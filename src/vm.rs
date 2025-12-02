@@ -95,9 +95,8 @@ impl VM {
         self.execute()
     }
 
-    /// Optimized dispatch loop with computed-goto style using labeled loop + continue
-    /// Each opcode handler explicitly continues to next iteration, avoiding
-    /// implicit control flow that can confuse the branch predictor
+    /// Optimized dispatch loop with packed 4-byte instructions
+    /// Uses opcode-based dispatch with match on u8 opcode constants
     #[inline(never)] // Prevent inlining to keep hot loop tight in cache
     fn execute(&mut self) -> Result<Value, String> {
         // Cache frequently accessed values outside the loop
@@ -120,34 +119,43 @@ impl VM {
         // The explicit labels and continues give LLVM better hints for jump tables
         loop {
             // Fetch instruction - pure pointer arithmetic, no bounds check
-            let op = unsafe { *code_ptr.add(ip) };
+            let instr = unsafe { *code_ptr.add(ip) };
             ip += 1;
 
-            // Dispatch using match - LLVM generates a dense jump table here
-            match op {
-                Op::LoadConst(dest, idx) => {
+            // Dispatch using match on opcode - LLVM generates a dense jump table here
+            match instr.opcode() {
+                Op::LOAD_CONST => {
+                    let dest = instr.a();
+                    let idx = instr.bx();
                     let value = unsafe { (*constants_ptr.add(idx as usize)).clone() };
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = value };
                 }
 
-                Op::LoadNil(dest) => {
+                Op::LOAD_NIL => {
+                    let dest = instr.a();
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = Value::nil() };
                 }
 
-                Op::LoadTrue(dest) => {
+                Op::LOAD_TRUE => {
+                    let dest = instr.a();
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = Value::bool(true) };
                 }
 
-                Op::LoadFalse(dest) => {
+                Op::LOAD_FALSE => {
+                    let dest = instr.a();
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = Value::bool(false) };
                 }
 
-                Op::Move(dest, src) => {
+                Op::MOVE => {
+                    let dest = instr.a();
+                    let src = instr.b();
                     let value = unsafe { self.registers.get_unchecked(base + src as usize).clone() };
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = value };
                 }
 
-                Op::GetGlobal(dest, name_idx) => {
+                Op::GET_GLOBAL => {
+                    let dest = instr.a();
+                    let name_idx = instr.bx();
                     let frame = unsafe { self.frames.last().unwrap_unchecked() };
                     let symbol_rc = frame.chunk.constants[name_idx as usize].as_symbol_rc()
                         .ok_or("GetGlobal: expected symbol")?;
@@ -164,7 +172,9 @@ impl VM {
                     self.registers[base + dest as usize] = value;
                 }
 
-                Op::SetGlobal(name_idx, src) => {
+                Op::SET_GLOBAL => {
+                    let src = instr.a();
+                    let name_idx = instr.bx();
                     let frame = unsafe { self.frames.last().unwrap_unchecked() };
                     let symbol_rc = frame.chunk.constants[name_idx as usize].as_symbol_rc()
                         .ok_or("SetGlobal: expected symbol")?;
@@ -181,30 +191,40 @@ impl VM {
                     self.global_cache.insert(key, value);
                 }
 
-                Op::Closure(dest, proto_idx) => {
+                Op::CLOSURE => {
+                    let dest = instr.a();
+                    let proto_idx = instr.bx();
                     let frame = unsafe { self.frames.last().unwrap_unchecked() };
                     let proto = frame.chunk.protos[proto_idx as usize].clone();
                     let func = Value::CompiledFunction(Rc::new(proto));
                     self.registers[base + dest as usize] = func;
                 }
 
-                Op::Jump(offset) => {
+                Op::JUMP => {
+                    let offset = instr.sbx();
                     ip = (ip as isize + offset as isize) as usize;
                 }
 
-                Op::JumpIfFalse(reg, offset) => {
+                Op::JUMP_IF_FALSE => {
+                    let reg = instr.a();
+                    let offset = instr.sbx();
                     if !unsafe { self.registers.get_unchecked(base + reg as usize) }.is_truthy() {
                         ip = (ip as isize + offset as isize) as usize;
                     }
                 }
 
-                Op::JumpIfTrue(reg, offset) => {
+                Op::JUMP_IF_TRUE => {
+                    let reg = instr.a();
+                    let offset = instr.sbx();
                     if unsafe { self.registers.get_unchecked(base + reg as usize) }.is_truthy() {
                         ip = (ip as isize + offset as isize) as usize;
                     }
                 }
 
-                Op::Call(dest, func_reg, nargs) => {
+                Op::CALL => {
+                    let dest = instr.a();
+                    let func_reg = instr.b();
+                    let nargs = instr.c();
                     let func_val = &self.registers[base + func_reg as usize];
                     if let Some(cf) = func_val.as_compiled_function() {
                         if cf.num_params != nargs {
@@ -258,7 +278,9 @@ impl VM {
                     }
                 }
 
-                Op::TailCall(func_reg, nargs) => {
+                Op::TAIL_CALL => {
+                    let func_reg = instr.a();
+                    let nargs = instr.b();
                     let func_val = &self.registers[base + func_reg as usize];
                     if let Some(cf) = func_val.as_compiled_function() {
                         if cf.num_params != nargs {
@@ -306,7 +328,10 @@ impl VM {
                     }
                 }
 
-                Op::CallGlobal(dest, name_idx, nargs) => {
+                Op::CALL_GLOBAL => {
+                    let dest = instr.a();
+                    let name_idx = instr.b(); // 8-bit constant index
+                    let nargs = instr.c();
                     let frame = unsafe { self.frames.last().unwrap_unchecked() };
                     let symbol_rc = frame.chunk.constants[name_idx as usize].as_symbol_rc()
                         .ok_or("CallGlobal: expected symbol")?;
@@ -370,7 +395,10 @@ impl VM {
                     }
                 }
 
-                Op::TailCallGlobal(name_idx, first_arg, nargs) => {
+                Op::TAIL_CALL_GLOBAL => {
+                    let name_idx = instr.a(); // 8-bit constant index
+                    let first_arg = instr.b();
+                    let nargs = instr.c();
                     let frame = unsafe { self.frames.last().unwrap_unchecked() };
                     let symbol_rc = frame.chunk.constants[name_idx as usize].as_symbol_rc()
                         .ok_or("TailCallGlobal: expected symbol")?;
@@ -428,8 +456,9 @@ impl VM {
                     }
                 }
 
-                Op::Return(reg) => {
-                    let result = self.registers[base + reg as usize].clone();
+                Op::RETURN => {
+                    let src = instr.a();
+                    let result = self.registers[base + src as usize].clone();
                     let return_reg = unsafe { self.frames.last().unwrap_unchecked() }.return_reg;
                     self.frames.pop();
 
@@ -446,28 +475,40 @@ impl VM {
                     base = frame.base;
                 }
 
-                Op::Add(dest, a, b) => {
+                Op::ADD => {
+                    let dest = instr.a();
+                    let a = instr.b();
+                    let b = instr.c();
                     let va = unsafe { self.registers.get_unchecked(base + a as usize) };
                     let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
                     let result = binary_arith(va, vb, |x, y| x + y, |x, y| x + y, "+")?;
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
-                Op::Sub(dest, a, b) => {
+                Op::SUB => {
+                    let dest = instr.a();
+                    let a = instr.b();
+                    let b = instr.c();
                     let va = unsafe { self.registers.get_unchecked(base + a as usize) };
                     let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
                     let result = binary_arith(va, vb, |x, y| x - y, |x, y| x - y, "-")?;
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
-                Op::Mul(dest, a, b) => {
+                Op::MUL => {
+                    let dest = instr.a();
+                    let a = instr.b();
+                    let b = instr.c();
                     let va = unsafe { self.registers.get_unchecked(base + a as usize) };
                     let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
                     let result = binary_arith(va, vb, |x, y| x * y, |x, y| x * y, "*")?;
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
-                Op::Div(dest, a, b) => {
+                Op::DIV => {
+                    let dest = instr.a();
+                    let a = instr.b();
+                    let b = instr.c();
                     let va = unsafe { self.registers.get_unchecked(base + a as usize) };
                     let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
                     let result = if let (Some(x), Some(y)) = (va.as_int(), vb.as_int()) {
@@ -488,7 +529,10 @@ impl VM {
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
-                Op::Mod(dest, a, b) => {
+                Op::MOD => {
+                    let dest = instr.a();
+                    let a = instr.b();
+                    let b = instr.c();
                     let va = unsafe { self.registers.get_unchecked(base + a as usize) };
                     let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
                     let result = if let (Some(x), Some(y)) = (va.as_int(), vb.as_int()) {
@@ -500,7 +544,9 @@ impl VM {
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
-                Op::Neg(dest, src) => {
+                Op::NEG => {
+                    let dest = instr.a();
+                    let src = instr.b();
                     let v = unsafe { self.registers.get_unchecked(base + src as usize) };
                     let result = if let Some(x) = v.as_int() {
                         Value::int(-x)
@@ -512,7 +558,10 @@ impl VM {
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
-                Op::AddImm(dest, src, imm) => {
+                Op::ADD_IMM => {
+                    let dest = instr.a();
+                    let src = instr.b();
+                    let imm = instr.c() as i8;
                     let v = unsafe { self.registers.get_unchecked(base + src as usize) };
                     let result = if let Some(x) = v.as_int() {
                         Value::int(x + imm as i64)
@@ -524,7 +573,10 @@ impl VM {
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
-                Op::SubImm(dest, src, imm) => {
+                Op::SUB_IMM => {
+                    let dest = instr.a();
+                    let src = instr.b();
+                    let imm = instr.c() as i8;
                     let v = unsafe { self.registers.get_unchecked(base + src as usize) };
                     let result = if let Some(x) = v.as_int() {
                         Value::int(x - imm as i64)
@@ -536,59 +588,84 @@ impl VM {
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
-                Op::Lt(dest, a, b) => {
+                Op::LT => {
+                    let dest = instr.a();
+                    let a = instr.b();
+                    let b = instr.c();
                     let va = unsafe { self.registers.get_unchecked(base + a as usize) };
                     let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
                     let result = Value::bool(compare_values(va, vb)? == std::cmp::Ordering::Less);
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
-                Op::Le(dest, a, b) => {
+                Op::LE => {
+                    let dest = instr.a();
+                    let a = instr.b();
+                    let b = instr.c();
                     let va = unsafe { self.registers.get_unchecked(base + a as usize) };
                     let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
                     let result = Value::bool(compare_values(va, vb)? != std::cmp::Ordering::Greater);
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
-                Op::Gt(dest, a, b) => {
+                Op::GT => {
+                    let dest = instr.a();
+                    let a = instr.b();
+                    let b = instr.c();
                     let va = unsafe { self.registers.get_unchecked(base + a as usize) };
                     let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
                     let result = Value::bool(compare_values(va, vb)? == std::cmp::Ordering::Greater);
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
-                Op::Ge(dest, a, b) => {
+                Op::GE => {
+                    let dest = instr.a();
+                    let a = instr.b();
+                    let b = instr.c();
                     let va = unsafe { self.registers.get_unchecked(base + a as usize) };
                     let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
                     let result = Value::bool(compare_values(va, vb)? != std::cmp::Ordering::Less);
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
-                Op::Eq(dest, a, b) => {
+                Op::EQ => {
+                    let dest = instr.a();
+                    let a = instr.b();
+                    let b = instr.c();
                     let va = unsafe { self.registers.get_unchecked(base + a as usize) };
                     let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = Value::bool(va == vb) };
                 }
 
-                Op::Ne(dest, a, b) => {
+                Op::NE => {
+                    let dest = instr.a();
+                    let a = instr.b();
+                    let b = instr.c();
                     let va = unsafe { self.registers.get_unchecked(base + a as usize) };
                     let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = Value::bool(va != vb) };
                 }
 
-                Op::Not(dest, src) => {
+                Op::NOT => {
+                    let dest = instr.a();
+                    let src = instr.b();
                     let v = unsafe { self.registers.get_unchecked(base + src as usize) };
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = Value::bool(!v.is_truthy()) };
                 }
 
-                Op::NewList(dest, nargs) => {
+                Op::NEW_LIST => {
+                    let dest = instr.a();
+                    let nargs = instr.b();
                     let items: Vec<Value> = (0..nargs)
                         .map(|i| self.registers[base + dest as usize + 1 + i as usize].clone())
                         .collect();
                     self.registers[base + dest as usize] = Value::list(items);
                 }
 
-                Op::GetList(dest, list, index) => {
+                Op::GET_LIST => {
+                    let dest = instr.a();
+                    let list = instr.b();
+                    let index = instr.c();
                     let list_val = &self.registers[base + list as usize];
                     let idx = &self.registers[base + index as usize];
                     let result = if let (Some(items), Some(i)) = (list_val.as_list(), idx.as_int()) {
@@ -599,8 +676,12 @@ impl VM {
                     self.registers[base + dest as usize] = result;
                 }
 
-                Op::SetList(_, _, _) => {
+                Op::SET_LIST => {
                     return Err("SetList not implemented (immutable lists)".to_string());
+                }
+
+                _ => {
+                    return Err(format!("Unknown opcode: {}", instr.opcode()));
                 }
             }
         }
@@ -982,8 +1063,8 @@ mod tests {
     fn test_vm_simple() {
         let mut chunk = Chunk::new();
         let idx = chunk.add_constant(Value::int(42));
-        chunk.emit(Op::LoadConst(0, idx));
-        chunk.emit(Op::Return(0));
+        chunk.emit(Op::load_const(0, idx));
+        chunk.emit(Op::ret(0));
         chunk.num_registers = 16;
 
         let mut vm = VM::new();
@@ -996,10 +1077,10 @@ mod tests {
         let mut chunk = Chunk::new();
         let idx1 = chunk.add_constant(Value::int(10));
         let idx2 = chunk.add_constant(Value::int(3));
-        chunk.emit(Op::LoadConst(0, idx1));
-        chunk.emit(Op::LoadConst(1, idx2));
-        chunk.emit(Op::Add(2, 0, 1));
-        chunk.emit(Op::Return(2));
+        chunk.emit(Op::load_const(0, idx1));
+        chunk.emit(Op::load_const(1, idx2));
+        chunk.emit(Op::add(2, 0, 1));
+        chunk.emit(Op::ret(2));
         chunk.num_registers = 16;
 
         let mut vm = VM::new();
@@ -1012,10 +1093,10 @@ mod tests {
         let mut chunk = Chunk::new();
         let idx1 = chunk.add_constant(Value::int(5));
         let idx2 = chunk.add_constant(Value::int(10));
-        chunk.emit(Op::LoadConst(0, idx1));
-        chunk.emit(Op::LoadConst(1, idx2));
-        chunk.emit(Op::Lt(2, 0, 1));
-        chunk.emit(Op::Return(2));
+        chunk.emit(Op::load_const(0, idx1));
+        chunk.emit(Op::load_const(1, idx2));
+        chunk.emit(Op::lt(2, 0, 1));
+        chunk.emit(Op::ret(2));
         chunk.num_registers = 16;
 
         let mut vm = VM::new();
@@ -1026,18 +1107,18 @@ mod tests {
     #[test]
     fn test_vm_jump() {
         let mut chunk = Chunk::new();
-        chunk.emit(Op::LoadTrue(0));
-        let jump_pos = chunk.emit(Op::JumpIfFalse(0, 0));
+        chunk.emit(Op::load_true(0));
+        let jump_pos = chunk.emit(Op::jump_if_false(0, 0));
         let idx = chunk.add_constant(Value::int(1));
-        chunk.emit(Op::LoadConst(1, idx));
-        let jump_over = chunk.emit(Op::Jump(0));
+        chunk.emit(Op::load_const(1, idx));
+        let jump_over = chunk.emit(Op::jump(0));
         let else_pos = chunk.current_pos();
         let idx2 = chunk.add_constant(Value::int(2));
-        chunk.emit(Op::LoadConst(1, idx2));
+        chunk.emit(Op::load_const(1, idx2));
         let end = chunk.current_pos();
         chunk.patch_jump(jump_pos, else_pos);
         chunk.patch_jump(jump_over, end);
-        chunk.emit(Op::Return(1));
+        chunk.emit(Op::ret(1));
         chunk.num_registers = 16;
 
         let mut vm = VM::new();
@@ -1050,10 +1131,10 @@ mod tests {
         let mut chunk = Chunk::new();
         let name_idx = chunk.add_constant(Value::symbol("x"));
         let val_idx = chunk.add_constant(Value::Int(42));
-        chunk.emit(Op::LoadConst(0, val_idx));
-        chunk.emit(Op::SetGlobal(name_idx, 0));
-        chunk.emit(Op::GetGlobal(1, name_idx));
-        chunk.emit(Op::Return(1));
+        chunk.emit(Op::load_const(0, val_idx));
+        chunk.emit(Op::set_global(name_idx, 0));
+        chunk.emit(Op::get_global(1, name_idx));
+        chunk.emit(Op::ret(1));
         chunk.num_registers = 16;
 
         let mut vm = VM::new();

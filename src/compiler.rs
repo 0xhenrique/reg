@@ -370,7 +370,7 @@ impl Compiler {
         let mut compiler = Compiler::new();
         let dest = compiler.alloc_reg();
         compiler.compile_expr(expr, dest, true)?;
-        compiler.emit(Op::Return(dest));
+        compiler.emit(Op::ret(dest));
         compiler.chunk.num_registers = compiler.locals.len().max(1) as u8 + 16; // extra for temps
         Ok(compiler.chunk)
     }
@@ -382,7 +382,7 @@ impl Compiler {
         let dest = compiler.alloc_reg();
 
         if exprs.is_empty() {
-            compiler.emit(Op::LoadNil(dest));
+            compiler.emit(Op::load_nil(dest));
         } else {
             // Compile all but last expression (not in tail position)
             for expr in &exprs[..exprs.len() - 1] {
@@ -392,7 +392,7 @@ impl Compiler {
             compiler.compile_expr(&exprs[exprs.len() - 1], dest, true)?;
         }
 
-        compiler.emit(Op::Return(dest));
+        compiler.emit(Op::ret(dest));
         compiler.chunk.num_registers = compiler.locals.len().max(1) as u8 + 16;
         Ok(compiler.chunk)
     }
@@ -408,7 +408,7 @@ impl Compiler {
 
         let dest = compiler.alloc_reg();
         compiler.compile_expr(body, dest, true)?;
-        compiler.emit(Op::Return(dest));
+        compiler.emit(Op::ret(dest));
         compiler.chunk.num_registers = compiler.locals.len().max(1) as u8 + 16;
         Ok(compiler.chunk)
     }
@@ -444,29 +444,29 @@ impl Compiler {
 
     fn compile_expr(&mut self, expr: &Value, dest: Reg, tail_pos: bool) -> Result<(), String> {
         if expr.is_nil() {
-            self.emit(Op::LoadNil(dest));
+            self.emit(Op::load_nil(dest));
         } else if let Some(b) = expr.as_bool() {
             if b {
-                self.emit(Op::LoadTrue(dest));
+                self.emit(Op::load_true(dest));
             } else {
-                self.emit(Op::LoadFalse(dest));
+                self.emit(Op::load_false(dest));
             }
         } else if expr.is_int() || expr.is_float() || expr.as_string().is_some() {
             let idx = self.add_constant(expr.clone());
-            self.emit(Op::LoadConst(dest, idx));
+            self.emit(Op::load_const(dest, idx));
         } else if let Some(name) = expr.as_symbol() {
             if let Some(reg) = self.resolve_local(name) {
                 if reg != dest {
-                    self.emit(Op::Move(dest, reg));
+                    self.emit(Op::mov(dest, reg));
                 }
             } else {
                 let idx = self.add_constant(Value::symbol(name));
-                self.emit(Op::GetGlobal(dest, idx));
+                self.emit(Op::get_global(dest, idx));
             }
         } else if let Some(items) = expr.as_list() {
             if items.is_empty() {
                 let idx = self.add_constant(Value::list(vec![]));
-                self.emit(Op::LoadConst(dest, idx));
+                self.emit(Op::load_const(dest, idx));
                 return Ok(());
             }
 
@@ -496,7 +496,7 @@ impl Compiler {
             return Err("quote expects exactly 1 argument".to_string());
         }
         let idx = self.add_constant(args[0].clone());
-        self.emit(Op::LoadConst(dest, idx));
+        self.emit(Op::load_const(dest, idx));
         Ok(())
     }
 
@@ -509,14 +509,14 @@ impl Compiler {
         self.compile_expr(&args[0], dest, false)?;
 
         // Jump to else if false
-        let jump_to_else = self.emit(Op::JumpIfFalse(dest, 0));
+        let jump_to_else = self.emit(Op::jump_if_false(dest, 0));
 
         // Compile then branch
         self.compile_expr(&args[1], dest, tail_pos)?;
 
         if args.len() == 3 {
             // Jump over else
-            let jump_over_else = self.emit(Op::Jump(0));
+            let jump_over_else = self.emit(Op::jump(0));
 
             // Patch jump to else
             let else_start = self.chunk.current_pos();
@@ -530,11 +530,11 @@ impl Compiler {
             self.chunk.patch_jump(jump_over_else, end);
         } else {
             // No else: load nil
-            let jump_over_nil = self.emit(Op::Jump(0));
+            let jump_over_nil = self.emit(Op::jump(0));
 
             let else_start = self.chunk.current_pos();
             self.chunk.patch_jump(jump_to_else, else_start);
-            self.emit(Op::LoadNil(dest));
+            self.emit(Op::load_nil(dest));
 
             let end = self.chunk.current_pos();
             self.chunk.patch_jump(jump_over_nil, end);
@@ -590,7 +590,7 @@ impl Compiler {
 
         // Store to global
         let name_idx = self.add_constant(Value::symbol(name));
-        self.emit(Op::SetGlobal(name_idx, dest));
+        self.emit(Op::set_global(name_idx, dest));
 
         Ok(())
     }
@@ -626,7 +626,7 @@ impl Compiler {
         // Compile body (all but last not in tail position)
         let body = &args[1..];
         if body.is_empty() {
-            self.emit(Op::LoadNil(dest));
+            self.emit(Op::load_nil(dest));
         } else {
             for expr in &body[..body.len() - 1] {
                 let temp = self.alloc_reg();
@@ -676,13 +676,13 @@ impl Compiler {
         let proto_idx = self.chunk.protos.len() as ConstIdx;
         self.chunk.protos.push(proto);
 
-        self.emit(Op::Closure(dest, proto_idx));
+        self.emit(Op::closure(dest, proto_idx));
         Ok(())
     }
 
     fn compile_do(&mut self, args: &[Value], dest: Reg, tail_pos: bool) -> Result<(), String> {
         if args.is_empty() {
-            self.emit(Op::LoadNil(dest));
+            self.emit(Op::load_nil(dest));
             return Ok(());
         }
 
@@ -711,9 +711,9 @@ impl Compiler {
                         // Optimization: compile first arg directly into dest
                         self.compile_expr(&args[0], dest, false)?;
                         if op == "+" {
-                            self.emit(Op::AddImm(dest, dest, imm as i8));
+                            self.emit(Op::add_imm(dest, dest, imm as i8));
                         } else {
-                            self.emit(Op::SubImm(dest, dest, imm as i8));
+                            self.emit(Op::sub_imm(dest, dest, imm as i8));
                         }
                         return Ok(Some(true));
                     }
@@ -724,7 +724,7 @@ impl Compiler {
                         if imm >= i8::MIN as i64 && imm <= i8::MAX as i64 {
                             // Optimization: compile second arg directly into dest
                             self.compile_expr(&args[1], dest, false)?;
-                            self.emit(Op::AddImm(dest, dest, imm as i8));
+                            self.emit(Op::add_imm(dest, dest, imm as i8));
                             return Ok(Some(true));
                         }
                     }
@@ -732,17 +732,17 @@ impl Compiler {
             }
 
             let make_binary_op: Option<fn(Reg, Reg, Reg) -> Op> = match op {
-                "+" => Some(Op::Add),
-                "-" => Some(Op::Sub),
-                "*" => Some(Op::Mul),
-                "/" => Some(Op::Div),
-                "mod" => Some(Op::Mod),
-                "<" => Some(Op::Lt),
-                "<=" => Some(Op::Le),
-                ">" => Some(Op::Gt),
-                ">=" => Some(Op::Ge),
-                "=" => Some(Op::Eq),
-                "!=" => Some(Op::Ne),
+                "+" => Some(Op::add),
+                "-" => Some(Op::sub),
+                "*" => Some(Op::mul),
+                "/" => Some(Op::div),
+                "mod" => Some(Op::modulo),
+                "<" => Some(Op::lt),
+                "<=" => Some(Op::le),
+                ">" => Some(Op::gt),
+                ">=" => Some(Op::ge),
+                "=" => Some(Op::eq),
+                "!=" => Some(Op::ne),
                 _ => None,
             };
 
@@ -767,7 +767,7 @@ impl Compiler {
             if op == "not" {
                 // Optimization: compile arg directly into dest
                 self.compile_expr(&args[0], dest, false)?;
-                self.emit(Op::Not(dest, dest));
+                self.emit(Op::not(dest, dest));
                 return Ok(Some(true));
             }
 
@@ -775,7 +775,7 @@ impl Compiler {
             if op == "-" {
                 // Optimization: compile arg directly into dest
                 self.compile_expr(&args[0], dest, false)?;
-                self.emit(Op::Neg(dest, dest));
+                self.emit(Op::neg(dest, dest));
                 return Ok(Some(true));
             }
         }
@@ -789,7 +789,7 @@ impl Compiler {
         let call_expr = Value::list(items.to_vec());
         if let Some(folded) = try_const_eval_with_fns(&call_expr, &self.pure_fns) {
             let idx = self.add_constant(folded);
-            self.emit(Op::LoadConst(dest, idx));
+            self.emit(Op::load_const(dest, idx));
             return Ok(());
         }
 
@@ -811,49 +811,50 @@ impl Compiler {
         };
 
         if is_global_call {
-            // Use optimized CallGlobal/TailCallGlobal opcode
             let name = items[0].as_symbol().unwrap();
             let name_idx = self.add_constant(Value::symbol(name));
             let args = &items[1..];
             let nargs = args.len() as u8;
 
-            if tail_pos {
-                // For TailCallGlobal, compile args to temp registers first,
-                // then we'll copy to r0, r1, ... at call time.
-                // Optimization: track first_arg position without allocating unused marker register
-                let first_arg = self.locals.len() as Reg;
-                for arg in args.iter() {
-                    let arg_reg = self.alloc_reg();
-                    self.compile_expr(arg, arg_reg, false)?;
-                }
-                self.emit(Op::TailCallGlobal(name_idx, first_arg, nargs));
-                self.emit(Op::LoadNil(dest));
-                // Free the temp registers
-                for _ in 0..nargs {
-                    self.free_reg();
-                }
-            } else {
-                // For CallGlobal, args go in dest+1, dest+2, ...
-                // First allocate registers for args
-                let start_locals = self.locals.len();
-                for (i, arg) in args.iter().enumerate() {
-                    let arg_reg = dest + 1 + i as Reg;
-                    // Ensure we have enough registers allocated
-                    while (self.locals.len() as Reg) <= arg_reg {
-                        self.alloc_reg();
+            // CallGlobal and TailCallGlobal use 8-bit constant index
+            // If name_idx > 255, fall back to regular GetGlobal + Call
+            if name_idx <= 255 {
+                let name_idx_u8 = name_idx as u8;
+
+                if tail_pos {
+                    // For TailCallGlobal, compile args to temp registers first
+                    let first_arg = self.locals.len() as Reg;
+                    for arg in args.iter() {
+                        let arg_reg = self.alloc_reg();
+                        self.compile_expr(arg, arg_reg, false)?;
                     }
-                    self.compile_expr(arg, arg_reg, false)?;
+                    self.emit(Op::tail_call_global(name_idx_u8, first_arg, nargs));
+                    self.emit(Op::load_nil(dest));
+                    // Free the temp registers
+                    for _ in 0..nargs {
+                        self.free_reg();
+                    }
+                } else {
+                    // For CallGlobal, args go in dest+1, dest+2, ...
+                    let start_locals = self.locals.len();
+                    for (i, arg) in args.iter().enumerate() {
+                        let arg_reg = dest + 1 + i as Reg;
+                        while (self.locals.len() as Reg) <= arg_reg {
+                            self.alloc_reg();
+                        }
+                        self.compile_expr(arg, arg_reg, false)?;
+                    }
+                    self.emit(Op::call_global(dest, name_idx_u8, nargs));
+                    while self.locals.len() > start_locals {
+                        self.free_reg();
+                    }
                 }
-                self.emit(Op::CallGlobal(dest, name_idx, nargs));
-                // Free the temporary arg registers
-                while self.locals.len() > start_locals {
-                    self.free_reg();
-                }
+                return Ok(());
             }
-            return Ok(());
+            // Fall through to regular call path if name_idx > 255
         }
 
-        // Regular call path
+        // Regular call path (or fallback for large name_idx)
         let func_reg = self.alloc_reg();
 
         // Compile function
@@ -870,12 +871,12 @@ impl Compiler {
 
         // Emit call
         if tail_pos {
-            self.emit(Op::TailCall(func_reg, nargs));
+            self.emit(Op::tail_call(func_reg, nargs));
             // After tail call, we still need to put something in dest for non-tail paths
             // But if it's truly a tail call, we won't reach here
-            self.emit(Op::LoadNil(dest));
+            self.emit(Op::load_nil(dest));
         } else {
-            self.emit(Op::Call(dest, func_reg, nargs));
+            self.emit(Op::call(dest, func_reg, nargs));
         }
 
         // Free arg registers and func register
@@ -906,29 +907,30 @@ mod tests {
     #[test]
     fn test_compile_literals() {
         let chunk = compile_str("42").unwrap();
-        assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
-        assert!(matches!(chunk.code[1], Op::Return(0)));
+        assert_eq!(chunk.code[0].opcode(), Op::LOAD_CONST);
+        assert_eq!(chunk.code[0].a(), 0);
+        assert_eq!(chunk.code[1].opcode(), Op::RETURN);
     }
 
     #[test]
     fn test_compile_nil() {
         let chunk = compile_str("nil").unwrap();
-        assert!(matches!(chunk.code[0], Op::LoadNil(0)));
+        assert_eq!(chunk.code[0].opcode(), Op::LOAD_NIL);
     }
 
     #[test]
     fn test_compile_bool() {
         let chunk = compile_str("true").unwrap();
-        assert!(matches!(chunk.code[0], Op::LoadTrue(0)));
+        assert_eq!(chunk.code[0].opcode(), Op::LOAD_TRUE);
 
         let chunk = compile_str("false").unwrap();
-        assert!(matches!(chunk.code[0], Op::LoadFalse(0)));
+        assert_eq!(chunk.code[0].opcode(), Op::LOAD_FALSE);
     }
 
     #[test]
     fn test_compile_quote() {
         let chunk = compile_str("'foo").unwrap();
-        assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
+        assert_eq!(chunk.code[0].opcode(), Op::LOAD_CONST);
         assert_eq!(chunk.constants[0], Value::symbol("foo"));
     }
 
@@ -943,7 +945,9 @@ mod tests {
     fn test_compile_fn() {
         let chunk = compile_str("(fn (x) x)").unwrap();
         // Should emit Closure instruction
-        assert!(matches!(chunk.code[0], Op::Closure(0, 0)));
+        assert_eq!(chunk.code[0].opcode(), Op::CLOSURE);
+        assert_eq!(chunk.code[0].a(), 0);
+        assert_eq!(chunk.code[0].bx(), 0);
         // Should have a proto
         assert_eq!(chunk.protos.len(), 1);
         assert_eq!(chunk.protos[0].num_params, 1);
@@ -953,7 +957,10 @@ mod tests {
     fn test_compile_if() {
         let chunk = compile_str("(if true 1 2)").unwrap();
         // Should have jumps
-        let has_jump = chunk.code.iter().any(|op| matches!(op, Op::Jump(_) | Op::JumpIfFalse(_, _)));
+        let has_jump = chunk.code.iter().any(|op| {
+            let opc = op.opcode();
+            opc == Op::JUMP || opc == Op::JUMP_IF_FALSE
+        });
         assert!(has_jump);
     }
 
@@ -968,14 +975,18 @@ mod tests {
     fn test_compile_call() {
         // Top-level call is in tail position, so it's a TailCall or TailCallGlobal
         let chunk = compile_str("(foo 1 2)").unwrap();
-        let has_tail_call = chunk.code.iter().any(|op|
-            matches!(op, Op::TailCall(_, _) | Op::TailCallGlobal(_, _, _)));
+        let has_tail_call = chunk.code.iter().any(|op| {
+            let opc = op.opcode();
+            opc == Op::TAIL_CALL || opc == Op::TAIL_CALL_GLOBAL
+        });
         assert!(has_tail_call);
 
         // Non-tail call (if condition is not in tail position)
         let chunk = compile_str("(if (foo) 1 2)").unwrap();
-        let has_call = chunk.code.iter().any(|op|
-            matches!(op, Op::Call(_, _, _) | Op::CallGlobal(_, _, _)));
+        let has_call = chunk.code.iter().any(|op| {
+            let opc = op.opcode();
+            opc == Op::CALL || opc == Op::CALL_GLOBAL
+        });
         assert!(has_call);
     }
 
@@ -983,10 +994,13 @@ mod tests {
     fn test_constant_folding_add() {
         let chunk = compile_str("(+ 1 2 3)").unwrap();
         // Should fold to LoadConst 6, not a call
-        assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
+        assert_eq!(chunk.code[0].opcode(), Op::LOAD_CONST);
         assert_eq!(chunk.constants[0], Value::int(6));
         // No function calls
-        let has_call = chunk.code.iter().any(|op| matches!(op, Op::Call(_, _, _) | Op::TailCall(_, _)));
+        let has_call = chunk.code.iter().any(|op| {
+            let opc = op.opcode();
+            opc == Op::CALL || opc == Op::TAIL_CALL
+        });
         assert!(!has_call);
     }
 
@@ -994,25 +1008,25 @@ mod tests {
     fn test_constant_folding_nested() {
         let chunk = compile_str("(* 2 (+ 3 4))").unwrap();
         // Should fold to LoadConst 14
-        assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
+        assert_eq!(chunk.code[0].opcode(), Op::LOAD_CONST);
         assert_eq!(chunk.constants[0], Value::int(14));
     }
 
     #[test]
     fn test_constant_folding_comparison() {
         let chunk = compile_str("(< 1 2)").unwrap();
-        assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
+        assert_eq!(chunk.code[0].opcode(), Op::LOAD_CONST);
         assert_eq!(chunk.constants[0], Value::bool(true));
 
         let chunk = compile_str("(>= 5 10)").unwrap();
-        assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
+        assert_eq!(chunk.code[0].opcode(), Op::LOAD_CONST);
         assert_eq!(chunk.constants[0], Value::bool(false));
     }
 
     #[test]
     fn test_constant_folding_not() {
         let chunk = compile_str("(not false)").unwrap();
-        assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
+        assert_eq!(chunk.code[0].opcode(), Op::LOAD_CONST);
         assert_eq!(chunk.constants[0], Value::bool(true));
     }
 
@@ -1021,25 +1035,25 @@ mod tests {
         // If any arg is not a constant, don't fold to LoadConst
         let chunk = compile_str("(+ x 1)").unwrap();
         // Should use Op::AddImm (specialized for small constants), not fold to LoadConst
-        let has_add_imm = chunk.code.iter().any(|op| matches!(op, Op::AddImm(_, _, _)));
+        let has_add_imm = chunk.code.iter().any(|op| op.opcode() == Op::ADD_IMM);
         assert!(has_add_imm, "Expected Op::AddImm for (+ x 1)");
         // Should NOT have LoadConst as first instruction (that would mean folding)
         // First instruction should be GetGlobal for 'x'
-        let first_is_get_global = matches!(chunk.code[0], Op::GetGlobal(_, _));
+        let first_is_get_global = chunk.code[0].opcode() == Op::GET_GLOBAL;
         assert!(first_is_get_global, "First op should be GetGlobal for variable x");
     }
 
     #[test]
     fn test_constant_folding_division() {
         let chunk = compile_str("(/ 10 2)").unwrap();
-        assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
+        assert_eq!(chunk.code[0].opcode(), Op::LOAD_CONST);
         assert_eq!(chunk.constants[0], Value::float(5.0));
     }
 
     #[test]
     fn test_constant_folding_mod() {
         let chunk = compile_str("(mod 17 5)").unwrap();
-        assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
+        assert_eq!(chunk.code[0].opcode(), Op::LOAD_CONST);
         assert_eq!(chunk.constants[0], Value::int(2));
     }
 
@@ -1082,8 +1096,10 @@ mod tests {
         let chunk = Compiler::compile_all(&exprs).unwrap();
 
         // Should have a function call (not folded)
-        let has_call = chunk.code.iter().any(|op| matches!(op,
-            Op::Call(_, _, _) | Op::TailCall(_, _) | Op::CallGlobal(_, _, _) | Op::TailCallGlobal(_, _, _)));
+        let has_call = chunk.code.iter().any(|op| {
+            let opc = op.opcode();
+            opc == Op::CALL || opc == Op::TAIL_CALL || opc == Op::CALL_GLOBAL || opc == Op::TAIL_CALL_GLOBAL
+        });
         assert!(has_call, "Impure function should not be folded");
     }
 }
