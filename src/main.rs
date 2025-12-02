@@ -1,4 +1,4 @@
-use lisp_vm::{eval, parse, standard_env};
+use lisp_vm::{eval, expand, parse, standard_env, MacroRegistry};
 use std::io::{self, BufRead, Write};
 
 fn main() {
@@ -7,6 +7,7 @@ fn main() {
     println!();
 
     let env = standard_env();
+    let macros = MacroRegistry::new();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -28,15 +29,21 @@ fn main() {
                 }
 
                 match parse(line) {
-                    Ok(expr) => match eval(&expr, &env) {
-                        Ok(result) => {
-                            // Don't display nil results (common REPL behavior)
-                            if !result.is_nil() {
-                                println!("{}", result);
-                            }
+                    Ok(expr) => {
+                        // First expand macros, then evaluate
+                        match expand(&expr, &macros, &env) {
+                            Ok(expanded) => match eval(&expanded, &env) {
+                                Ok(result) => {
+                                    // Don't display nil results (common REPL behavior)
+                                    if !result.is_nil() {
+                                        println!("{}", result);
+                                    }
+                                }
+                                Err(e) => eprintln!("Error: {}", e),
+                            },
+                            Err(e) => eprintln!("Macro error: {}", e),
                         }
-                        Err(e) => eprintln!("Error: {}", e),
-                    },
+                    }
                     Err(e) => eprintln!("Parse error: {}", e),
                 }
             }

@@ -1,11 +1,13 @@
 pub mod bytecode;
 pub mod compiler;
 pub mod eval;
+pub mod macros;
 pub mod parser;
 pub mod value;
 pub mod vm;
 
 pub use eval::{eval, standard_env, Env};
+pub use macros::{expand, MacroRegistry};
 pub use parser::{parse, parse_all};
 pub use value::Value;
 

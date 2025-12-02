@@ -341,6 +341,10 @@ pub fn standard_env() -> Env {
     env.define("print", native_fn("print", builtin_print));
     env.define("println", native_fn("println", builtin_println));
 
+    // Symbol operations (useful for macros)
+    env.define("symbol?", native_fn("symbol?", builtin_is_symbol));
+    env.define("gensym", native_fn("gensym", builtin_gensym));
+
     env
 }
 
@@ -692,6 +696,26 @@ fn builtin_println(args: &[Value]) -> Result<Value, String> {
     builtin_print(args)?;
     println!();
     Ok(Value::Nil)
+}
+
+fn builtin_is_symbol(args: &[Value]) -> Result<Value, String> {
+    if args.len() != 1 {
+        return Err("symbol? expects exactly 1 argument".to_string());
+    }
+    Ok(Value::Bool(matches!(args[0], Value::Symbol(_))))
+}
+
+fn builtin_gensym(args: &[Value]) -> Result<Value, String> {
+    let prefix = if args.is_empty() {
+        "g"
+    } else {
+        match &args[0] {
+            Value::String(s) => s.as_ref(),
+            Value::Symbol(s) => s.as_ref(),
+            _ => return Err("gensym: argument must be a string or symbol".to_string()),
+        }
+    };
+    Ok(Value::symbol(&crate::macros::gensym(prefix)))
 }
 
 #[cfg(test)]
