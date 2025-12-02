@@ -54,6 +54,8 @@ impl std::fmt::Debug for Op {
             Self::NEW_LIST => write!(f, "NewList({}, {})", self.a(), self.b()),
             Self::GET_LIST => write!(f, "GetList({}, {}, {})", self.a(), self.b(), self.c()),
             Self::SET_LIST => write!(f, "SetList({}, {}, {})", self.a(), self.b(), self.c()),
+            Self::CAR => write!(f, "Car({}, {})", self.a(), self.b()),
+            Self::CDR => write!(f, "Cdr({}, {})", self.a(), self.b()),
             _ => write!(f, "Unknown(0x{:08x})", self.0),
         }
     }
@@ -95,6 +97,8 @@ impl Op {
     pub const NEW_LIST: u8 = 31;       // AB: dest, nargs
     pub const GET_LIST: u8 = 32;       // ABC: dest, list, index
     pub const SET_LIST: u8 = 33;       // ABC: list, index, value
+    pub const CAR: u8 = 34;            // AB: dest, src - get head of cons/list
+    pub const CDR: u8 = 35;            // AB: dest, src - get tail of cons/list
 
     // ========== Constructors ==========
 
@@ -326,6 +330,16 @@ impl Op {
     #[inline(always)]
     pub const fn set_list(list: Reg, index: Reg, value: Reg) -> Self {
         Self::abc(Self::SET_LIST, list, index, value)
+    }
+
+    #[inline(always)]
+    pub const fn car(dest: Reg, src: Reg) -> Self {
+        Self::abc(Self::CAR, dest, src, 0)
+    }
+
+    #[inline(always)]
+    pub const fn cdr(dest: Reg, src: Reg) -> Self {
+        Self::abc(Self::CDR, dest, src, 0)
     }
 
     // ========== Jump patching helpers ==========

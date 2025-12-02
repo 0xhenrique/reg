@@ -680,6 +680,41 @@ impl VM {
                     return Err("SetList not implemented (immutable lists)".to_string());
                 }
 
+                Op::CAR => {
+                    let dest = instr.a();
+                    let src = instr.b();
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
+                    // Fast path: cons cell (most common in list processing)
+                    let result = if let Some(cons) = v.as_cons() {
+                        cons.car.clone()
+                    } else if let Some(list) = v.as_list() {
+                        // Array list
+                        list.first().cloned().ok_or_else(|| "car on empty list".to_string())?
+                    } else {
+                        return Err("car expects a list or cons cell".to_string());
+                    };
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
+                }
+
+                Op::CDR => {
+                    let dest = instr.a();
+                    let src = instr.b();
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
+                    // Fast path: cons cell (most common in list processing)
+                    let result = if let Some(cons) = v.as_cons() {
+                        cons.cdr.clone()
+                    } else if let Some(list) = v.as_list() {
+                        // Array list - O(n) but rare with cons cells
+                        if list.is_empty() {
+                            return Err("cdr on empty list".to_string());
+                        }
+                        Value::list(list[1..].to_vec())
+                    } else {
+                        return Err("cdr expects a list or cons cell".to_string());
+                    };
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
+                }
+
                 _ => {
                     return Err(format!("Unknown opcode: {}", instr.opcode()));
                 }
@@ -1214,5 +1249,18 @@ mod tests {
         // Phase 2 milestone - should not stack overflow
         let result = vm_eval("(do (def sum (fn (n acc) (if (<= n 0) acc (sum (- n 1) (+ acc n))))) (sum 10000 0))").unwrap();
         assert_eq!(result, Value::Int(50005000));
+    }
+
+    #[test]
+    fn test_specialized_car_cdr() {
+        // Test specialized car/cdr opcodes with cons cells
+        assert_eq!(vm_eval("(car (cons 1 (cons 2 nil)))").unwrap(), Value::Int(1));
+        assert_eq!(vm_eval("(car (cdr (cons 1 (cons 2 nil))))").unwrap(), Value::Int(2));
+
+        // Test with nested list operations
+        let result = vm_eval("(do (def reverse-acc (fn (lst acc) (if (empty? lst) acc (reverse-acc (cdr lst) (cons (car lst) acc))))) (reverse-acc (cons 1 (cons 2 (cons 3 nil))) nil))").unwrap();
+        // reversed (1 2 3) -> (3 2 1)
+        let cons = result.as_cons().expect("expected cons cell");
+        assert_eq!(cons.car.as_int(), Some(3));
     }
 }

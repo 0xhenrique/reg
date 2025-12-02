@@ -800,6 +800,26 @@ impl Compiler {
                     return Ok(());
                 }
             }
+
+            // Try specialized car/cdr opcodes (single argument)
+            let args = &items[1..];
+            if args.len() == 1 {
+                match op {
+                    "car" => {
+                        // Compile arg into dest, then emit Car
+                        self.compile_expr(&args[0], dest, false)?;
+                        self.emit(Op::car(dest, dest));
+                        return Ok(());
+                    }
+                    "cdr" => {
+                        // Compile arg into dest, then emit Cdr
+                        self.compile_expr(&args[0], dest, false)?;
+                        self.emit(Op::cdr(dest, dest));
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
         }
 
         // Check if calling a global symbol (optimization: use CallGlobal/TailCallGlobal)
