@@ -42,6 +42,13 @@ impl SymbolInterner {
     }
 }
 
+/// Public function to intern a symbol string.
+/// Returns an Rc<str> that can be used for pointer-based caching.
+/// Equal symbol strings will return the same Rc (pointer equality).
+pub fn intern_symbol(s: &str) -> Rc<str> {
+    SYMBOL_INTERNER.with(|interner| interner.borrow_mut().intern(s))
+}
+
 //=============================================================================
 // NaN-Boxing Implementation
 //=============================================================================
@@ -285,6 +292,15 @@ impl Value {
     pub fn as_symbol(&self) -> Option<&str> {
         match self.as_heap() {
             Some(HeapObject::Symbol(s)) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Get the symbol's Rc<str> for pointer-based caching
+    /// Returns the interned Rc<str> which can be used for O(1) hash/compare
+    pub fn as_symbol_rc(&self) -> Option<Rc<str>> {
+        match self.as_heap() {
+            Some(HeapObject::Symbol(s)) => Some(s.clone()),
             _ => None,
         }
     }

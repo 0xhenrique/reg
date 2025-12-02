@@ -1,11 +1,37 @@
 use crate::bytecode::{Chunk, Op};
-use crate::value::Value;
+use crate::value::{intern_symbol, Value};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 const MAX_REGISTERS: usize = 8192;  // Increased for deep recursion (fib needs ~30 depth)
 const MAX_FRAMES: usize = 1024;
+
+/// A wrapper for interned symbol Rc<str> that hashes/compares by pointer
+/// Since symbols are interned, equal symbols share the same Rc, so pointer
+/// comparison is correct and O(1) instead of O(n) string comparison
+#[derive(Clone)]
+struct SymbolKey(Rc<str>);
+
+impl Hash for SymbolKey {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Hash by pointer address only - O(1) instead of O(n) string hash
+        // Cast fat pointer (*const str) to thin pointer (*const u8) first
+        (Rc::as_ptr(&self.0) as *const u8 as usize).hash(state);
+    }
+}
+
+impl PartialEq for SymbolKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        // Compare by pointer - O(1) since symbols are interned
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SymbolKey {}
 
 #[derive(Clone)]
 struct CallFrame {
@@ -19,9 +45,9 @@ pub struct VM {
     registers: Vec<Value>,
     frames: Vec<CallFrame>,
     globals: Rc<RefCell<HashMap<String, Value>>>,
-    // Cache for global lookups: name -> Value
-    // Keyed by name to allow targeted invalidation when a specific global changes
-    global_cache: HashMap<String, Value>,
+    // Cache for global lookups: SymbolKey -> Value
+    // Uses pointer-based hashing for O(1) lookup instead of string hashing
+    global_cache: HashMap<SymbolKey, Value>,
 }
 
 impl VM {
@@ -53,12 +79,9 @@ impl VM {
                 globals.insert(name.to_string(), value.clone());
             }
         }
-        // Update cache (same optimization)
-        if let Some(existing) = self.global_cache.get_mut(name) {
-            *existing = value;
-        } else {
-            self.global_cache.insert(name.to_string(), value);
-        }
+        // Update cache using interned symbol key for O(1) lookup
+        let key = SymbolKey(intern_symbol(name));
+        self.global_cache.insert(key, value);
     }
 
     pub fn run(&mut self, chunk: Chunk) -> Result<Value, String> {
@@ -119,20 +142,21 @@ impl VM {
                 }
 
                 Op::GetGlobal(dest, name_idx) => {
-                    // Get name from constant pool
+                    // Get interned symbol from constant pool for O(1) cache lookup
                     let chunk = &self.frames.last().unwrap().chunk;
-                    let name = chunk.constants[name_idx as usize].as_symbol()
+                    let symbol_rc = chunk.constants[name_idx as usize].as_symbol_rc()
                         .ok_or("GetGlobal: expected symbol")?;
+                    let key = SymbolKey(symbol_rc);
 
-                    let value = if let Some(cached) = self.global_cache.get(name) {
-                        // Cache hit - avoid globals HashMap lookup
+                    let value = if let Some(cached) = self.global_cache.get(&key) {
+                        // Cache hit - O(1) pointer-based lookup
                         cached.clone()
                     } else {
-                        // Cache miss - look up in globals
-                        let v = self.globals.borrow().get(name).cloned()
-                            .ok_or_else(|| format!("Undefined variable: {}", name))?;
+                        // Cache miss - look up in globals (still uses string key)
+                        let v = self.globals.borrow().get(&*key.0).cloned()
+                            .ok_or_else(|| format!("Undefined variable: {}", &*key.0))?;
                         // Cache for future lookups
-                        self.global_cache.insert(name.to_string(), v.clone());
+                        self.global_cache.insert(key, v.clone());
                         v
                     };
                     self.registers[base + dest as usize] = value;
@@ -140,24 +164,21 @@ impl VM {
 
                 Op::SetGlobal(name_idx, src) => {
                     let chunk = &self.frames.last().unwrap().chunk;
-                    let name = chunk.constants[name_idx as usize].as_symbol()
+                    let symbol_rc = chunk.constants[name_idx as usize].as_symbol_rc()
                         .ok_or("SetGlobal: expected symbol")?;
                     let value = self.registers[base + src as usize].clone();
-                    // Avoid String allocation if key already exists
+                    // Update globals (still uses string key)
                     {
                         let mut globals = self.globals.borrow_mut();
-                        if let Some(existing) = globals.get_mut(name) {
+                        if let Some(existing) = globals.get_mut(&*symbol_rc) {
                             *existing = value.clone();
                         } else {
-                            globals.insert(name.to_string(), value.clone());
+                            globals.insert(symbol_rc.to_string(), value.clone());
                         }
                     }
-                    // Update cache (same optimization)
-                    if let Some(existing) = self.global_cache.get_mut(name) {
-                        *existing = value;
-                    } else {
-                        self.global_cache.insert(name.to_string(), value);
-                    }
+                    // Update cache with pointer-based key
+                    let key = SymbolKey(symbol_rc);
+                    self.global_cache.insert(key, value);
                 }
 
                 Op::Closure(dest, proto_idx) => {
@@ -283,17 +304,18 @@ impl VM {
                 Op::CallGlobal(dest, name_idx, nargs) => {
                     // Optimized: look up global and call directly without intermediate register
                     let chunk = &self.frames.last().unwrap().chunk;
-                    let name = chunk.constants[name_idx as usize].as_symbol()
+                    let symbol_rc = chunk.constants[name_idx as usize].as_symbol_rc()
                         .ok_or("CallGlobal: expected symbol")?;
+                    let key = SymbolKey(symbol_rc);
 
-                    // Get function from cache or globals
-                    let func_value = if let Some(cached) = self.global_cache.get(name) {
+                    // Get function from cache (O(1) pointer-based) or globals
+                    let func_value = if let Some(cached) = self.global_cache.get(&key) {
                         cached
                     } else {
-                        let v = self.globals.borrow().get(name).cloned()
-                            .ok_or_else(|| format!("Undefined function: {}", name))?;
-                        self.global_cache.insert(name.to_string(), v);
-                        self.global_cache.get(name).unwrap()
+                        let v = self.globals.borrow().get(&*key.0).cloned()
+                            .ok_or_else(|| format!("Undefined function: {}", &*key.0))?;
+                        self.global_cache.insert(key.clone(), v);
+                        self.global_cache.get(&key).unwrap()
                     };
 
                     if let Some(cf) = func_value.as_compiled_function() {
@@ -339,17 +361,18 @@ impl VM {
                 Op::TailCallGlobal(name_idx, arg_start, nargs) => {
                     // Optimized: look up global and tail-call directly
                     let chunk = &self.frames.last().unwrap().chunk;
-                    let name = chunk.constants[name_idx as usize].as_symbol()
+                    let symbol_rc = chunk.constants[name_idx as usize].as_symbol_rc()
                         .ok_or("TailCallGlobal: expected symbol")?;
+                    let key = SymbolKey(symbol_rc);
 
-                    // Get function from cache or globals
-                    let func_value = if let Some(cached) = self.global_cache.get(name) {
+                    // Get function from cache (O(1) pointer-based) or globals
+                    let func_value = if let Some(cached) = self.global_cache.get(&key) {
                         cached
                     } else {
-                        let v = self.globals.borrow().get(name).cloned()
-                            .ok_or_else(|| format!("Undefined function: {}", name))?;
-                        self.global_cache.insert(name.to_string(), v);
-                        self.global_cache.get(name).unwrap()
+                        let v = self.globals.borrow().get(&*key.0).cloned()
+                            .ok_or_else(|| format!("Undefined function: {}", &*key.0))?;
+                        self.global_cache.insert(key.clone(), v);
+                        self.global_cache.get(&key).unwrap()
                     };
 
                     if let Some(cf) = func_value.as_compiled_function() {
