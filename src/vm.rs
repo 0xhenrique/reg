@@ -715,6 +715,66 @@ impl VM {
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
+                Op::LT_IMM => {
+                    let dest = instr.a();
+                    let src = instr.b();
+                    let imm = instr.c() as i8 as i64;
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
+                    let result = if let Some(x) = v.as_int() {
+                        Value::bool(x < imm)
+                    } else if let Some(x) = v.as_float() {
+                        Value::bool(x < imm as f64)
+                    } else {
+                        return Err("< expects a number".to_string());
+                    };
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
+                }
+
+                Op::LE_IMM => {
+                    let dest = instr.a();
+                    let src = instr.b();
+                    let imm = instr.c() as i8 as i64;
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
+                    let result = if let Some(x) = v.as_int() {
+                        Value::bool(x <= imm)
+                    } else if let Some(x) = v.as_float() {
+                        Value::bool(x <= imm as f64)
+                    } else {
+                        return Err("<= expects a number".to_string());
+                    };
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
+                }
+
+                Op::GT_IMM => {
+                    let dest = instr.a();
+                    let src = instr.b();
+                    let imm = instr.c() as i8 as i64;
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
+                    let result = if let Some(x) = v.as_int() {
+                        Value::bool(x > imm)
+                    } else if let Some(x) = v.as_float() {
+                        Value::bool(x > imm as f64)
+                    } else {
+                        return Err("> expects a number".to_string());
+                    };
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
+                }
+
+                Op::GE_IMM => {
+                    let dest = instr.a();
+                    let src = instr.b();
+                    let imm = instr.c() as i8 as i64;
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
+                    let result = if let Some(x) = v.as_int() {
+                        Value::bool(x >= imm)
+                    } else if let Some(x) = v.as_float() {
+                        Value::bool(x >= imm as f64)
+                    } else {
+                        return Err(">= expects a number".to_string());
+                    };
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
+                }
+
                 _ => {
                     return Err(format!("Unknown opcode: {}", instr.opcode()));
                 }
@@ -1262,5 +1322,26 @@ mod tests {
         // reversed (1 2 3) -> (3 2 1)
         let cons = result.as_cons().expect("expected cons cell");
         assert_eq!(cons.car.as_int(), Some(3));
+    }
+
+    #[test]
+    fn test_comparison_immediate() {
+        // Test comparison with immediate values
+        assert_eq!(vm_eval("(< 5 10)").unwrap(), Value::Bool(true));
+        assert_eq!(vm_eval("(< 10 5)").unwrap(), Value::Bool(false));
+        assert_eq!(vm_eval("(<= 5 5)").unwrap(), Value::Bool(true));
+        assert_eq!(vm_eval("(<= 6 5)").unwrap(), Value::Bool(false));
+        assert_eq!(vm_eval("(> 10 5)").unwrap(), Value::Bool(true));
+        assert_eq!(vm_eval("(> 5 10)").unwrap(), Value::Bool(false));
+        assert_eq!(vm_eval("(>= 5 5)").unwrap(), Value::Bool(true));
+        assert_eq!(vm_eval("(>= 4 5)").unwrap(), Value::Bool(false));
+
+        // Test with negative immediates
+        assert_eq!(vm_eval("(< -5 0)").unwrap(), Value::Bool(true));
+        assert_eq!(vm_eval("(<= 0 0)").unwrap(), Value::Bool(true));
+
+        // Test in a loop context (sum function uses (<= n 0))
+        let result = vm_eval("(do (def count-down (fn (n) (if (<= n 0) 0 (+ 1 (count-down (- n 1)))))) (count-down 10))").unwrap();
+        assert_eq!(result, Value::Int(10));
     }
 }

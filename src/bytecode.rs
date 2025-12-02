@@ -56,6 +56,10 @@ impl std::fmt::Debug for Op {
             Self::SET_LIST => write!(f, "SetList({}, {}, {})", self.a(), self.b(), self.c()),
             Self::CAR => write!(f, "Car({}, {})", self.a(), self.b()),
             Self::CDR => write!(f, "Cdr({}, {})", self.a(), self.b()),
+            Self::LT_IMM => write!(f, "LtImm({}, {}, {})", self.a(), self.b(), self.c() as i8),
+            Self::LE_IMM => write!(f, "LeImm({}, {}, {})", self.a(), self.b(), self.c() as i8),
+            Self::GT_IMM => write!(f, "GtImm({}, {}, {})", self.a(), self.b(), self.c() as i8),
+            Self::GE_IMM => write!(f, "GeImm({}, {}, {})", self.a(), self.b(), self.c() as i8),
             _ => write!(f, "Unknown(0x{:08x})", self.0),
         }
     }
@@ -99,6 +103,10 @@ impl Op {
     pub const SET_LIST: u8 = 33;       // ABC: list, index, value
     pub const CAR: u8 = 34;            // AB: dest, src - get head of cons/list
     pub const CDR: u8 = 35;            // AB: dest, src - get tail of cons/list
+    pub const LT_IMM: u8 = 36;         // ABC: dest, src, imm (C is i8) - src < imm
+    pub const LE_IMM: u8 = 37;         // ABC: dest, src, imm (C is i8) - src <= imm
+    pub const GT_IMM: u8 = 38;         // ABC: dest, src, imm (C is i8) - src > imm
+    pub const GE_IMM: u8 = 39;         // ABC: dest, src, imm (C is i8) - src >= imm
 
     // ========== Constructors ==========
 
@@ -340,6 +348,26 @@ impl Op {
     #[inline(always)]
     pub const fn cdr(dest: Reg, src: Reg) -> Self {
         Self::abc(Self::CDR, dest, src, 0)
+    }
+
+    #[inline(always)]
+    pub const fn lt_imm(dest: Reg, src: Reg, imm: i8) -> Self {
+        Self::abc(Self::LT_IMM, dest, src, imm as u8)
+    }
+
+    #[inline(always)]
+    pub const fn le_imm(dest: Reg, src: Reg, imm: i8) -> Self {
+        Self::abc(Self::LE_IMM, dest, src, imm as u8)
+    }
+
+    #[inline(always)]
+    pub const fn gt_imm(dest: Reg, src: Reg, imm: i8) -> Self {
+        Self::abc(Self::GT_IMM, dest, src, imm as u8)
+    }
+
+    #[inline(always)]
+    pub const fn ge_imm(dest: Reg, src: Reg, imm: i8) -> Self {
+        Self::abc(Self::GE_IMM, dest, src, imm as u8)
     }
 
     // ========== Jump patching helpers ==========

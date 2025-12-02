@@ -731,6 +731,25 @@ impl Compiler {
                 }
             }
 
+            // Check for comparison with immediate value: (< x 0), (<= n 10), etc.
+            if op == "<" || op == "<=" || op == ">" || op == ">=" {
+                // Check if second arg is a small constant integer
+                if let Some(imm) = args[1].as_int() {
+                    if imm >= i8::MIN as i64 && imm <= i8::MAX as i64 {
+                        // Optimization: compile first arg directly into dest
+                        self.compile_expr(&args[0], dest, false)?;
+                        match op {
+                            "<" => self.emit(Op::lt_imm(dest, dest, imm as i8)),
+                            "<=" => self.emit(Op::le_imm(dest, dest, imm as i8)),
+                            ">" => self.emit(Op::gt_imm(dest, dest, imm as i8)),
+                            ">=" => self.emit(Op::ge_imm(dest, dest, imm as i8)),
+                            _ => unreachable!(),
+                        };
+                        return Ok(Some(true));
+                    }
+                }
+            }
+
             let make_binary_op: Option<fn(Reg, Reg, Reg) -> Op> = match op {
                 "+" => Some(Op::add),
                 "-" => Some(Op::sub),
