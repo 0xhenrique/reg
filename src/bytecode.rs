@@ -4,7 +4,7 @@ pub type Reg = u8;
 pub type ConstIdx = u16;
 pub type Offset = i16;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum Op {
     // Load constants/literals
     LoadConst(Reg, ConstIdx),
@@ -41,6 +41,10 @@ pub enum Op {
     Div(Reg, Reg, Reg),
     Mod(Reg, Reg, Reg),
     Neg(Reg, Reg), // dest, src (unary minus)
+
+    // Immediate arithmetic - saves LoadConst for common patterns like (+ n 1)
+    AddImm(Reg, Reg, i8), // dest = src + immediate
+    SubImm(Reg, Reg, i8), // dest = src - immediate
 
     // Comparison
     Lt(Reg, Reg, Reg),

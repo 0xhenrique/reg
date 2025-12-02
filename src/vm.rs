@@ -62,10 +62,10 @@ impl VM {
 
     fn execute(&mut self) -> Result<Value, String> {
         loop {
-            // Get op and base without cloning the chunk Rc
+            // Get op and base (Op is Copy, so no allocation needed)
             let (op, base) = {
                 let frame = self.frames.last().ok_or("No active frame")?;
-                (frame.chunk.code.get(frame.ip).cloned(), frame.base)
+                (frame.chunk.code.get(frame.ip).copied(), frame.base)
             };
 
             // Advance IP
@@ -442,6 +442,31 @@ impl VM {
                     self.registers[base + dest as usize] = result;
                 }
 
+                // Specialized immediate arithmetic - avoids LoadConst instruction
+                Op::AddImm(dest, src, imm) => {
+                    let v = &self.registers[base + src as usize];
+                    let result = if let Some(x) = v.as_int() {
+                        Value::int(x + imm as i64)
+                    } else if let Some(x) = v.as_float() {
+                        Value::float(x + imm as f64)
+                    } else {
+                        return Err("+ expects numbers".to_string());
+                    };
+                    self.registers[base + dest as usize] = result;
+                }
+
+                Op::SubImm(dest, src, imm) => {
+                    let v = &self.registers[base + src as usize];
+                    let result = if let Some(x) = v.as_int() {
+                        Value::int(x - imm as i64)
+                    } else if let Some(x) = v.as_float() {
+                        Value::float(x - imm as f64)
+                    } else {
+                        return Err("- expects numbers".to_string());
+                    };
+                    self.registers[base + dest as usize] = result;
+                }
+
                 Op::Lt(dest, a, b) => {
                     let va = &self.registers[base + a as usize];
                     let vb = &self.registers[base + b as usize];
@@ -657,36 +682,71 @@ pub fn standard_vm() -> VM {
     // List operations
     vm.define_global("list", native("list", |args| Ok(Value::list(args.to_vec()))));
 
+    // cons creates a cons cell - O(1) operation!
     vm.define_global("cons", native("cons", |args| {
         if args.len() != 2 { return Err("cons expects 2 arguments".to_string()); }
-        let tail = args[1].as_list().ok_or("cons expects list as second argument")?;
-        let mut new_list = vec![args[0].clone()];
-        new_list.extend(tail.iter().cloned());
-        Ok(Value::list(new_list))
+        // Accept nil, list, or cons cell as tail
+        let tail = &args[1];
+        if !tail.is_nil() && tail.as_list().is_none() && tail.as_cons().is_none() {
+            return Err("cons expects nil, list, or cons cell as second argument".to_string());
+        }
+        Ok(Value::cons(args[0].clone(), tail.clone()))
     }));
 
+    // car returns the head of a list or cons cell - O(1) operation
     vm.define_global("car", native("car", |args| {
         if args.len() != 1 { return Err("car expects 1 argument".to_string()); }
-        let list = args[0].as_list().ok_or("car expects a list")?;
-        list.first().cloned().ok_or_else(|| "car on empty list".to_string())
+        // Handle cons cells
+        if let Some(cons) = args[0].as_cons() {
+            return Ok(cons.car.clone());
+        }
+        // Handle array lists
+        if let Some(list) = args[0].as_list() {
+            return list.first().cloned().ok_or_else(|| "car on empty list".to_string());
+        }
+        Err("car expects a list or cons cell".to_string())
     }));
 
+    // cdr returns the tail of a list or cons cell - O(1) for cons cells!
     vm.define_global("cdr", native("cdr", |args| {
         if args.len() != 1 { return Err("cdr expects 1 argument".to_string()); }
-        let list = args[0].as_list().ok_or("cdr expects a list")?;
-        if list.is_empty() { return Err("cdr on empty list".to_string()); }
-        Ok(Value::list(list[1..].to_vec()))
+        // Handle cons cells - O(1)!
+        if let Some(cons) = args[0].as_cons() {
+            return Ok(cons.cdr.clone());
+        }
+        // Handle array lists - O(n) but rarely used now
+        if let Some(list) = args[0].as_list() {
+            if list.is_empty() { return Err("cdr on empty list".to_string()); }
+            return Ok(Value::list(list[1..].to_vec()));
+        }
+        Err("cdr expects a list or cons cell".to_string())
     }));
 
     vm.define_global("length", native("length", |args| {
         if args.len() != 1 { return Err("length expects 1 argument".to_string()); }
+        // Handle array lists
         if let Some(items) = args[0].as_list() {
-            Ok(Value::int(items.len() as i64))
-        } else if let Some(s) = args[0].as_string() {
-            Ok(Value::int(s.len() as i64))
-        } else {
-            Err("length expects list or string".to_string())
+            return Ok(Value::int(items.len() as i64));
         }
+        // Handle cons cells - traverse and count
+        if args[0].as_cons().is_some() {
+            let mut count = 0i64;
+            let mut current = &args[0];
+            while let Some(cons) = current.as_cons() {
+                count += 1;
+                current = &cons.cdr;
+            }
+            // If we ended on an array list, add its length
+            if let Some(items) = current.as_list() {
+                count += items.len() as i64;
+            }
+            return Ok(Value::int(count));
+        }
+        // Handle strings
+        if let Some(s) = args[0].as_string() {
+            return Ok(Value::int(s.len() as i64));
+        }
+        Err("length expects list, cons cell, or string".to_string())
     }));
 
     // I/O
@@ -738,18 +798,29 @@ pub fn standard_vm() -> VM {
 
     vm.define_global("list?", native("list?", |args| {
         if args.len() != 1 { return Err("list? expects 1 argument".to_string()); }
-        Ok(Value::bool(args[0].as_list().is_some()))
+        // Both array lists and cons cells are "lists"
+        Ok(Value::bool(args[0].as_list().is_some() || args[0].as_cons().is_some()))
     }));
 
     vm.define_global("empty?", native("empty?", |args| {
         if args.len() != 1 { return Err("empty? expects 1 argument".to_string()); }
-        if let Some(list) = args[0].as_list() {
-            Ok(Value::bool(list.is_empty()))
-        } else if let Some(s) = args[0].as_string() {
-            Ok(Value::bool(s.is_empty()))
-        } else {
-            Err("empty? expects list or string".to_string())
+        // nil is the empty list in Lisp
+        if args[0].is_nil() {
+            return Ok(Value::bool(true));
         }
+        // Empty array list
+        if let Some(list) = args[0].as_list() {
+            return Ok(Value::bool(list.is_empty()));
+        }
+        // Cons cells are never empty (they have at least car)
+        if args[0].as_cons().is_some() {
+            return Ok(Value::bool(false));
+        }
+        // Empty string
+        if let Some(s) = args[0].as_string() {
+            return Ok(Value::bool(s.is_empty()));
+        }
+        Err("empty? expects nil, list, cons cell, or string".to_string())
     }));
 
     vm.define_global("fn?", native("fn?", |args| {

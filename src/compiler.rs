@@ -702,6 +702,37 @@ impl Compiler {
     fn try_compile_binary_op(&mut self, op: &str, args: &[Value], dest: Reg) -> Result<Option<bool>, String> {
         // Binary arithmetic/comparison operators
         if args.len() == 2 {
+            // Check for immediate value optimization (+ n 1) or (- n 1)
+            // Only applies to + and - where one operand is a small constant
+            if op == "+" || op == "-" {
+                // Check if second arg is a small constant integer
+                if let Some(imm) = args[1].as_int() {
+                    if imm >= i8::MIN as i64 && imm <= i8::MAX as i64 {
+                        let a_reg = self.alloc_reg();
+                        self.compile_expr(&args[0], a_reg, false)?;
+                        if op == "+" {
+                            self.emit(Op::AddImm(dest, a_reg, imm as i8));
+                        } else {
+                            self.emit(Op::SubImm(dest, a_reg, imm as i8));
+                        }
+                        self.free_reg();
+                        return Ok(Some(true));
+                    }
+                }
+                // Check if first arg is a small constant integer (for + only, since + is commutative)
+                if op == "+" {
+                    if let Some(imm) = args[0].as_int() {
+                        if imm >= i8::MIN as i64 && imm <= i8::MAX as i64 {
+                            let b_reg = self.alloc_reg();
+                            self.compile_expr(&args[1], b_reg, false)?;
+                            self.emit(Op::AddImm(dest, b_reg, imm as i8));
+                            self.free_reg();
+                            return Ok(Some(true));
+                        }
+                    }
+                }
+            }
+
             let make_binary_op: Option<fn(Reg, Reg, Reg) -> Op> = match op {
                 "+" => Some(Op::Add),
                 "-" => Some(Op::Sub),
@@ -995,9 +1026,9 @@ mod tests {
     fn test_no_fold_with_variables() {
         // If any arg is not a constant, don't fold to LoadConst
         let chunk = compile_str("(+ x 1)").unwrap();
-        // Should use Op::Add (specialized opcode), not fold to LoadConst
-        let has_add = chunk.code.iter().any(|op| matches!(op, Op::Add(_, _, _)));
-        assert!(has_add, "Expected Op::Add for (+ x 1)");
+        // Should use Op::AddImm (specialized for small constants), not fold to LoadConst
+        let has_add_imm = chunk.code.iter().any(|op| matches!(op, Op::AddImm(_, _, _)));
+        assert!(has_add_imm, "Expected Op::AddImm for (+ x 1)");
         // Should NOT have LoadConst as first instruction (that would mean folding)
         // First instruction should be GetGlobal for 'x'
         let first_is_get_global = matches!(chunk.code[0], Op::GetGlobal(_, _));

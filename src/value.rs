@@ -39,12 +39,21 @@ const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;  // 48 bits
 // Sign extension for 48-bit integers
 const INT_SIGN_BIT: u64 = 0x0000_8000_0000_0000;  // Bit 47
 
+/// A cons cell - the fundamental building block of Lisp lists
+/// (cons car cdr) creates a pair where car is the head and cdr is the tail
+#[derive(Debug)]
+pub struct ConsCell {
+    pub car: Value,
+    pub cdr: Value,
+}
+
 /// Heap object types - what the pointer points to
 #[derive(Debug)]
 pub enum HeapObject {
     String(Rc<str>),
     Symbol(Rc<str>),
     List(Rc<[Value]>),
+    Cons(Rc<ConsCell>),
     Function(Rc<Function>),
     NativeFunction(Rc<NativeFunction>),
     CompiledFunction(Rc<Chunk>),
@@ -56,6 +65,7 @@ impl Clone for HeapObject {
             HeapObject::String(s) => HeapObject::String(s.clone()),
             HeapObject::Symbol(s) => HeapObject::Symbol(s.clone()),
             HeapObject::List(l) => HeapObject::List(l.clone()),
+            HeapObject::Cons(c) => HeapObject::Cons(c.clone()),
             HeapObject::Function(f) => HeapObject::Function(f.clone()),
             HeapObject::NativeFunction(f) => HeapObject::NativeFunction(f.clone()),
             HeapObject::CompiledFunction(c) => HeapObject::CompiledFunction(c.clone()),
@@ -132,6 +142,13 @@ impl Value {
     /// Create a list value
     pub fn list(items: Vec<Value>) -> Value {
         let heap = Rc::new(HeapObject::List(Rc::from(items)));
+        Value::from_heap(heap)
+    }
+
+    /// Create a cons cell - O(1) operation
+    /// (cons car cdr) creates a pair where car is the head and cdr is the tail
+    pub fn cons(car: Value, cdr: Value) -> Value {
+        let heap = Rc::new(HeapObject::Cons(Rc::new(ConsCell { car, cdr })));
         Value::from_heap(heap)
     }
 
@@ -248,6 +265,19 @@ impl Value {
         }
     }
 
+    /// Get as a cons cell reference
+    pub fn as_cons(&self) -> Option<&ConsCell> {
+        match self.as_heap() {
+            Some(HeapObject::Cons(c)) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Check if this is a cons cell
+    pub fn is_cons(&self) -> bool {
+        matches!(self.as_heap(), Some(HeapObject::Cons(_)))
+    }
+
     /// Get as a function reference
     pub fn as_function(&self) -> Option<&Rc<Function>> {
         match self.as_heap() {
@@ -297,6 +327,7 @@ impl Value {
                 HeapObject::String(_) => "string",
                 HeapObject::Symbol(_) => "symbol",
                 HeapObject::List(_) => "list",
+                HeapObject::Cons(_) => "list", // cons cells are also lists
                 HeapObject::Function(_) => "function",
                 HeapObject::NativeFunction(_) => "native-function",
                 HeapObject::CompiledFunction(_) => "function",
@@ -447,6 +478,36 @@ impl fmt::Display for Value {
                     }
                     write!(f, ")")
                 }
+                HeapObject::Cons(_) => {
+                    // Print cons cells as proper lists by traversing the chain
+                    write!(f, "(")?;
+                    let mut current = self;
+                    let mut first = true;
+                    loop {
+                        if let Some(cons) = current.as_cons() {
+                            if !first {
+                                write!(f, " ")?;
+                            }
+                            first = false;
+                            write!(f, "{}", cons.car)?;
+                            current = &cons.cdr;
+                        } else if current.is_nil() {
+                            // Proper list ending with nil
+                            break;
+                        } else if let Some(items) = current.as_list() {
+                            // Cons chain ending with an array list
+                            for item in items.iter() {
+                                write!(f, " {}", item)?;
+                            }
+                            break;
+                        } else {
+                            // Improper list (dotted pair)
+                            write!(f, " . {}", current)?;
+                            break;
+                        }
+                    }
+                    write!(f, ")")
+                }
                 HeapObject::Function(_) => write!(f, "<function>"),
                 HeapObject::NativeFunction(nf) => write!(f, "<native fn {}>", nf.name),
                 HeapObject::CompiledFunction(_) => write!(f, "<function>"),
@@ -490,6 +551,9 @@ impl PartialEq for Value {
             (Some(HeapObject::String(a)), Some(HeapObject::String(b))) => a == b,
             (Some(HeapObject::Symbol(a)), Some(HeapObject::Symbol(b))) => a == b,
             (Some(HeapObject::List(a)), Some(HeapObject::List(b))) => a == b,
+            (Some(HeapObject::Cons(a)), Some(HeapObject::Cons(b))) => {
+                a.car == b.car && a.cdr == b.cdr
+            }
             // Functions are never equal
             _ => false,
         }
