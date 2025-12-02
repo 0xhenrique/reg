@@ -51,34 +51,35 @@ impl MacroRegistry {
 
 /// Expand macros in an expression
 pub fn expand(expr: &Value, registry: &MacroRegistry, env: &Env) -> Result<Value, String> {
-    match expr {
-        Value::List(items) if !items.is_empty() => {
-            // Check for special forms first
-            if let Some(sym) = items[0].as_symbol() {
-                match sym {
-                    "quote" => return Ok(expr.clone()),
-                    "defmacro" => return expand_defmacro(&items[1..], registry, env),
-                    "gensym" => return expand_gensym(&items[1..]),
-                    _ => {
-                        // Check if it's a macro call
-                        if let Some(mac) = registry.get(sym) {
-                            let expanded = apply_macro(&mac, &items[1..], env)?;
-                            // Recursively expand the result
-                            return expand(&expanded, registry, env);
-                        }
+    if let Some(items) = expr.as_list() {
+        if items.is_empty() {
+            return Ok(expr.clone());
+        }
+        // Check for special forms first
+        if let Some(sym) = items[0].as_symbol() {
+            match sym {
+                "quote" => return Ok(expr.clone()),
+                "defmacro" => return expand_defmacro(&items[1..], registry, env),
+                "gensym" => return expand_gensym(&items[1..]),
+                _ => {
+                    // Check if it's a macro call
+                    if let Some(mac) = registry.get(sym) {
+                        let expanded = apply_macro(&mac, &items[1..], env)?;
+                        // Recursively expand the result
+                        return expand(&expanded, registry, env);
                     }
                 }
             }
-
-            // Recursively expand all elements
-            let expanded: Result<Vec<Value>, String> = items
-                .iter()
-                .map(|item| expand(item, registry, env))
-                .collect();
-            Ok(Value::list(expanded?))
         }
-        _ => Ok(expr.clone()),
+
+        // Recursively expand all elements
+        let expanded: Result<Vec<Value>, String> = items
+            .iter()
+            .map(|item| expand(item, registry, env))
+            .collect();
+        return Ok(Value::list(expanded?));
     }
+    Ok(expr.clone())
 }
 
 /// Handle defmacro: (defmacro name (params...) body)
@@ -121,19 +122,19 @@ fn expand_defmacro(args: &[Value], registry: &MacroRegistry, env: &Env) -> Resul
     };
 
     registry.define(name, mac);
-    Ok(Value::Nil)
+    Ok(Value::nil())
 }
 
 /// Handle gensym: (gensym) or (gensym "prefix")
 fn expand_gensym(args: &[Value]) -> Result<Value, String> {
     let prefix = if args.is_empty() {
         "g"
+    } else if let Some(s) = args[0].as_string() {
+        s
+    } else if let Some(s) = args[0].as_symbol() {
+        s
     } else {
-        match &args[0] {
-            Value::String(s) => s.as_ref(),
-            Value::Symbol(s) => s.as_ref(),
-            _ => return Err("gensym: argument must be a string or symbol".to_string()),
-        }
+        return Err("gensym: argument must be a string or symbol".to_string());
     };
     Ok(Value::symbol(&gensym(prefix)))
 }
@@ -247,8 +248,8 @@ mod tests {
         let sym2 = eval(&parse("(gensym \"tmp\")").unwrap(), &env).unwrap();
 
         // Both should be symbols
-        assert!(matches!(sym1, Value::Symbol(_)));
-        assert!(matches!(sym2, Value::Symbol(_)));
+        assert!(sym1.as_symbol().is_some());
+        assert!(sym2.as_symbol().is_some());
 
         // But different from each other
         assert_ne!(sym1, sym2);

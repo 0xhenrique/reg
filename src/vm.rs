@@ -27,7 +27,7 @@ pub struct VM {
 impl VM {
     pub fn new() -> Self {
         VM {
-            registers: vec![Value::Nil; MAX_REGISTERS],
+            registers: vec![Value::nil(); MAX_REGISTERS],
             frames: Vec::with_capacity(MAX_FRAMES),
             globals: Rc::new(RefCell::new(HashMap::new())),
             global_cache: HashMap::new(),
@@ -36,7 +36,7 @@ impl VM {
 
     pub fn with_globals(globals: Rc<RefCell<HashMap<String, Value>>>) -> Self {
         VM {
-            registers: vec![Value::Nil; MAX_REGISTERS],
+            registers: vec![Value::nil(); MAX_REGISTERS],
             frames: Vec::with_capacity(MAX_FRAMES),
             globals,
             global_cache: HashMap::new(),
@@ -86,15 +86,15 @@ impl VM {
                 }
 
                 Op::LoadNil(dest) => {
-                    self.registers[base + dest as usize] = Value::Nil;
+                    self.registers[base + dest as usize] = Value::nil();
                 }
 
                 Op::LoadTrue(dest) => {
-                    self.registers[base + dest as usize] = Value::Bool(true);
+                    self.registers[base + dest as usize] = Value::bool(true);
                 }
 
                 Op::LoadFalse(dest) => {
-                    self.registers[base + dest as usize] = Value::Bool(false);
+                    self.registers[base + dest as usize] = Value::bool(false);
                 }
 
                 Op::Move(dest, src) => {
@@ -113,10 +113,8 @@ impl VM {
                         cached.clone()
                     } else {
                         // Cache miss - do the lookup (using &str to avoid String allocation)
-                        let name: &str = match &chunk.constants[name_idx as usize] {
-                            Value::Symbol(s) => s,
-                            _ => return Err("GetGlobal: expected symbol".to_string()),
-                        };
+                        let name = chunk.constants[name_idx as usize].as_symbol()
+                            .ok_or("GetGlobal: expected symbol")?;
                         let v = self.globals.borrow().get(name).cloned()
                             .ok_or_else(|| format!("Undefined variable: {}", name))?;
                         // Cache for future lookups
@@ -128,10 +126,8 @@ impl VM {
 
                 Op::SetGlobal(name_idx, src) => {
                     let chunk = &self.frames.last().unwrap().chunk;
-                    let name: &str = match &chunk.constants[name_idx as usize] {
-                        Value::Symbol(s) => s,
-                        _ => return Err("SetGlobal: expected symbol".to_string()),
-                    };
+                    let name = chunk.constants[name_idx as usize].as_symbol()
+                        .ok_or("SetGlobal: expected symbol")?;
                     let value = self.registers[base + src as usize].clone();
                     self.globals.borrow_mut().insert(name.to_string(), value);
                     // Invalidate cache - global was modified
@@ -168,100 +164,94 @@ impl VM {
                 }
 
                 Op::Call(dest, func_reg, nargs) => {
-                    // Match on reference to avoid cloning the function value
-                    match &self.registers[base + func_reg as usize] {
-                        Value::CompiledFunction(cf) => {
-                            if cf.num_params != nargs {
-                                return Err(format!(
-                                    "Expected {} arguments, got {}",
-                                    cf.num_params, nargs
-                                ));
-                            }
-
-                            let num_registers = self.frames.last().unwrap().chunk.num_registers;
-                            let new_base = base + num_registers as usize;
-
-                            if new_base + cf.num_registers as usize > MAX_REGISTERS {
-                                return Err("Stack overflow".to_string());
-                            }
-
-                            // Clone the Rc<Chunk> directly (not the entire Value)
-                            let cf_chunk = cf.clone();
-
-                            // Copy args directly to new frame's registers (no Vec allocation!)
-                            let arg_start = base + func_reg as usize + 1;
-                            for i in 0..nargs as usize {
-                                self.registers[new_base + i] = self.registers[arg_start + i].clone();
-                            }
-
-                            // Push new frame - will continue in the loop
-                            self.frames.push(CallFrame {
-                                chunk: cf_chunk,
-                                ip: 0,
-                                base: new_base,
-                                return_reg: base + dest as usize,
-                            });
+                    let func_val = &self.registers[base + func_reg as usize];
+                    if let Some(cf) = func_val.as_compiled_function() {
+                        if cf.num_params != nargs {
+                            return Err(format!(
+                                "Expected {} arguments, got {}",
+                                cf.num_params, nargs
+                            ));
                         }
-                        Value::NativeFunction(nf) => {
-                            // Clone the function pointer before the mutable borrow
-                            let func_ptr = nf.func;
-                            // Pass a slice directly to native function (no Vec allocation!)
-                            let arg_start = base + func_reg as usize + 1;
-                            let arg_end = arg_start + nargs as usize;
-                            let result = func_ptr(&self.registers[arg_start..arg_end])?;
-                            self.registers[base + dest as usize] = result;
+
+                        let num_registers = self.frames.last().unwrap().chunk.num_registers;
+                        let new_base = base + num_registers as usize;
+
+                        if new_base + cf.num_registers as usize > MAX_REGISTERS {
+                            return Err("Stack overflow".to_string());
                         }
-                        Value::Function(_) => {
-                            return Err("Cannot call interpreted function from VM".to_string());
+
+                        // Clone the Rc<Chunk> directly (not the entire Value)
+                        let cf_chunk = cf.clone();
+
+                        // Copy args directly to new frame's registers (no Vec allocation!)
+                        let arg_start = base + func_reg as usize + 1;
+                        for i in 0..nargs as usize {
+                            self.registers[new_base + i] = self.registers[arg_start + i].clone();
                         }
-                        other => return Err(format!("Not a function: {}", other)),
+
+                        // Push new frame - will continue in the loop
+                        self.frames.push(CallFrame {
+                            chunk: cf_chunk,
+                            ip: 0,
+                            base: new_base,
+                            return_reg: base + dest as usize,
+                        });
+                    } else if let Some(nf) = func_val.as_native_function() {
+                        // Clone the function pointer before the mutable borrow
+                        let func_ptr = nf.func;
+                        // Pass a slice directly to native function (no Vec allocation!)
+                        let arg_start = base + func_reg as usize + 1;
+                        let arg_end = arg_start + nargs as usize;
+                        let result = func_ptr(&self.registers[arg_start..arg_end])?;
+                        self.registers[base + dest as usize] = result;
+                    } else if func_val.as_function().is_some() {
+                        return Err("Cannot call interpreted function from VM".to_string());
+                    } else {
+                        return Err(format!("Not a function: {}", func_val));
                     }
                 }
 
                 Op::TailCall(func_reg, nargs) => {
-                    // Match on reference to avoid cloning the function value
-                    match &self.registers[base + func_reg as usize] {
-                        Value::CompiledFunction(cf) => {
-                            if cf.num_params != nargs {
-                                return Err(format!(
-                                    "Expected {} arguments, got {}",
-                                    cf.num_params, nargs
-                                ));
-                            }
-                            // Clone the Rc<Chunk> directly (not the entire Value)
-                            let cf_chunk = cf.clone();
-                            // Reuse current frame for tail call
-                            if let Some(frame) = self.frames.last_mut() {
-                                frame.chunk = cf_chunk;
-                                frame.ip = 0;
-                            }
-                            // Copy args directly to base registers (no Vec allocation!)
-                            // Forward iteration is safe: source (base + func_reg + 1 + i)
-                            // is always >= destination (base + i) since func_reg >= 0
-                            let arg_start = base + func_reg as usize + 1;
-                            for i in 0..nargs as usize {
-                                self.registers[base + i] = self.registers[arg_start + i].clone();
-                            }
+                    let func_val = &self.registers[base + func_reg as usize];
+                    if let Some(cf) = func_val.as_compiled_function() {
+                        if cf.num_params != nargs {
+                            return Err(format!(
+                                "Expected {} arguments, got {}",
+                                cf.num_params, nargs
+                            ));
                         }
-                        Value::NativeFunction(nf) => {
-                            // Clone the function pointer before the mutable borrow
-                            let func_ptr = nf.func;
-                            let return_reg = self.frames.last().unwrap().return_reg;
-                            // Pass a slice directly to native function (no Vec allocation!)
-                            let arg_start = base + func_reg as usize + 1;
-                            let arg_end = arg_start + nargs as usize;
-                            let result = func_ptr(&self.registers[arg_start..arg_end])?;
-                            self.frames.pop();
-                            if self.frames.is_empty() {
-                                return Ok(result);
-                            }
-                            // Store result in caller's designated register
-                            self.registers[return_reg] = result;
+                        // Clone the Rc<Chunk> directly (not the entire Value)
+                        let cf_chunk = cf.clone();
+                        // Reuse current frame for tail call
+                        if let Some(frame) = self.frames.last_mut() {
+                            frame.chunk = cf_chunk;
+                            frame.ip = 0;
                         }
-                        Value::Function(_) => {
-                            return Err("Cannot call interpreted function from VM".to_string());
+                        // Copy args directly to base registers (no Vec allocation!)
+                        // Forward iteration is safe: source (base + func_reg + 1 + i)
+                        // is always >= destination (base + i) since func_reg >= 0
+                        let arg_start = base + func_reg as usize + 1;
+                        for i in 0..nargs as usize {
+                            self.registers[base + i] = self.registers[arg_start + i].clone();
                         }
-                        other => return Err(format!("Not a function: {}", other)),
+                    } else if let Some(nf) = func_val.as_native_function() {
+                        // Clone the function pointer before the mutable borrow
+                        let func_ptr = nf.func;
+                        let return_reg = self.frames.last().unwrap().return_reg;
+                        // Pass a slice directly to native function (no Vec allocation!)
+                        let arg_start = base + func_reg as usize + 1;
+                        let arg_end = arg_start + nargs as usize;
+                        let result = func_ptr(&self.registers[arg_start..arg_end])?;
+                        self.frames.pop();
+                        if self.frames.is_empty() {
+                            return Ok(result);
+                        }
+                        // Store result in caller's designated register
+                        self.registers[return_reg] = result;
+                    } else if func_val.as_function().is_some() {
+                        return Err("Cannot call interpreted function from VM".to_string());
+                    } else {
+                        return Err(format!("Not a function: {}", func_val));
                     }
                 }
 
@@ -275,55 +265,51 @@ impl VM {
                     let func_value = if let Some(cached) = self.global_cache.get(&cache_key) {
                         cached
                     } else {
-                        let name: &str = match &chunk.constants[name_idx as usize] {
-                            Value::Symbol(s) => s,
-                            _ => return Err("CallGlobal: expected symbol".to_string()),
-                        };
+                        let name = chunk.constants[name_idx as usize].as_symbol()
+                            .ok_or("CallGlobal: expected symbol")?;
                         let v = self.globals.borrow().get(name).cloned()
                             .ok_or_else(|| format!("Undefined function: {}", name))?;
                         self.global_cache.insert(cache_key, v);
                         self.global_cache.get(&cache_key).unwrap()
                     };
 
-                    match func_value {
-                        Value::CompiledFunction(cf) => {
-                            if cf.num_params != nargs {
-                                return Err(format!(
-                                    "Expected {} arguments, got {}",
-                                    cf.num_params, nargs
-                                ));
-                            }
-
-                            let num_registers = self.frames.last().unwrap().chunk.num_registers;
-                            let new_base = base + num_registers as usize;
-
-                            if new_base + cf.num_registers as usize > MAX_REGISTERS {
-                                return Err("Stack overflow".to_string());
-                            }
-
-                            let cf_chunk = cf.clone();
-
-                            // Copy args from dest+1, dest+2, ... to new frame
-                            let arg_start = base + dest as usize + 1;
-                            for i in 0..nargs as usize {
-                                self.registers[new_base + i] = self.registers[arg_start + i].clone();
-                            }
-
-                            self.frames.push(CallFrame {
-                                chunk: cf_chunk,
-                                ip: 0,
-                                base: new_base,
-                                return_reg: base + dest as usize,
-                            });
+                    if let Some(cf) = func_value.as_compiled_function() {
+                        if cf.num_params != nargs {
+                            return Err(format!(
+                                "Expected {} arguments, got {}",
+                                cf.num_params, nargs
+                            ));
                         }
-                        Value::NativeFunction(nf) => {
-                            let func_ptr = nf.func;
-                            let arg_start = base + dest as usize + 1;
-                            let arg_end = arg_start + nargs as usize;
-                            let result = func_ptr(&self.registers[arg_start..arg_end])?;
-                            self.registers[base + dest as usize] = result;
+
+                        let num_registers = self.frames.last().unwrap().chunk.num_registers;
+                        let new_base = base + num_registers as usize;
+
+                        if new_base + cf.num_registers as usize > MAX_REGISTERS {
+                            return Err("Stack overflow".to_string());
                         }
-                        _ => return Err(format!("Not a function: {}", func_value)),
+
+                        let cf_chunk = cf.clone();
+
+                        // Copy args from dest+1, dest+2, ... to new frame
+                        let arg_start = base + dest as usize + 1;
+                        for i in 0..nargs as usize {
+                            self.registers[new_base + i] = self.registers[arg_start + i].clone();
+                        }
+
+                        self.frames.push(CallFrame {
+                            chunk: cf_chunk,
+                            ip: 0,
+                            base: new_base,
+                            return_reg: base + dest as usize,
+                        });
+                    } else if let Some(nf) = func_value.as_native_function() {
+                        let func_ptr = nf.func;
+                        let arg_start = base + dest as usize + 1;
+                        let arg_end = arg_start + nargs as usize;
+                        let result = func_ptr(&self.registers[arg_start..arg_end])?;
+                        self.registers[base + dest as usize] = result;
+                    } else {
+                        return Err(format!("Not a function: {}", func_value));
                     }
                 }
 
@@ -337,48 +323,44 @@ impl VM {
                     let func_value = if let Some(cached) = self.global_cache.get(&cache_key) {
                         cached
                     } else {
-                        let name: &str = match &chunk.constants[name_idx as usize] {
-                            Value::Symbol(s) => s,
-                            _ => return Err("TailCallGlobal: expected symbol".to_string()),
-                        };
+                        let name = chunk.constants[name_idx as usize].as_symbol()
+                            .ok_or("TailCallGlobal: expected symbol")?;
                         let v = self.globals.borrow().get(name).cloned()
                             .ok_or_else(|| format!("Undefined function: {}", name))?;
                         self.global_cache.insert(cache_key, v);
                         self.global_cache.get(&cache_key).unwrap()
                     };
 
-                    match func_value {
-                        Value::CompiledFunction(cf) => {
-                            if cf.num_params != nargs {
-                                return Err(format!(
-                                    "Expected {} arguments, got {}",
-                                    cf.num_params, nargs
-                                ));
-                            }
-                            let cf_chunk = cf.clone();
-                            if let Some(frame) = self.frames.last_mut() {
-                                frame.chunk = cf_chunk;
-                                frame.ip = 0;
-                            }
-                            // Copy args from temp registers (at arg_start+1, arg_start+2, ...) to base+0, base+1, ...
-                            let src_start = base + arg_start as usize + 1;
-                            for i in 0..nargs as usize {
-                                self.registers[base + i] = self.registers[src_start + i].clone();
-                            }
+                    if let Some(cf) = func_value.as_compiled_function() {
+                        if cf.num_params != nargs {
+                            return Err(format!(
+                                "Expected {} arguments, got {}",
+                                cf.num_params, nargs
+                            ));
                         }
-                        Value::NativeFunction(nf) => {
-                            let func_ptr = nf.func;
-                            let return_reg = self.frames.last().unwrap().return_reg;
-                            let src_start = base + arg_start as usize + 1;
-                            let src_end = src_start + nargs as usize;
-                            let result = func_ptr(&self.registers[src_start..src_end])?;
-                            self.frames.pop();
-                            if self.frames.is_empty() {
-                                return Ok(result);
-                            }
-                            self.registers[return_reg] = result;
+                        let cf_chunk = cf.clone();
+                        if let Some(frame) = self.frames.last_mut() {
+                            frame.chunk = cf_chunk;
+                            frame.ip = 0;
                         }
-                        _ => return Err(format!("Not a function: {}", func_value)),
+                        // Copy args from temp registers (at arg_start+1, arg_start+2, ...) to base+0, base+1, ...
+                        let src_start = base + arg_start as usize + 1;
+                        for i in 0..nargs as usize {
+                            self.registers[base + i] = self.registers[src_start + i].clone();
+                        }
+                    } else if let Some(nf) = func_value.as_native_function() {
+                        let func_ptr = nf.func;
+                        let return_reg = self.frames.last().unwrap().return_reg;
+                        let src_start = base + arg_start as usize + 1;
+                        let src_end = src_start + nargs as usize;
+                        let result = func_ptr(&self.registers[src_start..src_end])?;
+                        self.frames.pop();
+                        if self.frames.is_empty() {
+                            return Ok(result);
+                        }
+                        self.registers[return_reg] = result;
+                    } else {
+                        return Err(format!("Not a function: {}", func_value));
                     }
                 }
 
@@ -418,24 +400,20 @@ impl VM {
                 Op::Div(dest, a, b) => {
                     let va = &self.registers[base + a as usize];
                     let vb = &self.registers[base + b as usize];
-                    let result = match (va, vb) {
-                        (Value::Int(x), Value::Int(y)) => {
-                            if *y == 0 { return Err("Division by zero".to_string()); }
-                            Value::Float(*x as f64 / *y as f64)
-                        }
-                        (Value::Float(x), Value::Float(y)) => {
-                            if *y == 0.0 { return Err("Division by zero".to_string()); }
-                            Value::Float(x / y)
-                        }
-                        (Value::Int(x), Value::Float(y)) => {
-                            if *y == 0.0 { return Err("Division by zero".to_string()); }
-                            Value::Float(*x as f64 / y)
-                        }
-                        (Value::Float(x), Value::Int(y)) => {
-                            if *y == 0 { return Err("Division by zero".to_string()); }
-                            Value::Float(x / *y as f64)
-                        }
-                        _ => return Err("/ expects numbers".to_string()),
+                    let result = if let (Some(x), Some(y)) = (va.as_int(), vb.as_int()) {
+                        if y == 0 { return Err("Division by zero".to_string()); }
+                        Value::float(x as f64 / y as f64)
+                    } else if let (Some(x), Some(y)) = (va.as_float(), vb.as_float()) {
+                        if y == 0.0 { return Err("Division by zero".to_string()); }
+                        Value::float(x / y)
+                    } else if let (Some(x), Some(y)) = (va.as_int(), vb.as_float()) {
+                        if y == 0.0 { return Err("Division by zero".to_string()); }
+                        Value::float(x as f64 / y)
+                    } else if let (Some(x), Some(y)) = (va.as_float(), vb.as_int()) {
+                        if y == 0 { return Err("Division by zero".to_string()); }
+                        Value::float(x / y as f64)
+                    } else {
+                        return Err("/ expects numbers".to_string());
                     };
                     self.registers[base + dest as usize] = result;
                 }
@@ -443,22 +421,23 @@ impl VM {
                 Op::Mod(dest, a, b) => {
                     let va = &self.registers[base + a as usize];
                     let vb = &self.registers[base + b as usize];
-                    let result = match (va, vb) {
-                        (Value::Int(x), Value::Int(y)) => {
-                            if *y == 0 { return Err("Division by zero".to_string()); }
-                            Value::Int(x % y)
-                        }
-                        _ => return Err("mod expects integers".to_string()),
+                    let result = if let (Some(x), Some(y)) = (va.as_int(), vb.as_int()) {
+                        if y == 0 { return Err("Division by zero".to_string()); }
+                        Value::int(x % y)
+                    } else {
+                        return Err("mod expects integers".to_string());
                     };
                     self.registers[base + dest as usize] = result;
                 }
 
                 Op::Neg(dest, src) => {
                     let v = &self.registers[base + src as usize];
-                    let result = match v {
-                        Value::Int(x) => Value::Int(-x),
-                        Value::Float(x) => Value::Float(-x),
-                        _ => return Err("- expects a number".to_string()),
+                    let result = if let Some(x) = v.as_int() {
+                        Value::int(-x)
+                    } else if let Some(x) = v.as_float() {
+                        Value::float(-x)
+                    } else {
+                        return Err("- expects a number".to_string());
                     };
                     self.registers[base + dest as usize] = result;
                 }
@@ -466,46 +445,46 @@ impl VM {
                 Op::Lt(dest, a, b) => {
                     let va = &self.registers[base + a as usize];
                     let vb = &self.registers[base + b as usize];
-                    let result = Value::Bool(compare_values(va, vb)? == std::cmp::Ordering::Less);
+                    let result = Value::bool(compare_values(va, vb)? == std::cmp::Ordering::Less);
                     self.registers[base + dest as usize] = result;
                 }
 
                 Op::Le(dest, a, b) => {
                     let va = &self.registers[base + a as usize];
                     let vb = &self.registers[base + b as usize];
-                    let result = Value::Bool(compare_values(va, vb)? != std::cmp::Ordering::Greater);
+                    let result = Value::bool(compare_values(va, vb)? != std::cmp::Ordering::Greater);
                     self.registers[base + dest as usize] = result;
                 }
 
                 Op::Gt(dest, a, b) => {
                     let va = &self.registers[base + a as usize];
                     let vb = &self.registers[base + b as usize];
-                    let result = Value::Bool(compare_values(va, vb)? == std::cmp::Ordering::Greater);
+                    let result = Value::bool(compare_values(va, vb)? == std::cmp::Ordering::Greater);
                     self.registers[base + dest as usize] = result;
                 }
 
                 Op::Ge(dest, a, b) => {
                     let va = &self.registers[base + a as usize];
                     let vb = &self.registers[base + b as usize];
-                    let result = Value::Bool(compare_values(va, vb)? != std::cmp::Ordering::Less);
+                    let result = Value::bool(compare_values(va, vb)? != std::cmp::Ordering::Less);
                     self.registers[base + dest as usize] = result;
                 }
 
                 Op::Eq(dest, a, b) => {
                     let va = &self.registers[base + a as usize];
                     let vb = &self.registers[base + b as usize];
-                    self.registers[base + dest as usize] = Value::Bool(va == vb);
+                    self.registers[base + dest as usize] = Value::bool(va == vb);
                 }
 
                 Op::Ne(dest, a, b) => {
                     let va = &self.registers[base + a as usize];
                     let vb = &self.registers[base + b as usize];
-                    self.registers[base + dest as usize] = Value::Bool(va != vb);
+                    self.registers[base + dest as usize] = Value::bool(va != vb);
                 }
 
                 Op::Not(dest, src) => {
                     let v = &self.registers[base + src as usize];
-                    self.registers[base + dest as usize] = Value::Bool(!v.is_truthy());
+                    self.registers[base + dest as usize] = Value::bool(!v.is_truthy());
                 }
 
                 Op::NewList(dest, nargs) => {
@@ -518,11 +497,10 @@ impl VM {
                 Op::GetList(dest, list, index) => {
                     let list_val = &self.registers[base + list as usize];
                     let idx = &self.registers[base + index as usize];
-                    let result = match (list_val, idx) {
-                        (Value::List(items), Value::Int(i)) => {
-                            items.get(*i as usize).cloned().unwrap_or(Value::Nil)
-                        }
-                        _ => return Err("GetList expects list and int".to_string()),
+                    let result = if let (Some(items), Some(i)) = (list_val.as_list(), idx.as_int()) {
+                        items.get(i as usize).cloned().unwrap_or(Value::nil())
+                    } else {
+                        return Err("GetList expects list and int".to_string());
                     };
                     self.registers[base + dest as usize] = result;
                 }
@@ -561,38 +539,48 @@ pub fn standard_vm() -> VM {
         let mut is_float = false;
         let mut fsum = 0.0f64;
         for arg in args {
-            match arg {
-                Value::Int(n) => if is_float { fsum += *n as f64 } else { sum += n },
-                Value::Float(n) => { if !is_float { is_float = true; fsum = sum as f64; } fsum += n },
-                _ => return Err(format!("+ expects numbers, got {}", arg.type_name())),
+            if let Some(n) = arg.as_int() {
+                if is_float { fsum += n as f64 } else { sum += n }
+            } else if let Some(n) = arg.as_float() {
+                if !is_float { is_float = true; fsum = sum as f64; }
+                fsum += n
+            } else {
+                return Err(format!("+ expects numbers, got {}", arg.type_name()));
             }
         }
-        Ok(if is_float { Value::Float(fsum) } else { Value::Int(sum) })
+        Ok(if is_float { Value::float(fsum) } else { Value::int(sum) })
     }));
 
     vm.define_global("-", native("-", |args| {
         if args.is_empty() { return Err("- expects at least 1 argument".to_string()); }
         if args.len() == 1 {
-            return match &args[0] {
-                Value::Int(n) => Ok(Value::Int(-n)),
-                Value::Float(n) => Ok(Value::Float(-n)),
-                _ => Err("- expects numbers".to_string()),
-            };
-        }
-        let mut result = match &args[0] {
-            Value::Int(n) => *n as f64,
-            Value::Float(n) => *n,
-            _ => return Err("- expects numbers".to_string()),
-        };
-        let mut is_float = matches!(&args[0], Value::Float(_));
-        for arg in &args[1..] {
-            match arg {
-                Value::Int(n) => result -= *n as f64,
-                Value::Float(n) => { is_float = true; result -= n },
-                _ => return Err("- expects numbers".to_string()),
+            if let Some(n) = args[0].as_int() {
+                return Ok(Value::int(-n));
+            } else if let Some(n) = args[0].as_float() {
+                return Ok(Value::float(-n));
+            } else {
+                return Err("- expects numbers".to_string());
             }
         }
-        Ok(if is_float { Value::Float(result) } else { Value::Int(result as i64) })
+        let mut is_float = args[0].is_float();
+        let mut result = if let Some(n) = args[0].as_int() {
+            n as f64
+        } else if let Some(n) = args[0].as_float() {
+            n
+        } else {
+            return Err("- expects numbers".to_string());
+        };
+        for arg in &args[1..] {
+            if let Some(n) = arg.as_int() {
+                result -= n as f64;
+            } else if let Some(n) = arg.as_float() {
+                is_float = true;
+                result -= n;
+            } else {
+                return Err("- expects numbers".to_string());
+            }
+        }
+        Ok(if is_float { Value::float(result) } else { Value::int(result as i64) })
     }));
 
     vm.define_global("*", native("*", |args| {
@@ -600,68 +588,70 @@ pub fn standard_vm() -> VM {
         let mut is_float = false;
         let mut fprod = 1.0f64;
         for arg in args {
-            match arg {
-                Value::Int(n) => if is_float { fprod *= *n as f64 } else { prod *= n },
-                Value::Float(n) => { if !is_float { is_float = true; fprod = prod as f64; } fprod *= n },
-                _ => return Err("* expects numbers".to_string()),
+            if let Some(n) = arg.as_int() {
+                if is_float { fprod *= n as f64 } else { prod *= n }
+            } else if let Some(n) = arg.as_float() {
+                if !is_float { is_float = true; fprod = prod as f64; }
+                fprod *= n
+            } else {
+                return Err("* expects numbers".to_string());
             }
         }
-        Ok(if is_float { Value::Float(fprod) } else { Value::Int(prod) })
+        Ok(if is_float { Value::float(fprod) } else { Value::int(prod) })
     }));
 
     vm.define_global("/", native("/", |args| {
         if args.len() != 2 { return Err("/ expects 2 arguments".to_string()); }
-        let a = match &args[0] { Value::Int(n) => *n as f64, Value::Float(n) => *n, _ => return Err("/ expects numbers".to_string()) };
-        let b = match &args[1] { Value::Int(n) => *n as f64, Value::Float(n) => *n, _ => return Err("/ expects numbers".to_string()) };
+        let a = if let Some(n) = args[0].as_int() { n as f64 } else if let Some(n) = args[0].as_float() { n } else { return Err("/ expects numbers".to_string()) };
+        let b = if let Some(n) = args[1].as_int() { n as f64 } else if let Some(n) = args[1].as_float() { n } else { return Err("/ expects numbers".to_string()) };
         if b == 0.0 { return Err("Division by zero".to_string()); }
-        Ok(Value::Float(a / b))
+        Ok(Value::float(a / b))
     }));
 
     vm.define_global("mod", native("mod", |args| {
         if args.len() != 2 { return Err("mod expects 2 arguments".to_string()); }
-        match (&args[0], &args[1]) {
-            (Value::Int(a), Value::Int(b)) => {
-                if *b == 0 { return Err("Division by zero".to_string()); }
-                Ok(Value::Int(a % b))
-            }
-            _ => Err("mod expects integers".to_string()),
+        if let (Some(a), Some(b)) = (args[0].as_int(), args[1].as_int()) {
+            if b == 0 { return Err("Division by zero".to_string()); }
+            Ok(Value::int(a % b))
+        } else {
+            Err("mod expects integers".to_string())
         }
     }));
 
     // Comparison
     vm.define_global("<", native("<", |args| {
         if args.len() != 2 { return Err("< expects 2 arguments".to_string()); }
-        Ok(Value::Bool(compare_values(&args[0], &args[1])? == std::cmp::Ordering::Less))
+        Ok(Value::bool(compare_values(&args[0], &args[1])? == std::cmp::Ordering::Less))
     }));
 
     vm.define_global("<=", native("<=", |args| {
         if args.len() != 2 { return Err("<= expects 2 arguments".to_string()); }
-        Ok(Value::Bool(compare_values(&args[0], &args[1])? != std::cmp::Ordering::Greater))
+        Ok(Value::bool(compare_values(&args[0], &args[1])? != std::cmp::Ordering::Greater))
     }));
 
     vm.define_global(">", native(">", |args| {
         if args.len() != 2 { return Err("> expects 2 arguments".to_string()); }
-        Ok(Value::Bool(compare_values(&args[0], &args[1])? == std::cmp::Ordering::Greater))
+        Ok(Value::bool(compare_values(&args[0], &args[1])? == std::cmp::Ordering::Greater))
     }));
 
     vm.define_global(">=", native(">=", |args| {
         if args.len() != 2 { return Err(">= expects 2 arguments".to_string()); }
-        Ok(Value::Bool(compare_values(&args[0], &args[1])? != std::cmp::Ordering::Less))
+        Ok(Value::bool(compare_values(&args[0], &args[1])? != std::cmp::Ordering::Less))
     }));
 
     vm.define_global("=", native("=", |args| {
         if args.len() != 2 { return Err("= expects 2 arguments".to_string()); }
-        Ok(Value::Bool(args[0] == args[1]))
+        Ok(Value::bool(args[0] == args[1]))
     }));
 
     vm.define_global("!=", native("!=", |args| {
         if args.len() != 2 { return Err("!= expects 2 arguments".to_string()); }
-        Ok(Value::Bool(args[0] != args[1]))
+        Ok(Value::bool(args[0] != args[1]))
     }));
 
     vm.define_global("not", native("not", |args| {
         if args.len() != 1 { return Err("not expects 1 argument".to_string()); }
-        Ok(Value::Bool(!args[0].is_truthy()))
+        Ok(Value::bool(!args[0].is_truthy()))
     }));
 
     // List operations
@@ -690,10 +680,12 @@ pub fn standard_vm() -> VM {
 
     vm.define_global("length", native("length", |args| {
         if args.len() != 1 { return Err("length expects 1 argument".to_string()); }
-        match &args[0] {
-            Value::List(items) => Ok(Value::Int(items.len() as i64)),
-            Value::String(s) => Ok(Value::Int(s.len() as i64)),
-            _ => Err("length expects list or string".to_string()),
+        if let Some(items) = args[0].as_list() {
+            Ok(Value::int(items.len() as i64))
+        } else if let Some(s) = args[0].as_string() {
+            Ok(Value::int(s.len() as i64))
+        } else {
+            Err("length expects list or string".to_string())
         }
     }));
 
@@ -701,60 +693,62 @@ pub fn standard_vm() -> VM {
     vm.define_global("print", native("print", |args| {
         for (i, arg) in args.iter().enumerate() {
             if i > 0 { print!(" "); }
-            match arg {
-                Value::String(s) => print!("{}", s),
-                other => print!("{}", other),
+            if let Some(s) = arg.as_string() {
+                print!("{}", s);
+            } else {
+                print!("{}", arg);
             }
         }
-        Ok(Value::Nil)
+        Ok(Value::nil())
     }));
 
     vm.define_global("println", native("println", |args| {
         for (i, arg) in args.iter().enumerate() {
             if i > 0 { print!(" "); }
-            match arg {
-                Value::String(s) => print!("{}", s),
-                other => print!("{}", other),
+            if let Some(s) = arg.as_string() {
+                print!("{}", s);
+            } else {
+                print!("{}", arg);
             }
         }
         println!();
-        Ok(Value::Nil)
+        Ok(Value::nil())
     }));
 
     // Type predicates
     vm.define_global("nil?", native("nil?", |args| {
         if args.len() != 1 { return Err("nil? expects 1 argument".to_string()); }
-        Ok(Value::Bool(matches!(args[0], Value::Nil)))
+        Ok(Value::bool(args[0].is_nil()))
     }));
 
     vm.define_global("int?", native("int?", |args| {
         if args.len() != 1 { return Err("int? expects 1 argument".to_string()); }
-        Ok(Value::Bool(matches!(args[0], Value::Int(_))))
+        Ok(Value::bool(args[0].is_int()))
     }));
 
     vm.define_global("float?", native("float?", |args| {
         if args.len() != 1 { return Err("float? expects 1 argument".to_string()); }
-        Ok(Value::Bool(matches!(args[0], Value::Float(_))))
+        Ok(Value::bool(args[0].is_float()))
     }));
 
     vm.define_global("string?", native("string?", |args| {
         if args.len() != 1 { return Err("string? expects 1 argument".to_string()); }
-        Ok(Value::Bool(matches!(args[0], Value::String(_))))
+        Ok(Value::bool(args[0].as_string().is_some()))
     }));
 
     vm.define_global("list?", native("list?", |args| {
         if args.len() != 1 { return Err("list? expects 1 argument".to_string()); }
-        Ok(Value::Bool(matches!(args[0], Value::List(_))))
+        Ok(Value::bool(args[0].as_list().is_some()))
     }));
 
     vm.define_global("fn?", native("fn?", |args| {
         if args.len() != 1 { return Err("fn? expects 1 argument".to_string()); }
-        Ok(Value::Bool(matches!(args[0], Value::Function(_) | Value::NativeFunction(_) | Value::CompiledFunction(_))))
+        Ok(Value::bool(args[0].as_function().is_some() || args[0].as_native_function().is_some() || args[0].as_compiled_function().is_some()))
     }));
 
     vm.define_global("symbol?", native("symbol?", |args| {
         if args.len() != 1 { return Err("symbol? expects 1 argument".to_string()); }
-        Ok(Value::Bool(matches!(args[0], Value::Symbol(_))))
+        Ok(Value::bool(args[0].as_symbol().is_some()))
     }));
 
     // Symbol operations (useful for macros)
@@ -779,33 +773,39 @@ where
     FI: Fn(i64, i64) -> i64,
     FF: Fn(f64, f64) -> f64,
 {
-    match (a, b) {
-        (Value::Int(x), Value::Int(y)) => Ok(Value::Int(int_op(*x, *y))),
-        (Value::Float(x), Value::Float(y)) => Ok(Value::Float(float_op(*x, *y))),
-        (Value::Int(x), Value::Float(y)) => Ok(Value::Float(float_op(*x as f64, *y))),
-        (Value::Float(x), Value::Int(y)) => Ok(Value::Float(float_op(*x, *y as f64))),
-        _ => Err(format!("{} expects numbers", name)),
+    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+        return Ok(Value::int(int_op(x, y)));
     }
+    if let (Some(x), Some(y)) = (a.as_float(), b.as_float()) {
+        return Ok(Value::float(float_op(x, y)));
+    }
+    if let (Some(x), Some(y)) = (a.as_int(), b.as_float()) {
+        return Ok(Value::float(float_op(x as f64, y)));
+    }
+    if let (Some(x), Some(y)) = (a.as_float(), b.as_int()) {
+        return Ok(Value::float(float_op(x, y as f64)));
+    }
+    Err(format!("{} expects numbers", name))
 }
 
 fn compare_values(a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> {
-    match (a, b) {
-        (Value::Int(x), Value::Int(y)) => Ok(x.cmp(y)),
-        (Value::Float(x), Value::Float(y)) => x
-            .partial_cmp(y)
-            .ok_or_else(|| "Cannot compare NaN".to_string()),
-        (Value::Int(x), Value::Float(y)) => (*x as f64)
-            .partial_cmp(y)
-            .ok_or_else(|| "Cannot compare NaN".to_string()),
-        (Value::Float(x), Value::Int(y)) => x
-            .partial_cmp(&(*y as f64))
-            .ok_or_else(|| "Cannot compare NaN".to_string()),
-        _ => Err(format!(
-            "Cannot compare {} and {}",
-            a.type_name(),
-            b.type_name()
-        )),
+    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+        return Ok(x.cmp(&y));
     }
+    if let (Some(x), Some(y)) = (a.as_float(), b.as_float()) {
+        return x.partial_cmp(&y).ok_or_else(|| "Cannot compare NaN".to_string());
+    }
+    if let (Some(x), Some(y)) = (a.as_int(), b.as_float()) {
+        return (x as f64).partial_cmp(&y).ok_or_else(|| "Cannot compare NaN".to_string());
+    }
+    if let (Some(x), Some(y)) = (a.as_float(), b.as_int()) {
+        return x.partial_cmp(&(y as f64)).ok_or_else(|| "Cannot compare NaN".to_string());
+    }
+    Err(format!(
+        "Cannot compare {} and {}",
+        a.type_name(),
+        b.type_name()
+    ))
 }
 
 #[cfg(test)]
@@ -816,21 +816,21 @@ mod tests {
     #[test]
     fn test_vm_simple() {
         let mut chunk = Chunk::new();
-        let idx = chunk.add_constant(Value::Int(42));
+        let idx = chunk.add_constant(Value::int(42));
         chunk.emit(Op::LoadConst(0, idx));
         chunk.emit(Op::Return(0));
         chunk.num_registers = 16;
 
         let mut vm = VM::new();
         let result = vm.run(chunk).unwrap();
-        assert_eq!(result, Value::Int(42));
+        assert_eq!(result, Value::int(42));
     }
 
     #[test]
     fn test_vm_arithmetic() {
         let mut chunk = Chunk::new();
-        let idx1 = chunk.add_constant(Value::Int(10));
-        let idx2 = chunk.add_constant(Value::Int(3));
+        let idx1 = chunk.add_constant(Value::int(10));
+        let idx2 = chunk.add_constant(Value::int(3));
         chunk.emit(Op::LoadConst(0, idx1));
         chunk.emit(Op::LoadConst(1, idx2));
         chunk.emit(Op::Add(2, 0, 1));
@@ -839,14 +839,14 @@ mod tests {
 
         let mut vm = VM::new();
         let result = vm.run(chunk).unwrap();
-        assert_eq!(result, Value::Int(13));
+        assert_eq!(result, Value::int(13));
     }
 
     #[test]
     fn test_vm_comparison() {
         let mut chunk = Chunk::new();
-        let idx1 = chunk.add_constant(Value::Int(5));
-        let idx2 = chunk.add_constant(Value::Int(10));
+        let idx1 = chunk.add_constant(Value::int(5));
+        let idx2 = chunk.add_constant(Value::int(10));
         chunk.emit(Op::LoadConst(0, idx1));
         chunk.emit(Op::LoadConst(1, idx2));
         chunk.emit(Op::Lt(2, 0, 1));
@@ -855,7 +855,7 @@ mod tests {
 
         let mut vm = VM::new();
         let result = vm.run(chunk).unwrap();
-        assert_eq!(result, Value::Bool(true));
+        assert_eq!(result, Value::bool(true));
     }
 
     #[test]
@@ -863,11 +863,11 @@ mod tests {
         let mut chunk = Chunk::new();
         chunk.emit(Op::LoadTrue(0));
         let jump_pos = chunk.emit(Op::JumpIfFalse(0, 0));
-        let idx = chunk.add_constant(Value::Int(1));
+        let idx = chunk.add_constant(Value::int(1));
         chunk.emit(Op::LoadConst(1, idx));
         let jump_over = chunk.emit(Op::Jump(0));
         let else_pos = chunk.current_pos();
-        let idx2 = chunk.add_constant(Value::Int(2));
+        let idx2 = chunk.add_constant(Value::int(2));
         chunk.emit(Op::LoadConst(1, idx2));
         let end = chunk.current_pos();
         chunk.patch_jump(jump_pos, else_pos);
@@ -877,7 +877,7 @@ mod tests {
 
         let mut vm = VM::new();
         let result = vm.run(chunk).unwrap();
-        assert_eq!(result, Value::Int(1));
+        assert_eq!(result, Value::int(1));
     }
 
     #[test]

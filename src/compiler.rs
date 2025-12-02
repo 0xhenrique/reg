@@ -40,116 +40,123 @@ pub struct Compiler {
 
 /// Check if an expression is pure (no side effects)
 fn is_pure_expr_with_fns(expr: &Value, pure_fns: &PureFunctions) -> bool {
-    match expr {
-        // Literals are pure
-        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Nil | Value::String(_) => true,
-        // Symbols are pure (just variable references)
-        Value::Symbol(_) => true,
-        // Lists need to be checked
-        Value::List(items) if items.is_empty() => true,
-        Value::List(items) => {
-            let first = &items[0];
-            if let Some(sym) = first.as_symbol() {
-                match sym {
-                    // Pure built-in operations
-                    "+" | "-" | "*" | "/" | "mod" | "<" | "<=" | ">" | ">=" | "=" | "!=" | "not" => {
-                        items[1..].iter().all(|e| is_pure_expr_with_fns(e, pure_fns))
-                    }
-                    // Conditional is pure if branches are pure
-                    "if" => items[1..].iter().all(|e| is_pure_expr_with_fns(e, pure_fns)),
-                    // Let is pure if bindings and body are pure
-                    "let" => {
-                        if items.len() >= 3 {
-                            if let Some(bindings) = items[1].as_list() {
-                                bindings.iter().all(|e| is_pure_expr_with_fns(e, pure_fns)) &&
-                                items[2..].iter().all(|e| is_pure_expr_with_fns(e, pure_fns))
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    }
-                    // Quote is pure
-                    "quote" => true,
-                    // Check if it's a known pure function
-                    _ => {
-                        if pure_fns.get(sym).is_some() {
-                            // It's a call to a known pure function, check args are pure
-                            items[1..].iter().all(|e| is_pure_expr_with_fns(e, pure_fns))
-                        } else {
-                            false
-                        }
-                    }
+    // Literals are pure
+    if expr.is_nil() || expr.is_bool() || expr.is_int() || expr.is_float() {
+        return true;
+    }
+    if expr.as_string().is_some() {
+        return true;
+    }
+    // Symbols are pure (just variable references)
+    if expr.as_symbol().is_some() {
+        return true;
+    }
+    // Lists need to be checked
+    if let Some(items) = expr.as_list() {
+        if items.is_empty() {
+            return true;
+        }
+        let first = &items[0];
+        if let Some(sym) = first.as_symbol() {
+            match sym {
+                // Pure built-in operations
+                "+" | "-" | "*" | "/" | "mod" | "<" | "<=" | ">" | ">=" | "=" | "!=" | "not" => {
+                    return items[1..].iter().all(|e| is_pure_expr_with_fns(e, pure_fns));
                 }
-            } else {
-                false
+                // Conditional is pure if branches are pure
+                "if" => {
+                    return items[1..].iter().all(|e| is_pure_expr_with_fns(e, pure_fns));
+                }
+                // Let is pure if bindings and body are pure
+                "let" => {
+                    if items.len() >= 3 {
+                        if let Some(bindings) = items[1].as_list() {
+                            return bindings.iter().all(|e| is_pure_expr_with_fns(e, pure_fns)) &&
+                                items[2..].iter().all(|e| is_pure_expr_with_fns(e, pure_fns));
+                        }
+                    }
+                    return false;
+                }
+                // Quote is pure
+                "quote" => return true,
+                // Check if it's a known pure function
+                _ => {
+                    if pure_fns.get(sym).is_some() {
+                        // It's a call to a known pure function, check args are pure
+                        return items[1..].iter().all(|e| is_pure_expr_with_fns(e, pure_fns));
+                    }
+                    return false;
+                }
             }
         }
-        _ => false,
+        return false;
     }
+    false
 }
 
 
 /// Try to evaluate a constant expression recursively, including pure function calls
 fn try_const_eval_with_fns(expr: &Value, pure_fns: &PureFunctions) -> Option<Value> {
-    match expr {
-        // Literals are constants
-        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Nil | Value::String(_) => {
-            Some(expr.clone())
-        }
-        // Try to fold function calls
-        Value::List(items) if !items.is_empty() => {
-            let op = items[0].as_symbol()?;
-            let args = &items[1..];
-
-            // First try built-in operations
-            let const_args: Option<Vec<Value>> = args.iter()
-                .map(|a| try_const_eval_with_fns(a, pure_fns))
-                .collect();
-            let const_args = const_args?;
-            let const_refs: Vec<&Value> = const_args.iter().collect();
-
-            if let Some(result) = fold_op(op, &const_refs) {
-                return Some(result);
-            }
-
-            // Try pure user-defined functions
-            if let Some(pure_fn) = pure_fns.get(op) {
-                if pure_fn.params.len() == const_args.len() {
-                    // Substitute parameters with constant values
-                    let substituted = substitute(&pure_fn.body, &pure_fn.params, &const_args);
-                    // Recursively evaluate the substituted body
-                    return try_const_eval_with_fns(&substituted, pure_fns);
-                }
-            }
-
-            None
-        }
-        _ => None,
+    // Literals are constants
+    if expr.is_nil() || expr.is_bool() || expr.is_int() || expr.is_float() {
+        return Some(expr.clone());
     }
+    if expr.as_string().is_some() {
+        return Some(expr.clone());
+    }
+
+    // Try to fold function calls
+    if let Some(items) = expr.as_list() {
+        if items.is_empty() {
+            return None;
+        }
+        let op = items[0].as_symbol()?;
+        let args = &items[1..];
+
+        // First try built-in operations
+        let const_args: Option<Vec<Value>> = args.iter()
+            .map(|a| try_const_eval_with_fns(a, pure_fns))
+            .collect();
+        let const_args = const_args?;
+        let const_refs: Vec<&Value> = const_args.iter().collect();
+
+        if let Some(result) = fold_op(op, &const_refs) {
+            return Some(result);
+        }
+
+        // Try pure user-defined functions
+        if let Some(pure_fn) = pure_fns.get(op) {
+            if pure_fn.params.len() == const_args.len() {
+                // Substitute parameters with constant values
+                let substituted = substitute(&pure_fn.body, &pure_fn.params, &const_args);
+                // Recursively evaluate the substituted body
+                return try_const_eval_with_fns(&substituted, pure_fns);
+            }
+        }
+
+        return None;
+    }
+    None
 }
 
 /// Substitute parameters with values in an expression
 fn substitute(expr: &Value, params: &[String], args: &[Value]) -> Value {
-    match expr {
-        Value::Symbol(name) => {
-            for (i, param) in params.iter().enumerate() {
-                if param == name.as_ref() {
-                    return args[i].clone();
-                }
+    if let Some(name) = expr.as_symbol() {
+        for (i, param) in params.iter().enumerate() {
+            if param == name {
+                return args[i].clone();
             }
-            expr.clone()
         }
-        Value::List(items) => {
-            let new_items: Vec<Value> = items
-                .iter()
-                .map(|item| substitute(item, params, args))
-                .collect();
-            Value::list(new_items)
-        }
-        _ => expr.clone(),
+        return expr.clone();
     }
+    if let Some(items) = expr.as_list() {
+        let new_items: Vec<Value> = items
+            .iter()
+            .map(|item| substitute(item, params, args))
+            .collect();
+        return Value::list(new_items);
+    }
+    expr.clone()
 }
 
 /// Try to fold an operation with constant arguments
@@ -177,29 +184,27 @@ fn fold_add(args: &[&Value]) -> Option<Value> {
     let mut is_float = false;
 
     for arg in args {
-        match arg {
-            Value::Int(n) => {
-                if is_float {
-                    sum_float += *n as f64;
-                } else {
-                    sum_int += n;
-                }
+        if let Some(n) = arg.as_int() {
+            if is_float {
+                sum_float += n as f64;
+            } else {
+                sum_int += n;
             }
-            Value::Float(n) => {
-                if !is_float {
-                    is_float = true;
-                    sum_float = sum_int as f64;
-                }
-                sum_float += n;
+        } else if let Some(n) = arg.as_float() {
+            if !is_float {
+                is_float = true;
+                sum_float = sum_int as f64;
             }
-            _ => return None,
+            sum_float += n;
+        } else {
+            return None;
         }
     }
 
     Some(if is_float {
-        Value::Float(sum_float)
+        Value::float(sum_float)
     } else {
-        Value::Int(sum_int)
+        Value::int(sum_int)
     })
 }
 
@@ -208,35 +213,39 @@ fn fold_sub(args: &[&Value]) -> Option<Value> {
         return None;
     }
     if args.len() == 1 {
-        return match args[0] {
-            Value::Int(n) => Some(Value::Int(-n)),
-            Value::Float(n) => Some(Value::Float(-n)),
-            _ => None,
-        };
+        if let Some(n) = args[0].as_int() {
+            return Some(Value::int(-n));
+        } else if let Some(n) = args[0].as_float() {
+            return Some(Value::float(-n));
+        } else {
+            return None;
+        }
     }
 
-    let mut result = match args[0] {
-        Value::Int(n) => *n as f64,
-        Value::Float(n) => *n,
-        _ => return None,
+    let mut is_float = args[0].is_float();
+    let mut result = if let Some(n) = args[0].as_int() {
+        n as f64
+    } else if let Some(n) = args[0].as_float() {
+        n
+    } else {
+        return None;
     };
-    let mut is_float = matches!(args[0], Value::Float(_));
 
     for arg in &args[1..] {
-        match arg {
-            Value::Int(n) => result -= *n as f64,
-            Value::Float(n) => {
-                is_float = true;
-                result -= n;
-            }
-            _ => return None,
+        if let Some(n) = arg.as_int() {
+            result -= n as f64;
+        } else if let Some(n) = arg.as_float() {
+            is_float = true;
+            result -= n;
+        } else {
+            return None;
         }
     }
 
     Some(if is_float {
-        Value::Float(result)
+        Value::float(result)
     } else {
-        Value::Int(result as i64)
+        Value::int(result as i64)
     })
 }
 
@@ -246,29 +255,27 @@ fn fold_mul(args: &[&Value]) -> Option<Value> {
     let mut is_float = false;
 
     for arg in args {
-        match arg {
-            Value::Int(n) => {
-                if is_float {
-                    prod_float *= *n as f64;
-                } else {
-                    prod_int *= n;
-                }
+        if let Some(n) = arg.as_int() {
+            if is_float {
+                prod_float *= n as f64;
+            } else {
+                prod_int *= n;
             }
-            Value::Float(n) => {
-                if !is_float {
-                    is_float = true;
-                    prod_float = prod_int as f64;
-                }
-                prod_float *= n;
+        } else if let Some(n) = arg.as_float() {
+            if !is_float {
+                is_float = true;
+                prod_float = prod_int as f64;
             }
-            _ => return None,
+            prod_float *= n;
+        } else {
+            return None;
         }
     }
 
     Some(if is_float {
-        Value::Float(prod_float)
+        Value::float(prod_float)
     } else {
-        Value::Int(prod_int)
+        Value::int(prod_int)
     })
 }
 
@@ -276,42 +283,46 @@ fn fold_div(args: &[&Value]) -> Option<Value> {
     if args.len() != 2 {
         return None;
     }
-    let a = match args[0] {
-        Value::Int(n) => *n as f64,
-        Value::Float(n) => *n,
-        _ => return None,
+    let a = if let Some(n) = args[0].as_int() {
+        n as f64
+    } else if let Some(n) = args[0].as_float() {
+        n
+    } else {
+        return None;
     };
-    let b = match args[1] {
-        Value::Int(n) => *n as f64,
-        Value::Float(n) => *n,
-        _ => return None,
+    let b = if let Some(n) = args[1].as_int() {
+        n as f64
+    } else if let Some(n) = args[1].as_float() {
+        n
+    } else {
+        return None;
     };
     if b == 0.0 {
         return None; // Don't fold division by zero
     }
-    Some(Value::Float(a / b))
+    Some(Value::float(a / b))
 }
 
 fn fold_mod(args: &[&Value]) -> Option<Value> {
     if args.len() != 2 {
         return None;
     }
-    match (args[0], args[1]) {
-        (Value::Int(a), Value::Int(b)) => {
-            if *b == 0 {
-                return None;
-            }
-            Some(Value::Int(a % b))
+    if let (Some(a), Some(b)) = (args[0].as_int(), args[1].as_int()) {
+        if b == 0 {
+            return None;
         }
-        _ => None,
+        return Some(Value::int(a % b));
     }
+    None
 }
 
 fn to_f64(v: &Value) -> Option<f64> {
-    match v {
-        Value::Int(n) => Some(*n as f64),
-        Value::Float(n) => Some(*n),
-        _ => None,
+    if let Some(n) = v.as_int() {
+        Some(n as f64)
+    } else if let Some(n) = v.as_float() {
+        Some(n)
+    } else {
+        None
     }
 }
 
@@ -321,28 +332,28 @@ fn fold_cmp<F: Fn(f64, f64) -> bool>(args: &[&Value], cmp: F) -> Option<Value> {
     }
     let a = to_f64(args[0])?;
     let b = to_f64(args[1])?;
-    Some(Value::Bool(cmp(a, b)))
+    Some(Value::bool(cmp(a, b)))
 }
 
 fn fold_eq(args: &[&Value]) -> Option<Value> {
     if args.len() != 2 {
         return None;
     }
-    Some(Value::Bool(args[0] == args[1]))
+    Some(Value::bool(args[0] == args[1]))
 }
 
 fn fold_ne(args: &[&Value]) -> Option<Value> {
     if args.len() != 2 {
         return None;
     }
-    Some(Value::Bool(args[0] != args[1]))
+    Some(Value::bool(args[0] != args[1]))
 }
 
 fn fold_not(args: &[&Value]) -> Option<Value> {
     if args.len() != 1 {
         return None;
     }
-    Some(Value::Bool(!args[0].is_truthy()))
+    Some(Value::bool(!args[0].is_truthy()))
 }
 
 impl Compiler {
@@ -432,56 +443,50 @@ impl Compiler {
     }
 
     fn compile_expr(&mut self, expr: &Value, dest: Reg, tail_pos: bool) -> Result<(), String> {
-        match expr {
-            Value::Nil => {
-                self.emit(Op::LoadNil(dest));
-            }
-            Value::Bool(true) => {
+        if expr.is_nil() {
+            self.emit(Op::LoadNil(dest));
+        } else if let Some(b) = expr.as_bool() {
+            if b {
                 self.emit(Op::LoadTrue(dest));
-            }
-            Value::Bool(false) => {
+            } else {
                 self.emit(Op::LoadFalse(dest));
             }
-            Value::Int(_) | Value::Float(_) | Value::String(_) => {
-                let idx = self.add_constant(expr.clone());
+        } else if expr.is_int() || expr.is_float() || expr.as_string().is_some() {
+            let idx = self.add_constant(expr.clone());
+            self.emit(Op::LoadConst(dest, idx));
+        } else if let Some(name) = expr.as_symbol() {
+            if let Some(reg) = self.resolve_local(name) {
+                if reg != dest {
+                    self.emit(Op::Move(dest, reg));
+                }
+            } else {
+                let idx = self.add_constant(Value::symbol(name));
+                self.emit(Op::GetGlobal(dest, idx));
+            }
+        } else if let Some(items) = expr.as_list() {
+            if items.is_empty() {
+                let idx = self.add_constant(Value::list(vec![]));
                 self.emit(Op::LoadConst(dest, idx));
+                return Ok(());
             }
-            Value::Symbol(name) => {
-                if let Some(reg) = self.resolve_local(name) {
-                    if reg != dest {
-                        self.emit(Op::Move(dest, reg));
-                    }
-                } else {
-                    let idx = self.add_constant(Value::symbol(name));
-                    self.emit(Op::GetGlobal(dest, idx));
-                }
-            }
-            Value::List(items) => {
-                if items.is_empty() {
-                    let idx = self.add_constant(Value::list(vec![]));
-                    self.emit(Op::LoadConst(dest, idx));
-                    return Ok(());
-                }
 
-                let first = &items[0];
-                if let Some(sym) = first.as_symbol() {
-                    match sym {
-                        "quote" => return self.compile_quote(&items[1..], dest),
-                        "if" => return self.compile_if(&items[1..], dest, tail_pos),
-                        "def" => return self.compile_def(&items[1..], dest),
-                        "let" => return self.compile_let(&items[1..], dest, tail_pos),
-                        "fn" => return self.compile_fn(&items[1..], dest),
-                        "do" => return self.compile_do(&items[1..], dest, tail_pos),
-                        _ => {}
-                    }
+            let first = &items[0];
+            if let Some(sym) = first.as_symbol() {
+                match sym {
+                    "quote" => return self.compile_quote(&items[1..], dest),
+                    "if" => return self.compile_if(&items[1..], dest, tail_pos),
+                    "def" => return self.compile_def(&items[1..], dest),
+                    "let" => return self.compile_let(&items[1..], dest, tail_pos),
+                    "fn" => return self.compile_fn(&items[1..], dest),
+                    "do" => return self.compile_do(&items[1..], dest, tail_pos),
+                    _ => {}
                 }
+            }
 
-                // Function call
-                self.compile_call(items, dest, tail_pos)?;
-            }
-            Value::Function(_) | Value::NativeFunction(_) | Value::CompiledFunction(_) => {
-                return Err("Cannot compile function value directly".to_string());
-            }
+            // Function call
+            self.compile_call(items, dest, tail_pos)?;
+        } else if expr.as_function().is_some() || expr.as_native_function().is_some() || expr.as_compiled_function().is_some() {
+            return Err("Cannot compile function value directly".to_string());
         }
         Ok(())
     }
@@ -954,7 +959,7 @@ mod tests {
         let chunk = compile_str("(+ 1 2 3)").unwrap();
         // Should fold to LoadConst 6, not a call
         assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
-        assert_eq!(chunk.constants[0], Value::Int(6));
+        assert_eq!(chunk.constants[0], Value::int(6));
         // No function calls
         let has_call = chunk.code.iter().any(|op| matches!(op, Op::Call(_, _, _) | Op::TailCall(_, _)));
         assert!(!has_call);
@@ -965,25 +970,25 @@ mod tests {
         let chunk = compile_str("(* 2 (+ 3 4))").unwrap();
         // Should fold to LoadConst 14
         assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
-        assert_eq!(chunk.constants[0], Value::Int(14));
+        assert_eq!(chunk.constants[0], Value::int(14));
     }
 
     #[test]
     fn test_constant_folding_comparison() {
         let chunk = compile_str("(< 1 2)").unwrap();
         assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
-        assert_eq!(chunk.constants[0], Value::Bool(true));
+        assert_eq!(chunk.constants[0], Value::bool(true));
 
         let chunk = compile_str("(>= 5 10)").unwrap();
         assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
-        assert_eq!(chunk.constants[0], Value::Bool(false));
+        assert_eq!(chunk.constants[0], Value::bool(false));
     }
 
     #[test]
     fn test_constant_folding_not() {
         let chunk = compile_str("(not false)").unwrap();
         assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
-        assert_eq!(chunk.constants[0], Value::Bool(true));
+        assert_eq!(chunk.constants[0], Value::bool(true));
     }
 
     #[test]
@@ -1003,14 +1008,14 @@ mod tests {
     fn test_constant_folding_division() {
         let chunk = compile_str("(/ 10 2)").unwrap();
         assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
-        assert_eq!(chunk.constants[0], Value::Float(5.0));
+        assert_eq!(chunk.constants[0], Value::float(5.0));
     }
 
     #[test]
     fn test_constant_folding_mod() {
         let chunk = compile_str("(mod 17 5)").unwrap();
         assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
-        assert_eq!(chunk.constants[0], Value::Int(2));
+        assert_eq!(chunk.constants[0], Value::int(2));
     }
 
     #[test]
@@ -1023,7 +1028,7 @@ mod tests {
 
         // The call (square 5) should be folded to 25
         // Look for LoadConst 25 in the chunk
-        let has_25 = chunk.constants.iter().any(|c| *c == Value::Int(25));
+        let has_25 = chunk.constants.iter().any(|c| *c == Value::int(25));
         assert!(has_25, "Expected constant 25 from folding (square 5)");
 
         // Should NOT have a function call for (square 5)
@@ -1039,7 +1044,7 @@ mod tests {
         let chunk = Compiler::compile_all(&exprs).unwrap();
 
         // (quad 3) = (double (double 3)) = (double 6) = 12
-        let has_12 = chunk.constants.iter().any(|c| *c == Value::Int(12));
+        let has_12 = chunk.constants.iter().any(|c| *c == Value::int(12));
         assert!(has_12, "Expected constant 12 from folding (quad 3)");
     }
 

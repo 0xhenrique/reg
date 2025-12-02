@@ -84,89 +84,87 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, String> {
 
 /// Inner eval that tracks tail position and returns Trampoline
 fn eval_inner(expr: &Value, env: &Env, tail_pos: bool) -> Result<Trampoline, String> {
-    match expr {
-        // Self-evaluating forms
-        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::String(_) => {
-            Ok(Trampoline::Value(expr.clone()))
-        }
+    // Self-evaluating forms
+    if expr.is_nil() || expr.is_bool() || expr.is_int() || expr.is_float() || expr.as_string().is_some() {
+        return Ok(Trampoline::Value(expr.clone()));
+    }
 
-        // Functions evaluate to themselves
-        Value::Function(_) | Value::NativeFunction(_) | Value::CompiledFunction(_) => {
-            Ok(Trampoline::Value(expr.clone()))
-        }
+    // Functions evaluate to themselves
+    if expr.as_function().is_some() || expr.as_native_function().is_some() || expr.as_compiled_function().is_some() {
+        return Ok(Trampoline::Value(expr.clone()));
+    }
 
-        // Symbol lookup
-        Value::Symbol(name) => env
+    // Symbol lookup
+    if let Some(name) = expr.as_symbol() {
+        return env
             .get(name)
             .map(Trampoline::Value)
-            .ok_or_else(|| format!("Undefined variable: {}", name)),
-
-        // List: function call or special form
-        Value::List(items) => {
-            if items.is_empty() {
-                return Ok(Trampoline::Value(Value::list(vec![]))); // () evaluates to ()
-            }
-
-            let first = &items[0];
-
-            // Check for special forms
-            if let Some(sym) = first.as_symbol() {
-                match sym {
-                    "quote" => return eval_quote(&items[1..]),
-                    "if" => return eval_if(&items[1..], env, tail_pos),
-                    "def" => return eval_def(&items[1..], env),
-                    "let" => return eval_let(&items[1..], env, tail_pos),
-                    "fn" => return eval_fn(&items[1..], env),
-                    "do" => return eval_do(&items[1..], env, tail_pos),
-                    _ => {}
-                }
-            }
-
-            // Regular function call - evaluate function and arguments
-            let func = eval(first, env)?;
-            let args: Result<Vec<Value>, String> =
-                items[1..].iter().map(|arg| eval(arg, env)).collect();
-            let args = args?;
-
-            apply(&func, args, tail_pos)
-        }
+            .ok_or_else(|| format!("Undefined variable: {}", name));
     }
+
+    // List: function call or special form
+    if let Some(items) = expr.as_list() {
+        if items.is_empty() {
+            return Ok(Trampoline::Value(Value::list(vec![]))); // () evaluates to ()
+        }
+
+        let first = &items[0];
+
+        // Check for special forms
+        if let Some(sym) = first.as_symbol() {
+            match sym {
+                "quote" => return eval_quote(&items[1..]),
+                "if" => return eval_if(&items[1..], env, tail_pos),
+                "def" => return eval_def(&items[1..], env),
+                "let" => return eval_let(&items[1..], env, tail_pos),
+                "fn" => return eval_fn(&items[1..], env),
+                "do" => return eval_do(&items[1..], env, tail_pos),
+                _ => {}
+            }
+        }
+
+        // Regular function call - evaluate function and arguments
+        let func = eval(first, env)?;
+        let args: Result<Vec<Value>, String> =
+            items[1..].iter().map(|arg| eval(arg, env)).collect();
+        let args = args?;
+
+        return apply(&func, args, tail_pos);
+    }
+
+    Err("Unknown expression type".to_string())
 }
 
 /// Apply a function to arguments
 fn apply(func: &Value, args: Vec<Value>, tail_pos: bool) -> Result<Trampoline, String> {
-    match func {
-        Value::Function(f) => {
-            if f.params.len() != args.len() {
-                return Err(format!(
-                    "Expected {} arguments, got {}",
-                    f.params.len(),
-                    args.len()
-                ));
-            }
-
-            if tail_pos {
-                // In tail position: return thunk for trampoline
-                Ok(Trampoline::TailCall {
-                    func: f.clone(),
-                    args,
-                })
-            } else {
-                // Not in tail position: evaluate now (will trampoline internally)
-                let call_env = f.env.extend();
-                for (param, arg) in f.params.iter().zip(args.iter()) {
-                    call_env.define(param, arg.clone());
-                }
-                eval_inner(&f.body, &call_env, true)
-            }
+    if let Some(f) = func.as_function() {
+        if f.params.len() != args.len() {
+            return Err(format!(
+                "Expected {} arguments, got {}",
+                f.params.len(),
+                args.len()
+            ));
         }
 
-        Value::NativeFunction(nf) => {
-            let result = (nf.func)(&args)?;
-            Ok(Trampoline::Value(result))
+        if tail_pos {
+            // In tail position: return thunk for trampoline
+            Ok(Trampoline::TailCall {
+                func: f.clone(),
+                args,
+            })
+        } else {
+            // Not in tail position: evaluate now (will trampoline internally)
+            let call_env = f.env.extend();
+            for (param, arg) in f.params.iter().zip(args.iter()) {
+                call_env.define(param, arg.clone());
+            }
+            eval_inner(&f.body, &call_env, true)
         }
-
-        _ => Err(format!("Not a function: {}", func)),
+    } else if let Some(nf) = func.as_native_function() {
+        let result = (nf.func)(&args)?;
+        Ok(Trampoline::Value(result))
+    } else {
+        Err(format!("Not a function: {}", func))
     }
 }
 
@@ -363,29 +361,27 @@ fn builtin_add(args: &[Value]) -> Result<Value, String> {
     let mut is_float = false;
 
     for arg in args {
-        match arg {
-            Value::Int(n) => {
-                if is_float {
-                    float_sum += *n as f64;
-                } else {
-                    int_sum += n;
-                }
+        if let Some(n) = arg.as_int() {
+            if is_float {
+                float_sum += n as f64;
+            } else {
+                int_sum += n;
             }
-            Value::Float(n) => {
-                if !is_float {
-                    is_float = true;
-                    float_sum = int_sum as f64;
-                }
-                float_sum += n;
+        } else if let Some(n) = arg.as_float() {
+            if !is_float {
+                is_float = true;
+                float_sum = int_sum as f64;
             }
-            _ => return Err(format!("+ expects numbers, got {}", arg.type_name())),
+            float_sum += n;
+        } else {
+            return Err(format!("+ expects numbers, got {}", arg.type_name()));
         }
     }
 
     if is_float {
-        Ok(Value::Float(float_sum))
+        Ok(Value::float(float_sum))
     } else {
-        Ok(Value::Int(int_sum))
+        Ok(Value::int(int_sum))
     }
 }
 
@@ -396,38 +392,39 @@ fn builtin_sub(args: &[Value]) -> Result<Value, String> {
 
     if args.len() == 1 {
         // Unary minus
-        return match &args[0] {
-            Value::Int(n) => Ok(Value::Int(-n)),
-            Value::Float(n) => Ok(Value::Float(-n)),
-            _ => Err(format!("- expects numbers, got {}", args[0].type_name())),
-        };
+        if let Some(n) = args[0].as_int() {
+            return Ok(Value::int(-n));
+        } else if let Some(n) = args[0].as_float() {
+            return Ok(Value::float(-n));
+        } else {
+            return Err(format!("- expects numbers, got {}", args[0].type_name()));
+        }
     }
 
-    let mut is_float = false;
-    let mut result = match &args[0] {
-        Value::Int(n) => *n as f64,
-        Value::Float(n) => {
-            is_float = true;
-            *n
-        }
-        _ => return Err(format!("- expects numbers, got {}", args[0].type_name())),
+    let mut is_float = args[0].is_float();
+    let mut result = if let Some(n) = args[0].as_int() {
+        n as f64
+    } else if let Some(n) = args[0].as_float() {
+        n
+    } else {
+        return Err(format!("- expects numbers, got {}", args[0].type_name()));
     };
 
     for arg in &args[1..] {
-        match arg {
-            Value::Int(n) => result -= *n as f64,
-            Value::Float(n) => {
-                is_float = true;
-                result -= n;
-            }
-            _ => return Err(format!("- expects numbers, got {}", arg.type_name())),
+        if let Some(n) = arg.as_int() {
+            result -= n as f64;
+        } else if let Some(n) = arg.as_float() {
+            is_float = true;
+            result -= n;
+        } else {
+            return Err(format!("- expects numbers, got {}", arg.type_name()));
         }
     }
 
     if is_float {
-        Ok(Value::Float(result))
+        Ok(Value::float(result))
     } else {
-        Ok(Value::Int(result as i64))
+        Ok(Value::int(result as i64))
     }
 }
 
@@ -437,29 +434,27 @@ fn builtin_mul(args: &[Value]) -> Result<Value, String> {
     let mut is_float = false;
 
     for arg in args {
-        match arg {
-            Value::Int(n) => {
-                if is_float {
-                    float_prod *= *n as f64;
-                } else {
-                    int_prod *= n;
-                }
+        if let Some(n) = arg.as_int() {
+            if is_float {
+                float_prod *= n as f64;
+            } else {
+                int_prod *= n;
             }
-            Value::Float(n) => {
-                if !is_float {
-                    is_float = true;
-                    float_prod = int_prod as f64;
-                }
-                float_prod *= n;
+        } else if let Some(n) = arg.as_float() {
+            if !is_float {
+                is_float = true;
+                float_prod = int_prod as f64;
             }
-            _ => return Err(format!("* expects numbers, got {}", arg.type_name())),
+            float_prod *= n;
+        } else {
+            return Err(format!("* expects numbers, got {}", arg.type_name()));
         }
     }
 
     if is_float {
-        Ok(Value::Float(float_prod))
+        Ok(Value::float(float_prod))
     } else {
-        Ok(Value::Int(int_prod))
+        Ok(Value::int(int_prod))
     }
 }
 
@@ -468,23 +463,27 @@ fn builtin_div(args: &[Value]) -> Result<Value, String> {
         return Err("/ expects exactly 2 arguments".to_string());
     }
 
-    let a = match &args[0] {
-        Value::Int(n) => *n as f64,
-        Value::Float(n) => *n,
-        _ => return Err(format!("/ expects numbers, got {}", args[0].type_name())),
+    let a = if let Some(n) = args[0].as_int() {
+        n as f64
+    } else if let Some(n) = args[0].as_float() {
+        n
+    } else {
+        return Err(format!("/ expects numbers, got {}", args[0].type_name()));
     };
 
-    let b = match &args[1] {
-        Value::Int(n) => *n as f64,
-        Value::Float(n) => *n,
-        _ => return Err(format!("/ expects numbers, got {}", args[1].type_name())),
+    let b = if let Some(n) = args[1].as_int() {
+        n as f64
+    } else if let Some(n) = args[1].as_float() {
+        n
+    } else {
+        return Err(format!("/ expects numbers, got {}", args[1].type_name()));
     };
 
     if b == 0.0 {
         return Err("Division by zero".to_string());
     }
 
-    Ok(Value::Float(a / b))
+    Ok(Value::float(a / b))
 }
 
 fn builtin_mod(args: &[Value]) -> Result<Value, String> {
@@ -492,43 +491,42 @@ fn builtin_mod(args: &[Value]) -> Result<Value, String> {
         return Err("mod expects exactly 2 arguments".to_string());
     }
 
-    match (&args[0], &args[1]) {
-        (Value::Int(a), Value::Int(b)) => {
-            if *b == 0 {
-                Err("Division by zero".to_string())
-            } else {
-                Ok(Value::Int(a % b))
-            }
+    if let (Some(a), Some(b)) = (args[0].as_int(), args[1].as_int()) {
+        if b == 0 {
+            Err("Division by zero".to_string())
+        } else {
+            Ok(Value::int(a % b))
         }
-        _ => Err("mod expects integers".to_string()),
+    } else {
+        Err("mod expects integers".to_string())
     }
 }
 
 fn compare_values(a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> {
-    match (a, b) {
-        (Value::Int(x), Value::Int(y)) => Ok(x.cmp(y)),
-        (Value::Float(x), Value::Float(y)) => x
-            .partial_cmp(y)
-            .ok_or_else(|| "Cannot compare NaN".to_string()),
-        (Value::Int(x), Value::Float(y)) => (*x as f64)
-            .partial_cmp(y)
-            .ok_or_else(|| "Cannot compare NaN".to_string()),
-        (Value::Float(x), Value::Int(y)) => x
-            .partial_cmp(&(*y as f64))
-            .ok_or_else(|| "Cannot compare NaN".to_string()),
-        _ => Err(format!(
-            "Cannot compare {} and {}",
-            a.type_name(),
-            b.type_name()
-        )),
+    if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+        return Ok(x.cmp(&y));
     }
+    if let (Some(x), Some(y)) = (a.as_float(), b.as_float()) {
+        return x.partial_cmp(&y).ok_or_else(|| "Cannot compare NaN".to_string());
+    }
+    if let (Some(x), Some(y)) = (a.as_int(), b.as_float()) {
+        return (x as f64).partial_cmp(&y).ok_or_else(|| "Cannot compare NaN".to_string());
+    }
+    if let (Some(x), Some(y)) = (a.as_float(), b.as_int()) {
+        return x.partial_cmp(&(y as f64)).ok_or_else(|| "Cannot compare NaN".to_string());
+    }
+    Err(format!(
+        "Cannot compare {} and {}",
+        a.type_name(),
+        b.type_name()
+    ))
 }
 
 fn builtin_lt(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err("< expects exactly 2 arguments".to_string());
     }
-    Ok(Value::Bool(
+    Ok(Value::bool(
         compare_values(&args[0], &args[1])? == std::cmp::Ordering::Less,
     ))
 }
@@ -537,7 +535,7 @@ fn builtin_le(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err("<= expects exactly 2 arguments".to_string());
     }
-    Ok(Value::Bool(
+    Ok(Value::bool(
         compare_values(&args[0], &args[1])? != std::cmp::Ordering::Greater,
     ))
 }
@@ -546,7 +544,7 @@ fn builtin_gt(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err("> expects exactly 2 arguments".to_string());
     }
-    Ok(Value::Bool(
+    Ok(Value::bool(
         compare_values(&args[0], &args[1])? == std::cmp::Ordering::Greater,
     ))
 }
@@ -555,7 +553,7 @@ fn builtin_ge(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err(">= expects exactly 2 arguments".to_string());
     }
-    Ok(Value::Bool(
+    Ok(Value::bool(
         compare_values(&args[0], &args[1])? != std::cmp::Ordering::Less,
     ))
 }
@@ -564,66 +562,65 @@ fn builtin_eq(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err("= expects exactly 2 arguments".to_string());
     }
-    Ok(Value::Bool(args[0] == args[1]))
+    Ok(Value::bool(args[0] == args[1]))
 }
 
 fn builtin_ne(args: &[Value]) -> Result<Value, String> {
     if args.len() != 2 {
         return Err("!= expects exactly 2 arguments".to_string());
     }
-    Ok(Value::Bool(args[0] != args[1]))
+    Ok(Value::bool(args[0] != args[1]))
 }
 
 fn builtin_not(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("not expects exactly 1 argument".to_string());
     }
-    Ok(Value::Bool(!args[0].is_truthy()))
+    Ok(Value::bool(!args[0].is_truthy()))
 }
 
 fn builtin_is_nil(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("nil? expects exactly 1 argument".to_string());
     }
-    Ok(Value::Bool(matches!(args[0], Value::Nil)))
+    Ok(Value::bool(args[0].is_nil()))
 }
 
 fn builtin_is_int(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("int? expects exactly 1 argument".to_string());
     }
-    Ok(Value::Bool(matches!(args[0], Value::Int(_))))
+    Ok(Value::bool(args[0].is_int()))
 }
 
 fn builtin_is_float(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("float? expects exactly 1 argument".to_string());
     }
-    Ok(Value::Bool(matches!(args[0], Value::Float(_))))
+    Ok(Value::bool(args[0].is_float()))
 }
 
 fn builtin_is_string(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("string? expects exactly 1 argument".to_string());
     }
-    Ok(Value::Bool(matches!(args[0], Value::String(_))))
+    Ok(Value::bool(args[0].as_string().is_some()))
 }
 
 fn builtin_is_list(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("list? expects exactly 1 argument".to_string());
     }
-    Ok(Value::Bool(matches!(args[0], Value::List(_))))
+    Ok(Value::bool(args[0].as_list().is_some()))
 }
 
 fn builtin_is_fn(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("fn? expects exactly 1 argument".to_string());
     }
-    Ok(Value::Bool(matches!(
-        args[0],
-        Value::Function(_) | Value::NativeFunction(_)
-    )))
+    Ok(Value::bool(
+        args[0].as_function().is_some() || args[0].as_native_function().is_some()
+    ))
 }
 
 fn builtin_list(args: &[Value]) -> Result<Value, String> {
@@ -669,14 +666,16 @@ fn builtin_length(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("length expects exactly 1 argument".to_string());
     }
-    match &args[0] {
-        Value::List(items) => Ok(Value::Int(items.len() as i64)),
-        Value::String(s) => Ok(Value::Int(s.len() as i64)),
-        _ => Err(format!(
-            "length expects list or string, got {}",
-            args[0].type_name()
-        )),
+    if let Some(items) = args[0].as_list() {
+        return Ok(Value::int(items.len() as i64));
     }
+    if let Some(s) = args[0].as_string() {
+        return Ok(Value::int(s.len() as i64));
+    }
+    Err(format!(
+        "length expects list or string, got {}",
+        args[0].type_name()
+    ))
 }
 
 fn builtin_print(args: &[Value]) -> Result<Value, String> {
@@ -684,36 +683,37 @@ fn builtin_print(args: &[Value]) -> Result<Value, String> {
         if i > 0 {
             print!(" ");
         }
-        match arg {
-            Value::String(s) => print!("{}", s), // Print strings without quotes
-            other => print!("{}", other),
+        if let Some(s) = arg.as_string() {
+            print!("{}", s); // Print strings without quotes
+        } else {
+            print!("{}", arg);
         }
     }
-    Ok(Value::Nil)
+    Ok(Value::nil())
 }
 
 fn builtin_println(args: &[Value]) -> Result<Value, String> {
     builtin_print(args)?;
     println!();
-    Ok(Value::Nil)
+    Ok(Value::nil())
 }
 
 fn builtin_is_symbol(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("symbol? expects exactly 1 argument".to_string());
     }
-    Ok(Value::Bool(matches!(args[0], Value::Symbol(_))))
+    Ok(Value::bool(args[0].as_symbol().is_some()))
 }
 
 fn builtin_gensym(args: &[Value]) -> Result<Value, String> {
     let prefix = if args.is_empty() {
         "g"
+    } else if let Some(s) = args[0].as_string() {
+        s
+    } else if let Some(s) = args[0].as_symbol() {
+        s
     } else {
-        match &args[0] {
-            Value::String(s) => s.as_ref(),
-            Value::Symbol(s) => s.as_ref(),
-            _ => return Err("gensym: argument must be a string or symbol".to_string()),
-        }
+        return Err("gensym: argument must be a string or symbol".to_string());
     };
     Ok(Value::symbol(&crate::macros::gensym(prefix)))
 }
@@ -731,41 +731,41 @@ mod tests {
 
     #[test]
     fn test_eval_literals() {
-        assert_eq!(eval_str("42").unwrap(), Value::Int(42));
-        assert_eq!(eval_str("3.14").unwrap(), Value::Float(3.14));
-        assert_eq!(eval_str("true").unwrap(), Value::Bool(true));
-        assert_eq!(eval_str("nil").unwrap(), Value::Nil);
+        assert_eq!(eval_str("42").unwrap(), Value::int(42));
+        assert_eq!(eval_str("3.14").unwrap(), Value::float(3.14));
+        assert_eq!(eval_str("true").unwrap(), Value::bool(true));
+        assert_eq!(eval_str("nil").unwrap(), Value::nil());
         assert_eq!(eval_str("\"hello\"").unwrap(), Value::string("hello"));
     }
 
     #[test]
     fn test_eval_arithmetic() {
-        assert_eq!(eval_str("(+ 1 2)").unwrap(), Value::Int(3));
-        assert_eq!(eval_str("(+ 1 2 3)").unwrap(), Value::Int(6));
-        assert_eq!(eval_str("(- 5 3)").unwrap(), Value::Int(2));
-        assert_eq!(eval_str("(* 4 5)").unwrap(), Value::Int(20));
-        assert_eq!(eval_str("(/ 10 4)").unwrap(), Value::Float(2.5));
-        assert_eq!(eval_str("(mod 10 3)").unwrap(), Value::Int(1));
+        assert_eq!(eval_str("(+ 1 2)").unwrap(), Value::int(3));
+        assert_eq!(eval_str("(+ 1 2 3)").unwrap(), Value::int(6));
+        assert_eq!(eval_str("(- 5 3)").unwrap(), Value::int(2));
+        assert_eq!(eval_str("(* 4 5)").unwrap(), Value::int(20));
+        assert_eq!(eval_str("(/ 10 4)").unwrap(), Value::float(2.5));
+        assert_eq!(eval_str("(mod 10 3)").unwrap(), Value::int(1));
     }
 
     #[test]
     fn test_eval_comparison() {
-        assert_eq!(eval_str("(< 1 2)").unwrap(), Value::Bool(true));
-        assert_eq!(eval_str("(< 2 1)").unwrap(), Value::Bool(false));
-        assert_eq!(eval_str("(<= 2 2)").unwrap(), Value::Bool(true));
-        assert_eq!(eval_str("(> 3 2)").unwrap(), Value::Bool(true));
-        assert_eq!(eval_str("(>= 2 2)").unwrap(), Value::Bool(true));
-        assert_eq!(eval_str("(= 1 1)").unwrap(), Value::Bool(true));
-        assert_eq!(eval_str("(!= 1 2)").unwrap(), Value::Bool(true));
+        assert_eq!(eval_str("(< 1 2)").unwrap(), Value::bool(true));
+        assert_eq!(eval_str("(< 2 1)").unwrap(), Value::bool(false));
+        assert_eq!(eval_str("(<= 2 2)").unwrap(), Value::bool(true));
+        assert_eq!(eval_str("(> 3 2)").unwrap(), Value::bool(true));
+        assert_eq!(eval_str("(>= 2 2)").unwrap(), Value::bool(true));
+        assert_eq!(eval_str("(= 1 1)").unwrap(), Value::bool(true));
+        assert_eq!(eval_str("(!= 1 2)").unwrap(), Value::bool(true));
     }
 
     #[test]
     fn test_eval_if() {
-        assert_eq!(eval_str("(if true 1 2)").unwrap(), Value::Int(1));
-        assert_eq!(eval_str("(if false 1 2)").unwrap(), Value::Int(2));
-        assert_eq!(eval_str("(if nil 1 2)").unwrap(), Value::Int(2));
-        assert_eq!(eval_str("(if 0 1 2)").unwrap(), Value::Int(1)); // 0 is truthy!
-        assert_eq!(eval_str("(if false 1)").unwrap(), Value::Nil);
+        assert_eq!(eval_str("(if true 1 2)").unwrap(), Value::int(1));
+        assert_eq!(eval_str("(if false 1 2)").unwrap(), Value::int(2));
+        assert_eq!(eval_str("(if nil 1 2)").unwrap(), Value::int(2));
+        assert_eq!(eval_str("(if 0 1 2)").unwrap(), Value::int(1)); // 0 is truthy!
+        assert_eq!(eval_str("(if false 1)").unwrap(), Value::nil());
     }
 
     #[test]
@@ -779,7 +779,7 @@ mod tests {
         let result = eval_str("'(1 2 3)").unwrap();
         assert_eq!(
             result,
-            Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+            Value::list(vec![Value::int(1), Value::int(2), Value::int(3)])
         );
     }
 
@@ -788,17 +788,17 @@ mod tests {
         let env = standard_env();
         let expr = parse("(def x 42)").unwrap();
         eval(&expr, &env).unwrap();
-        assert_eq!(env.get("x").unwrap(), Value::Int(42));
+        assert_eq!(env.get("x").unwrap(), Value::int(42));
     }
 
     #[test]
     fn test_eval_let() {
-        assert_eq!(eval_str("(let (x 10) x)").unwrap(), Value::Int(10));
-        assert_eq!(eval_str("(let (x 10 y 20) (+ x y))").unwrap(), Value::Int(30));
+        assert_eq!(eval_str("(let (x 10) x)").unwrap(), Value::int(10));
+        assert_eq!(eval_str("(let (x 10 y 20) (+ x y))").unwrap(), Value::int(30));
         // Let bindings are sequential
         assert_eq!(
             eval_str("(let (x 10 y (+ x 5)) y)").unwrap(),
-            Value::Int(15)
+            Value::int(15)
         );
     }
 
@@ -806,25 +806,25 @@ mod tests {
     fn test_eval_fn() {
         assert_eq!(
             eval_str("((fn (x) (* x x)) 5)").unwrap(),
-            Value::Int(25)
+            Value::int(25)
         );
         assert_eq!(
             eval_str("((fn (x y) (+ x y)) 3 4)").unwrap(),
-            Value::Int(7)
+            Value::int(7)
         );
     }
 
     #[test]
     fn test_eval_do() {
-        assert_eq!(eval_str("(do 1 2 3)").unwrap(), Value::Int(3));
+        assert_eq!(eval_str("(do 1 2 3)").unwrap(), Value::int(3));
     }
 
     #[test]
     fn test_eval_nested() {
-        assert_eq!(eval_str("(+ (* 2 3) 4)").unwrap(), Value::Int(10));
+        assert_eq!(eval_str("(+ (* 2 3) 4)").unwrap(), Value::int(10));
         assert_eq!(
             eval_str("(if (< 1 2) (+ 3 4) (- 5 6))").unwrap(),
-            Value::Int(7)
+            Value::int(7)
         );
     }
 
@@ -832,18 +832,18 @@ mod tests {
     fn test_eval_list_ops() {
         assert_eq!(
             eval_str("(list 1 2 3)").unwrap(),
-            Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+            Value::list(vec![Value::int(1), Value::int(2), Value::int(3)])
         );
-        assert_eq!(eval_str("(car (list 1 2 3))").unwrap(), Value::Int(1));
+        assert_eq!(eval_str("(car (list 1 2 3))").unwrap(), Value::int(1));
         assert_eq!(
             eval_str("(cdr (list 1 2 3))").unwrap(),
-            Value::list(vec![Value::Int(2), Value::Int(3)])
+            Value::list(vec![Value::int(2), Value::int(3)])
         );
         assert_eq!(
             eval_str("(cons 0 (list 1 2))").unwrap(),
-            Value::list(vec![Value::Int(0), Value::Int(1), Value::Int(2)])
+            Value::list(vec![Value::int(0), Value::int(1), Value::int(2)])
         );
-        assert_eq!(eval_str("(length (list 1 2 3))").unwrap(), Value::Int(3));
+        assert_eq!(eval_str("(length (list 1 2 3))").unwrap(), Value::int(3));
     }
 
     #[test]
@@ -852,7 +852,7 @@ mod tests {
         eval(&parse("(def x 10)").unwrap(), &env).unwrap();
         eval(&parse("(def square (fn (n) (* n n)))").unwrap(), &env).unwrap();
         let result = eval(&parse("(square x)").unwrap(), &env).unwrap();
-        assert_eq!(result, Value::Int(100));
+        assert_eq!(result, Value::int(100));
     }
 
     #[test]
@@ -860,7 +860,7 @@ mod tests {
         let env = standard_env();
         eval(&parse("(def factorial (fn (n) (if (<= n 1) 1 (* n (factorial (- n 1))))))").unwrap(), &env).unwrap();
         let result = eval(&parse("(factorial 5)").unwrap(), &env).unwrap();
-        assert_eq!(result, Value::Int(120));
+        assert_eq!(result, Value::int(120));
     }
 
     #[test]
@@ -869,7 +869,7 @@ mod tests {
         eval(&parse("(def make-adder (fn (x) (fn (y) (+ x y))))").unwrap(), &env).unwrap();
         eval(&parse("(def add5 (make-adder 5))").unwrap(), &env).unwrap();
         let result = eval(&parse("(add5 10)").unwrap(), &env).unwrap();
-        assert_eq!(result, Value::Int(15));
+        assert_eq!(result, Value::int(15));
     }
 
     #[test]
@@ -878,7 +878,7 @@ mod tests {
         eval(&parse("(def sum (fn (n acc) (if (<= n 0) acc (sum (- n 1) (+ acc n)))))").unwrap(), &env).unwrap();
         // 100k iterations - would stack overflow without TCO
         let result = eval(&parse("(sum 100000 0)").unwrap(), &env).unwrap();
-        assert_eq!(result, Value::Int(5000050000));
+        assert_eq!(result, Value::int(5000050000));
     }
 
     #[test]
@@ -887,7 +887,7 @@ mod tests {
         eval(&parse("(def even? (fn (n) (if (= n 0) true (odd? (- n 1)))))").unwrap(), &env).unwrap();
         eval(&parse("(def odd? (fn (n) (if (= n 0) false (even? (- n 1)))))").unwrap(), &env).unwrap();
         // 10k mutual calls - would stack overflow without TCO
-        assert_eq!(eval(&parse("(even? 10000)").unwrap(), &env).unwrap(), Value::Bool(true));
-        assert_eq!(eval(&parse("(odd? 10001)").unwrap(), &env).unwrap(), Value::Bool(true));
+        assert_eq!(eval(&parse("(even? 10000)").unwrap(), &env).unwrap(), Value::bool(true));
+        assert_eq!(eval(&parse("(odd? 10001)").unwrap(), &env).unwrap(), Value::bool(true));
     }
 }
