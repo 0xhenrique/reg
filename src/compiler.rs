@@ -7,6 +7,220 @@ pub struct Compiler {
     scope_depth: usize,
 }
 
+/// Try to evaluate a constant expression recursively
+fn try_const_eval(expr: &Value) -> Option<Value> {
+    match expr {
+        // Literals are constants
+        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Nil | Value::String(_) => {
+            Some(expr.clone())
+        }
+        // Try to fold function calls
+        Value::List(items) if !items.is_empty() => {
+            let op = items[0].as_symbol()?;
+            let args = &items[1..];
+            // Recursively evaluate arguments
+            let const_args: Option<Vec<Value>> = args.iter().map(try_const_eval).collect();
+            let const_args = const_args?;
+            let const_refs: Vec<&Value> = const_args.iter().collect();
+            fold_op(op, &const_refs)
+        }
+        _ => None,
+    }
+}
+
+/// Try to fold an operation with constant arguments
+fn fold_op(op: &str, args: &[&Value]) -> Option<Value> {
+    match op {
+        "+" => fold_add(args),
+        "-" => fold_sub(args),
+        "*" => fold_mul(args),
+        "/" => fold_div(args),
+        "mod" => fold_mod(args),
+        "<" => fold_cmp(args, |a, b| a < b),
+        "<=" => fold_cmp(args, |a, b| a <= b),
+        ">" => fold_cmp(args, |a, b| a > b),
+        ">=" => fold_cmp(args, |a, b| a >= b),
+        "=" => fold_eq(args),
+        "!=" => fold_ne(args),
+        "not" => fold_not(args),
+        _ => None,
+    }
+}
+
+fn fold_add(args: &[&Value]) -> Option<Value> {
+    let mut sum_int: i64 = 0;
+    let mut sum_float: f64 = 0.0;
+    let mut is_float = false;
+
+    for arg in args {
+        match arg {
+            Value::Int(n) => {
+                if is_float {
+                    sum_float += *n as f64;
+                } else {
+                    sum_int += n;
+                }
+            }
+            Value::Float(n) => {
+                if !is_float {
+                    is_float = true;
+                    sum_float = sum_int as f64;
+                }
+                sum_float += n;
+            }
+            _ => return None,
+        }
+    }
+
+    Some(if is_float {
+        Value::Float(sum_float)
+    } else {
+        Value::Int(sum_int)
+    })
+}
+
+fn fold_sub(args: &[&Value]) -> Option<Value> {
+    if args.is_empty() {
+        return None;
+    }
+    if args.len() == 1 {
+        return match args[0] {
+            Value::Int(n) => Some(Value::Int(-n)),
+            Value::Float(n) => Some(Value::Float(-n)),
+            _ => None,
+        };
+    }
+
+    let mut result = match args[0] {
+        Value::Int(n) => *n as f64,
+        Value::Float(n) => *n,
+        _ => return None,
+    };
+    let mut is_float = matches!(args[0], Value::Float(_));
+
+    for arg in &args[1..] {
+        match arg {
+            Value::Int(n) => result -= *n as f64,
+            Value::Float(n) => {
+                is_float = true;
+                result -= n;
+            }
+            _ => return None,
+        }
+    }
+
+    Some(if is_float {
+        Value::Float(result)
+    } else {
+        Value::Int(result as i64)
+    })
+}
+
+fn fold_mul(args: &[&Value]) -> Option<Value> {
+    let mut prod_int: i64 = 1;
+    let mut prod_float: f64 = 1.0;
+    let mut is_float = false;
+
+    for arg in args {
+        match arg {
+            Value::Int(n) => {
+                if is_float {
+                    prod_float *= *n as f64;
+                } else {
+                    prod_int *= n;
+                }
+            }
+            Value::Float(n) => {
+                if !is_float {
+                    is_float = true;
+                    prod_float = prod_int as f64;
+                }
+                prod_float *= n;
+            }
+            _ => return None,
+        }
+    }
+
+    Some(if is_float {
+        Value::Float(prod_float)
+    } else {
+        Value::Int(prod_int)
+    })
+}
+
+fn fold_div(args: &[&Value]) -> Option<Value> {
+    if args.len() != 2 {
+        return None;
+    }
+    let a = match args[0] {
+        Value::Int(n) => *n as f64,
+        Value::Float(n) => *n,
+        _ => return None,
+    };
+    let b = match args[1] {
+        Value::Int(n) => *n as f64,
+        Value::Float(n) => *n,
+        _ => return None,
+    };
+    if b == 0.0 {
+        return None; // Don't fold division by zero
+    }
+    Some(Value::Float(a / b))
+}
+
+fn fold_mod(args: &[&Value]) -> Option<Value> {
+    if args.len() != 2 {
+        return None;
+    }
+    match (args[0], args[1]) {
+        (Value::Int(a), Value::Int(b)) => {
+            if *b == 0 {
+                return None;
+            }
+            Some(Value::Int(a % b))
+        }
+        _ => None,
+    }
+}
+
+fn to_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(n) => Some(*n as f64),
+        Value::Float(n) => Some(*n),
+        _ => None,
+    }
+}
+
+fn fold_cmp<F: Fn(f64, f64) -> bool>(args: &[&Value], cmp: F) -> Option<Value> {
+    if args.len() != 2 {
+        return None;
+    }
+    let a = to_f64(args[0])?;
+    let b = to_f64(args[1])?;
+    Some(Value::Bool(cmp(a, b)))
+}
+
+fn fold_eq(args: &[&Value]) -> Option<Value> {
+    if args.len() != 2 {
+        return None;
+    }
+    Some(Value::Bool(args[0] == args[1]))
+}
+
+fn fold_ne(args: &[&Value]) -> Option<Value> {
+    if args.len() != 2 {
+        return None;
+    }
+    Some(Value::Bool(args[0] != args[1]))
+}
+
+fn fold_not(args: &[&Value]) -> Option<Value> {
+    if args.len() != 1 {
+        return None;
+    }
+    Some(Value::Bool(!args[0].is_truthy()))
+}
+
 impl Compiler {
     pub fn new() -> Self {
         Compiler {
@@ -299,6 +513,14 @@ impl Compiler {
     }
 
     fn compile_call(&mut self, items: &[Value], dest: Reg, tail_pos: bool) -> Result<(), String> {
+        // Try constant folding for the entire call expression
+        let call_expr = Value::list(items.to_vec());
+        if let Some(folded) = try_const_eval(&call_expr) {
+            let idx = self.add_constant(folded);
+            self.emit(Op::LoadConst(dest, idx));
+            return Ok(());
+        }
+
         let func_reg = self.alloc_reg();
 
         // Compile function
@@ -420,5 +642,65 @@ mod tests {
         let chunk = compile_str("(if (foo) 1 2)").unwrap();
         let has_call = chunk.code.iter().any(|op| matches!(op, Op::Call(_, _, _)));
         assert!(has_call);
+    }
+
+    #[test]
+    fn test_constant_folding_add() {
+        let chunk = compile_str("(+ 1 2 3)").unwrap();
+        // Should fold to LoadConst 6, not a call
+        assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
+        assert_eq!(chunk.constants[0], Value::Int(6));
+        // No function calls
+        let has_call = chunk.code.iter().any(|op| matches!(op, Op::Call(_, _, _) | Op::TailCall(_, _)));
+        assert!(!has_call);
+    }
+
+    #[test]
+    fn test_constant_folding_nested() {
+        let chunk = compile_str("(* 2 (+ 3 4))").unwrap();
+        // Should fold to LoadConst 14
+        assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
+        assert_eq!(chunk.constants[0], Value::Int(14));
+    }
+
+    #[test]
+    fn test_constant_folding_comparison() {
+        let chunk = compile_str("(< 1 2)").unwrap();
+        assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
+        assert_eq!(chunk.constants[0], Value::Bool(true));
+
+        let chunk = compile_str("(>= 5 10)").unwrap();
+        assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
+        assert_eq!(chunk.constants[0], Value::Bool(false));
+    }
+
+    #[test]
+    fn test_constant_folding_not() {
+        let chunk = compile_str("(not false)").unwrap();
+        assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
+        assert_eq!(chunk.constants[0], Value::Bool(true));
+    }
+
+    #[test]
+    fn test_no_fold_with_variables() {
+        // If any arg is not a constant, don't fold
+        let chunk = compile_str("(+ x 1)").unwrap();
+        // Should have a call, not just LoadConst
+        let has_call = chunk.code.iter().any(|op| matches!(op, Op::Call(_, _, _) | Op::TailCall(_, _)));
+        assert!(has_call);
+    }
+
+    #[test]
+    fn test_constant_folding_division() {
+        let chunk = compile_str("(/ 10 2)").unwrap();
+        assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
+        assert_eq!(chunk.constants[0], Value::Float(5.0));
+    }
+
+    #[test]
+    fn test_constant_folding_mod() {
+        let chunk = compile_str("(mod 17 5)").unwrap();
+        assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
+        assert_eq!(chunk.constants[0], Value::Int(2));
     }
 }
