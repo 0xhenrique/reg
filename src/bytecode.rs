@@ -68,6 +68,8 @@ impl std::fmt::Debug for Op {
             Self::JUMP_IF_LE_IMM => write!(f, "JumpIfLeImm({}, {}, {})", self.a(), self.b() as i8, self.c() as i8),
             Self::JUMP_IF_GT_IMM => write!(f, "JumpIfGtImm({}, {}, {})", self.a(), self.b() as i8, self.c() as i8),
             Self::JUMP_IF_GE_IMM => write!(f, "JumpIfGeImm({}, {}, {})", self.a(), self.b() as i8, self.c() as i8),
+            Self::JUMP_IF_NIL => write!(f, "JumpIfNil({}, {})", self.a(), self.sbx()),
+            Self::JUMP_IF_NOT_NIL => write!(f, "JumpIfNotNil({}, {})", self.a(), self.sbx()),
             _ => write!(f, "Unknown(0x{:08x})", self.0),
         }
     }
@@ -124,6 +126,9 @@ impl Op {
     pub const JUMP_IF_LE_IMM: u8 = 45; // ABC: src, imm (i8), offset (i8) - jump if src <= imm
     pub const JUMP_IF_GT_IMM: u8 = 46; // ABC: src, imm (i8), offset (i8) - jump if src > imm
     pub const JUMP_IF_GE_IMM: u8 = 47; // ABC: src, imm (i8), offset (i8) - jump if src >= imm
+    // Specialized nil check opcodes (common in list processing)
+    pub const JUMP_IF_NIL: u8 = 48;    // A: src, sBx: offset - jump if src is nil
+    pub const JUMP_IF_NOT_NIL: u8 = 49; // A: src, sBx: offset - jump if src is NOT nil
 
     // ========== Constructors ==========
 
@@ -429,6 +434,17 @@ impl Op {
         Self::abc(Self::JUMP_IF_GE_IMM, src, imm as u8, offset as u8)
     }
 
+    // Specialized nil check (uses ABx format like JumpIfFalse for 16-bit offset)
+    #[inline(always)]
+    pub const fn jump_if_nil(src: Reg, offset: Offset) -> Self {
+        Self::asbx(Self::JUMP_IF_NIL, src, offset)
+    }
+
+    #[inline(always)]
+    pub const fn jump_if_not_nil(src: Reg, offset: Offset) -> Self {
+        Self::asbx(Self::JUMP_IF_NOT_NIL, src, offset)
+    }
+
     // ========== Jump patching helpers ==========
 
     /// Check if this is a jump instruction (for patching)
@@ -440,6 +456,7 @@ impl Op {
             || op == Self::JUMP_IF_GT || op == Self::JUMP_IF_GE
             || op == Self::JUMP_IF_LT_IMM || op == Self::JUMP_IF_LE_IMM
             || op == Self::JUMP_IF_GT_IMM || op == Self::JUMP_IF_GE_IMM
+            || op == Self::JUMP_IF_NIL || op == Self::JUMP_IF_NOT_NIL
     }
 
     /// Patch the offset of a jump instruction

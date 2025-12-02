@@ -889,6 +889,25 @@ impl VM {
                     }
                 }
 
+                // Specialized nil check opcodes
+                Op::JUMP_IF_NIL => {
+                    let src = instr.a();
+                    let offset = instr.sbx();
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
+                    if v.is_nil() {
+                        ip = (ip as isize + offset as isize) as usize;
+                    }
+                }
+
+                Op::JUMP_IF_NOT_NIL => {
+                    let src = instr.a();
+                    let offset = instr.sbx();
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
+                    if !v.is_nil() {
+                        ip = (ip as isize + offset as isize) as usize;
+                    }
+                }
+
                 _ => {
                     return Err(format!("Unknown opcode: {}", instr.opcode()));
                 }
@@ -1487,5 +1506,37 @@ mod tests {
         // Recursive function using combined compare-jump
         let result = vm_eval("(do (def sum (fn (n acc) (if (<= n 0) acc (sum (- n 1) (+ acc n))))) (sum 100 0))").unwrap();
         assert_eq!(result, Value::Int(5050));
+    }
+
+    #[test]
+    fn test_nil_check_jump() {
+        // Test specialized nil check opcodes
+        // These are generated for (if (nil? x) ...) patterns
+
+        // Direct nil check
+        assert_eq!(vm_eval("(if (nil? nil) 1 2)").unwrap(), Value::Int(1));
+        assert_eq!(vm_eval("(if (nil? 42) 1 2)").unwrap(), Value::Int(2));
+
+        // Variable nil check
+        assert_eq!(vm_eval("(let (x nil) (if (nil? x) 1 2))").unwrap(), Value::Int(1));
+        assert_eq!(vm_eval("(let (x 42) (if (nil? x) 1 2))").unwrap(), Value::Int(2));
+
+        // Recursive list processing using nil check (with cons-based lists)
+        let result = vm_eval("(do
+            (def list-length (fn (lst)
+                (if (nil? lst)
+                    0
+                    (+ 1 (list-length (cdr lst))))))
+            (list-length (cons 1 (cons 2 (cons 3 (cons 4 (cons 5 nil)))))))").unwrap();
+        assert_eq!(result, Value::Int(5));
+
+        // List sum using nil? (with cons-based lists)
+        let result = vm_eval("(do
+            (def list-sum (fn (lst acc)
+                (if (nil? lst)
+                    acc
+                    (list-sum (cdr lst) (+ acc (car lst))))))
+            (list-sum (cons 1 (cons 2 (cons 3 (cons 4 (cons 5 nil))))) 0))").unwrap();
+        assert_eq!(result, Value::Int(15));
     }
 }

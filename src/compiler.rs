@@ -511,6 +511,11 @@ impl Compiler {
             return self.compile_if_branches(args, dest, tail_pos, jump_to_else);
         }
 
+        // Try to use specialized nil check opcodes
+        if let Some(jump_to_else) = self.try_compile_nil_check_jump(&args[0], dest)? {
+            return self.compile_if_branches(args, dest, tail_pos, jump_to_else);
+        }
+
         // Fallback: compile condition into dest and use JumpIfFalse
         self.compile_expr(&args[0], dest, false)?;
 
@@ -613,6 +618,38 @@ impl Compiler {
         };
 
         self.free_reg(); // free right_reg
+        Ok(Some(jump_pos))
+    }
+
+    /// Try to compile a nil check condition as a specialized jump opcode.
+    /// Returns Some(jump_pos) if successful, None if condition is not a nil check.
+    ///
+    /// Handles pattern:
+    /// - `(nil? x)` → JumpIfNotNil (jump to else if x is NOT nil)
+    ///
+    /// Note: We don't optimize `(empty? x)` because it handles array-based lists
+    /// differently (empty array [] is not nil but is empty).
+    fn try_compile_nil_check_jump(&mut self, cond: &Value, dest: Reg) -> Result<Option<usize>, String> {
+        let items = match cond.as_list() {
+            Some(items) if items.len() == 2 => items,
+            _ => return Ok(None),
+        };
+
+        // Only optimize nil? - not empty? which has different semantics for array lists
+        if items[0].as_symbol() != Some("nil?") {
+            return Ok(None);
+        }
+
+        let arg = &items[1];
+
+        // Compile argument into dest
+        self.compile_expr(arg, dest, false)?;
+
+        // For `(if (nil? x) then else)`, we jump to else when condition is FALSE.
+        // Condition is TRUE when x IS nil.
+        // So we jump to else when x is NOT nil.
+        let jump_pos = self.emit(Op::jump_if_not_nil(dest, 0));
+
         Ok(Some(jump_pos))
     }
 
