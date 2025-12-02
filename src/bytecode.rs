@@ -1,4 +1,5 @@
 use crate::value::Value;
+use std::collections::HashMap;
 
 pub type Reg = u8;
 pub type ConstIdx = u16;
@@ -71,6 +72,11 @@ pub struct Chunk {
     pub num_params: u8,
     pub num_registers: u8,
     pub protos: Vec<Chunk>, // nested function prototypes
+    // Constant deduplication indexes for O(1) lookup of common types
+    #[allow(dead_code)]
+    int_const_idx: HashMap<i64, ConstIdx>,
+    #[allow(dead_code)]
+    symbol_const_idx: HashMap<String, ConstIdx>,
 }
 
 impl Chunk {
@@ -81,19 +87,44 @@ impl Chunk {
             num_params: 0,
             num_registers: 0,
             protos: Vec::new(),
+            int_const_idx: HashMap::new(),
+            symbol_const_idx: HashMap::new(),
         }
     }
 
     pub fn add_constant(&mut self, value: Value) -> ConstIdx {
-        // Check if constant already exists
+        // Fast path: check specialized indexes for common types (O(1))
+        if let Some(n) = value.as_int() {
+            if let Some(&idx) = self.int_const_idx.get(&n) {
+                return idx;
+            }
+        }
+        if let Some(s) = value.as_symbol() {
+            if let Some(&idx) = self.symbol_const_idx.get(s) {
+                return idx;
+            }
+        }
+
+        // Slow path: linear scan for other types (strings, floats, etc.)
         for (i, c) in self.constants.iter().enumerate() {
             if *c == value {
                 return i as ConstIdx;
             }
         }
-        let idx = self.constants.len();
+
+        // Not found - add new constant and update indexes
+        let idx = self.constants.len() as ConstIdx;
+
+        // Update specialized indexes
+        if let Some(n) = value.as_int() {
+            self.int_const_idx.insert(n, idx);
+        }
+        if let Some(s) = value.as_symbol() {
+            self.symbol_const_idx.insert(s.to_string(), idx);
+        }
+
         self.constants.push(value);
-        idx as ConstIdx
+        idx
     }
 
     pub fn emit(&mut self, op: Op) -> usize {

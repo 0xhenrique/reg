@@ -19,9 +19,9 @@ pub struct VM {
     registers: Vec<Value>,
     frames: Vec<CallFrame>,
     globals: Rc<RefCell<HashMap<String, Value>>>,
-    // Cache for global lookups: (chunk_ptr, const_idx) -> Value
-    // This avoids repeated HashMap lookups for recursive function calls
-    global_cache: HashMap<(usize, u16), Value>,
+    // Cache for global lookups: name -> Value
+    // Keyed by name to allow targeted invalidation when a specific global changes
+    global_cache: HashMap<String, Value>,
 }
 
 impl VM {
@@ -44,9 +44,21 @@ impl VM {
     }
 
     pub fn define_global(&mut self, name: &str, value: Value) {
-        self.globals.borrow_mut().insert(name.to_string(), value);
-        // Invalidate cache when globals change
-        self.global_cache.clear();
+        // Avoid String allocation if key already exists
+        {
+            let mut globals = self.globals.borrow_mut();
+            if let Some(existing) = globals.get_mut(name) {
+                *existing = value.clone();
+            } else {
+                globals.insert(name.to_string(), value.clone());
+            }
+        }
+        // Update cache (same optimization)
+        if let Some(existing) = self.global_cache.get_mut(name) {
+            *existing = value;
+        } else {
+            self.global_cache.insert(name.to_string(), value);
+        }
     }
 
     pub fn run(&mut self, chunk: Chunk) -> Result<Value, String> {
@@ -103,22 +115,20 @@ impl VM {
                 }
 
                 Op::GetGlobal(dest, name_idx) => {
-                    // Use chunk pointer as part of cache key for uniqueness
+                    // Get name from constant pool
                     let chunk = &self.frames.last().unwrap().chunk;
-                    let chunk_ptr = Rc::as_ptr(chunk) as usize;
-                    let cache_key = (chunk_ptr, name_idx);
+                    let name = chunk.constants[name_idx as usize].as_symbol()
+                        .ok_or("GetGlobal: expected symbol")?;
 
-                    let value = if let Some(cached) = self.global_cache.get(&cache_key) {
-                        // Cache hit - avoid HashMap lookup entirely
+                    let value = if let Some(cached) = self.global_cache.get(name) {
+                        // Cache hit - avoid globals HashMap lookup
                         cached.clone()
                     } else {
-                        // Cache miss - do the lookup (using &str to avoid String allocation)
-                        let name = chunk.constants[name_idx as usize].as_symbol()
-                            .ok_or("GetGlobal: expected symbol")?;
+                        // Cache miss - look up in globals
                         let v = self.globals.borrow().get(name).cloned()
                             .ok_or_else(|| format!("Undefined variable: {}", name))?;
                         // Cache for future lookups
-                        self.global_cache.insert(cache_key, v.clone());
+                        self.global_cache.insert(name.to_string(), v.clone());
                         v
                     };
                     self.registers[base + dest as usize] = value;
@@ -129,9 +139,21 @@ impl VM {
                     let name = chunk.constants[name_idx as usize].as_symbol()
                         .ok_or("SetGlobal: expected symbol")?;
                     let value = self.registers[base + src as usize].clone();
-                    self.globals.borrow_mut().insert(name.to_string(), value);
-                    // Invalidate cache - global was modified
-                    self.global_cache.clear();
+                    // Avoid String allocation if key already exists
+                    {
+                        let mut globals = self.globals.borrow_mut();
+                        if let Some(existing) = globals.get_mut(name) {
+                            *existing = value.clone();
+                        } else {
+                            globals.insert(name.to_string(), value.clone());
+                        }
+                    }
+                    // Update cache (same optimization)
+                    if let Some(existing) = self.global_cache.get_mut(name) {
+                        *existing = value;
+                    } else {
+                        self.global_cache.insert(name.to_string(), value);
+                    }
                 }
 
                 Op::Closure(dest, proto_idx) => {
@@ -258,19 +280,17 @@ impl VM {
                 Op::CallGlobal(dest, name_idx, nargs) => {
                     // Optimized: look up global and call directly without intermediate register
                     let chunk = &self.frames.last().unwrap().chunk;
-                    let chunk_ptr = Rc::as_ptr(chunk) as usize;
-                    let cache_key = (chunk_ptr, name_idx);
+                    let name = chunk.constants[name_idx as usize].as_symbol()
+                        .ok_or("CallGlobal: expected symbol")?;
 
                     // Get function from cache or globals
-                    let func_value = if let Some(cached) = self.global_cache.get(&cache_key) {
+                    let func_value = if let Some(cached) = self.global_cache.get(name) {
                         cached
                     } else {
-                        let name = chunk.constants[name_idx as usize].as_symbol()
-                            .ok_or("CallGlobal: expected symbol")?;
                         let v = self.globals.borrow().get(name).cloned()
                             .ok_or_else(|| format!("Undefined function: {}", name))?;
-                        self.global_cache.insert(cache_key, v);
-                        self.global_cache.get(&cache_key).unwrap()
+                        self.global_cache.insert(name.to_string(), v);
+                        self.global_cache.get(name).unwrap()
                     };
 
                     if let Some(cf) = func_value.as_compiled_function() {
@@ -316,19 +336,17 @@ impl VM {
                 Op::TailCallGlobal(name_idx, arg_start, nargs) => {
                     // Optimized: look up global and tail-call directly
                     let chunk = &self.frames.last().unwrap().chunk;
-                    let chunk_ptr = Rc::as_ptr(chunk) as usize;
-                    let cache_key = (chunk_ptr, name_idx);
+                    let name = chunk.constants[name_idx as usize].as_symbol()
+                        .ok_or("TailCallGlobal: expected symbol")?;
 
                     // Get function from cache or globals
-                    let func_value = if let Some(cached) = self.global_cache.get(&cache_key) {
+                    let func_value = if let Some(cached) = self.global_cache.get(name) {
                         cached
                     } else {
-                        let name = chunk.constants[name_idx as usize].as_symbol()
-                            .ok_or("TailCallGlobal: expected symbol")?;
                         let v = self.globals.borrow().get(name).cloned()
                             .ok_or_else(|| format!("Undefined function: {}", name))?;
-                        self.global_cache.insert(cache_key, v);
-                        self.global_cache.get(&cache_key).unwrap()
+                        self.global_cache.insert(name.to_string(), v);
+                        self.global_cache.get(name).unwrap()
                     };
 
                     if let Some(cf) = func_value.as_compiled_function() {
