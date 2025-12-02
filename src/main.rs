@@ -3,7 +3,7 @@ use std::io::{self, BufRead, Write};
 
 fn main() {
     println!("Lisp VM v0.1.0");
-    println!("Type expressions to evaluate. Ctrl+D to exit.");
+    println!("Type :q or :quit to exit.");
     println!();
 
     let env = standard_env();
@@ -21,6 +21,10 @@ fn main() {
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
+                }
+
+                if line == ":q" || line == ":quit" {
+                    break;
                 }
 
                 match parse(line) {
