@@ -741,6 +741,17 @@ pub fn standard_vm() -> VM {
         Ok(Value::bool(args[0].as_list().is_some()))
     }));
 
+    vm.define_global("empty?", native("empty?", |args| {
+        if args.len() != 1 { return Err("empty? expects 1 argument".to_string()); }
+        if let Some(list) = args[0].as_list() {
+            Ok(Value::bool(list.is_empty()))
+        } else if let Some(s) = args[0].as_string() {
+            Ok(Value::bool(s.is_empty()))
+        } else {
+            Err("empty? expects list or string".to_string())
+        }
+    }));
+
     vm.define_global("fn?", native("fn?", |args| {
         if args.len() != 1 { return Err("fn? expects 1 argument".to_string()); }
         Ok(Value::bool(args[0].as_function().is_some() || args[0].as_native_function().is_some() || args[0].as_compiled_function().is_some()))
