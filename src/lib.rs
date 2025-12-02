@@ -1,4 +1,5 @@
 pub mod bytecode;
+pub mod compiler;
 pub mod eval;
 pub mod parser;
 pub mod value;
