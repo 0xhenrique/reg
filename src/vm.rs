@@ -19,6 +19,9 @@ pub struct VM {
     registers: Vec<Value>,
     frames: Vec<CallFrame>,
     globals: Rc<RefCell<HashMap<String, Value>>>,
+    // Cache for global lookups: (chunk_ptr, const_idx) -> Value
+    // This avoids repeated HashMap lookups for recursive function calls
+    global_cache: HashMap<(usize, u16), Value>,
 }
 
 impl VM {
@@ -27,6 +30,7 @@ impl VM {
             registers: vec![Value::Nil; MAX_REGISTERS],
             frames: Vec::with_capacity(MAX_FRAMES),
             globals: Rc::new(RefCell::new(HashMap::new())),
+            global_cache: HashMap::new(),
         }
     }
 
@@ -35,11 +39,14 @@ impl VM {
             registers: vec![Value::Nil; MAX_REGISTERS],
             frames: Vec::with_capacity(MAX_FRAMES),
             globals,
+            global_cache: HashMap::new(),
         }
     }
 
     pub fn define_global(&mut self, name: &str, value: Value) {
         self.globals.borrow_mut().insert(name.to_string(), value);
+        // Invalidate cache when globals change
+        self.global_cache.clear();
     }
 
     pub fn run(&mut self, chunk: Chunk) -> Result<Value, String> {
@@ -94,22 +101,37 @@ impl VM {
                 }
 
                 Op::GetGlobal(dest, name_idx) => {
-                    let name = match &chunk.constants[name_idx as usize] {
-                        Value::Symbol(s) => s.to_string(),
-                        _ => return Err("GetGlobal: expected symbol".to_string()),
+                    // Use chunk pointer as part of cache key for uniqueness
+                    let chunk_ptr = Rc::as_ptr(&chunk) as usize;
+                    let cache_key = (chunk_ptr, name_idx);
+
+                    let value = if let Some(cached) = self.global_cache.get(&cache_key) {
+                        // Cache hit - avoid HashMap lookup entirely
+                        cached.clone()
+                    } else {
+                        // Cache miss - do the lookup (using &str to avoid String allocation)
+                        let name: &str = match &chunk.constants[name_idx as usize] {
+                            Value::Symbol(s) => s,
+                            _ => return Err("GetGlobal: expected symbol".to_string()),
+                        };
+                        let v = self.globals.borrow().get(name).cloned()
+                            .ok_or_else(|| format!("Undefined variable: {}", name))?;
+                        // Cache for future lookups
+                        self.global_cache.insert(cache_key, v.clone());
+                        v
                     };
-                    let value = self.globals.borrow().get(&name).cloned()
-                        .ok_or_else(|| format!("Undefined variable: {}", name))?;
                     self.registers[base + dest as usize] = value;
                 }
 
                 Op::SetGlobal(name_idx, src) => {
-                    let name = match &chunk.constants[name_idx as usize] {
-                        Value::Symbol(s) => s.to_string(),
+                    let name: &str = match &chunk.constants[name_idx as usize] {
+                        Value::Symbol(s) => s,
                         _ => return Err("SetGlobal: expected symbol".to_string()),
                     };
                     let value = self.registers[base + src as usize].clone();
-                    self.globals.borrow_mut().insert(name, value);
+                    self.globals.borrow_mut().insert(name.to_string(), value);
+                    // Invalidate cache - global was modified
+                    self.global_cache.clear();
                 }
 
                 Op::Closure(dest, proto_idx) => {
