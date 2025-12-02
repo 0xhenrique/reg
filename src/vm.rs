@@ -908,6 +908,17 @@ impl VM {
                     }
                 }
 
+                // Specialized cons opcode (very common in list construction)
+                Op::CONS => {
+                    let dest = instr.a();
+                    let car_reg = instr.b();
+                    let cdr_reg = instr.c();
+                    let car = unsafe { self.registers.get_unchecked(base + car_reg as usize).clone() };
+                    let cdr = unsafe { self.registers.get_unchecked(base + cdr_reg as usize).clone() };
+                    let cons = Value::cons(car, cdr);
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = cons };
+                }
+
                 _ => {
                     return Err(format!("Unknown opcode: {}", instr.opcode()));
                 }
@@ -1538,5 +1549,39 @@ mod tests {
                     (list-sum (cdr lst) (+ acc (car lst))))))
             (list-sum (cons 1 (cons 2 (cons 3 (cons 4 (cons 5 nil))))) 0))").unwrap();
         assert_eq!(result, Value::Int(15));
+    }
+
+    #[test]
+    fn test_specialized_cons() {
+        // Test specialized cons opcode
+        // Basic cons
+        let result = vm_eval("(cons 1 nil)").unwrap();
+        let cons = result.as_cons().expect("expected cons cell");
+        assert_eq!(cons.car.as_int(), Some(1));
+        assert!(cons.cdr.is_nil());
+
+        // Nested cons
+        let result = vm_eval("(cons 1 (cons 2 (cons 3 nil)))").unwrap();
+        let cons = result.as_cons().expect("expected cons cell");
+        assert_eq!(cons.car.as_int(), Some(1));
+
+        // List reversal using cons (exercises the opcode heavily)
+        let result = vm_eval("(do
+            (def reverse-acc (fn (lst acc)
+                (if (nil? lst)
+                    acc
+                    (reverse-acc (cdr lst) (cons (car lst) acc)))))
+            (reverse-acc (cons 1 (cons 2 (cons 3 nil))) nil))").unwrap();
+        let cons = result.as_cons().expect("expected cons cell");
+        assert_eq!(cons.car.as_int(), Some(3));
+
+        // Map function using cons
+        let result = vm_eval("(do
+            (def map-double (fn (lst)
+                (if (nil? lst)
+                    nil
+                    (cons (* 2 (car lst)) (map-double (cdr lst))))))
+            (car (map-double (cons 5 (cons 10 nil)))))").unwrap();
+        assert_eq!(result, Value::Int(10)); // first element 5 * 2 = 10
     }
 }

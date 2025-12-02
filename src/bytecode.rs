@@ -70,6 +70,7 @@ impl std::fmt::Debug for Op {
             Self::JUMP_IF_GE_IMM => write!(f, "JumpIfGeImm({}, {}, {})", self.a(), self.b() as i8, self.c() as i8),
             Self::JUMP_IF_NIL => write!(f, "JumpIfNil({}, {})", self.a(), self.sbx()),
             Self::JUMP_IF_NOT_NIL => write!(f, "JumpIfNotNil({}, {})", self.a(), self.sbx()),
+            Self::CONS => write!(f, "Cons({}, {}, {})", self.a(), self.b(), self.c()),
             _ => write!(f, "Unknown(0x{:08x})", self.0),
         }
     }
@@ -129,6 +130,8 @@ impl Op {
     // Specialized nil check opcodes (common in list processing)
     pub const JUMP_IF_NIL: u8 = 48;    // A: src, sBx: offset - jump if src is nil
     pub const JUMP_IF_NOT_NIL: u8 = 49; // A: src, sBx: offset - jump if src is NOT nil
+    // Specialized cons opcode (very common in list construction)
+    pub const CONS: u8 = 50;           // ABC: dest, car, cdr - create cons cell
 
     // ========== Constructors ==========
 
@@ -443,6 +446,12 @@ impl Op {
     #[inline(always)]
     pub const fn jump_if_not_nil(src: Reg, offset: Offset) -> Self {
         Self::asbx(Self::JUMP_IF_NOT_NIL, src, offset)
+    }
+
+    // Specialized cons (very common in list construction)
+    #[inline(always)]
+    pub const fn cons(dest: Reg, car: Reg, cdr: Reg) -> Self {
+        Self::abc(Self::CONS, dest, car, cdr)
     }
 
     // ========== Jump patching helpers ==========

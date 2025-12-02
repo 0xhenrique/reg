@@ -949,6 +949,19 @@ impl Compiler {
                     _ => {}
                 }
             }
+
+            // Try specialized cons opcode (two arguments)
+            if args.len() == 2 && op == "cons" {
+                // Compile car into dest
+                self.compile_expr(&args[0], dest, false)?;
+                // Compile cdr into temp register
+                let cdr_reg = self.alloc_reg();
+                self.compile_expr(&args[1], cdr_reg, false)?;
+                // Emit Cons
+                self.emit(Op::cons(dest, dest, cdr_reg));
+                self.free_reg(); // free cdr_reg
+                return Ok(());
+            }
         }
 
         // Check if calling a global symbol (optimization: use CallGlobal/TailCallGlobal)
