@@ -775,6 +775,120 @@ impl VM {
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
+                // Combined compare-and-jump (register vs register)
+                Op::JUMP_IF_LT => {
+                    let left = instr.a();
+                    let right = instr.b();
+                    let offset = instr.c() as i8;
+                    let va = unsafe { self.registers.get_unchecked(base + left as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + right as usize) };
+                    if compare_values(va, vb)? == std::cmp::Ordering::Less {
+                        ip = (ip as isize + offset as isize) as usize;
+                    }
+                }
+
+                Op::JUMP_IF_LE => {
+                    let left = instr.a();
+                    let right = instr.b();
+                    let offset = instr.c() as i8;
+                    let va = unsafe { self.registers.get_unchecked(base + left as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + right as usize) };
+                    if compare_values(va, vb)? != std::cmp::Ordering::Greater {
+                        ip = (ip as isize + offset as isize) as usize;
+                    }
+                }
+
+                Op::JUMP_IF_GT => {
+                    let left = instr.a();
+                    let right = instr.b();
+                    let offset = instr.c() as i8;
+                    let va = unsafe { self.registers.get_unchecked(base + left as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + right as usize) };
+                    if compare_values(va, vb)? == std::cmp::Ordering::Greater {
+                        ip = (ip as isize + offset as isize) as usize;
+                    }
+                }
+
+                Op::JUMP_IF_GE => {
+                    let left = instr.a();
+                    let right = instr.b();
+                    let offset = instr.c() as i8;
+                    let va = unsafe { self.registers.get_unchecked(base + left as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + right as usize) };
+                    if compare_values(va, vb)? != std::cmp::Ordering::Less {
+                        ip = (ip as isize + offset as isize) as usize;
+                    }
+                }
+
+                // Combined compare-and-jump (register vs immediate)
+                Op::JUMP_IF_LT_IMM => {
+                    let src = instr.a();
+                    let imm = instr.b() as i8 as i64;
+                    let offset = instr.c() as i8;
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
+                    let should_jump = if let Some(x) = v.as_int() {
+                        x < imm
+                    } else if let Some(x) = v.as_float() {
+                        x < imm as f64
+                    } else {
+                        return Err("< expects a number".to_string());
+                    };
+                    if should_jump {
+                        ip = (ip as isize + offset as isize) as usize;
+                    }
+                }
+
+                Op::JUMP_IF_LE_IMM => {
+                    let src = instr.a();
+                    let imm = instr.b() as i8 as i64;
+                    let offset = instr.c() as i8;
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
+                    let should_jump = if let Some(x) = v.as_int() {
+                        x <= imm
+                    } else if let Some(x) = v.as_float() {
+                        x <= imm as f64
+                    } else {
+                        return Err("<= expects a number".to_string());
+                    };
+                    if should_jump {
+                        ip = (ip as isize + offset as isize) as usize;
+                    }
+                }
+
+                Op::JUMP_IF_GT_IMM => {
+                    let src = instr.a();
+                    let imm = instr.b() as i8 as i64;
+                    let offset = instr.c() as i8;
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
+                    let should_jump = if let Some(x) = v.as_int() {
+                        x > imm
+                    } else if let Some(x) = v.as_float() {
+                        x > imm as f64
+                    } else {
+                        return Err("> expects a number".to_string());
+                    };
+                    if should_jump {
+                        ip = (ip as isize + offset as isize) as usize;
+                    }
+                }
+
+                Op::JUMP_IF_GE_IMM => {
+                    let src = instr.a();
+                    let imm = instr.b() as i8 as i64;
+                    let offset = instr.c() as i8;
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
+                    let should_jump = if let Some(x) = v.as_int() {
+                        x >= imm
+                    } else if let Some(x) = v.as_float() {
+                        x >= imm as f64
+                    } else {
+                        return Err(">= expects a number".to_string());
+                    };
+                    if should_jump {
+                        ip = (ip as isize + offset as isize) as usize;
+                    }
+                }
+
                 _ => {
                     return Err(format!("Unknown opcode: {}", instr.opcode()));
                 }
@@ -1343,5 +1457,35 @@ mod tests {
         // Test in a loop context (sum function uses (<= n 0))
         let result = vm_eval("(do (def count-down (fn (n) (if (<= n 0) 0 (+ 1 (count-down (- n 1)))))) (count-down 10))").unwrap();
         assert_eq!(result, Value::Int(10));
+    }
+
+    #[test]
+    fn test_combined_compare_jump() {
+        // Test combined compare-and-jump opcodes
+        // These are generated for (if (< a b) ...) patterns
+
+        // Immediate variants
+        assert_eq!(vm_eval("(if (< 5 10) 1 2)").unwrap(), Value::Int(1));
+        assert_eq!(vm_eval("(if (< 15 10) 1 2)").unwrap(), Value::Int(2));
+        assert_eq!(vm_eval("(if (<= 10 10) 1 2)").unwrap(), Value::Int(1));
+        assert_eq!(vm_eval("(if (<= 11 10) 1 2)").unwrap(), Value::Int(2));
+        assert_eq!(vm_eval("(if (> 15 10) 1 2)").unwrap(), Value::Int(1));
+        assert_eq!(vm_eval("(if (> 5 10) 1 2)").unwrap(), Value::Int(2));
+        assert_eq!(vm_eval("(if (>= 10 10) 1 2)").unwrap(), Value::Int(1));
+        assert_eq!(vm_eval("(if (>= 9 10) 1 2)").unwrap(), Value::Int(2));
+
+        // Variable vs immediate (uses JumpIfXxxImm)
+        assert_eq!(vm_eval("(let (x 5) (if (< x 10) 1 2))").unwrap(), Value::Int(1));
+        assert_eq!(vm_eval("(let (x 15) (if (< x 10) 1 2))").unwrap(), Value::Int(2));
+        assert_eq!(vm_eval("(let (n 0) (if (<= n 0) 1 2))").unwrap(), Value::Int(1));
+        assert_eq!(vm_eval("(let (n 1) (if (<= n 0) 1 2))").unwrap(), Value::Int(2));
+
+        // Variable vs variable (uses JumpIfXxx)
+        assert_eq!(vm_eval("(let (a 5 b 10) (if (< a b) 1 2))").unwrap(), Value::Int(1));
+        assert_eq!(vm_eval("(let (a 15 b 10) (if (< a b) 1 2))").unwrap(), Value::Int(2));
+
+        // Recursive function using combined compare-jump
+        let result = vm_eval("(do (def sum (fn (n acc) (if (<= n 0) acc (sum (- n 1) (+ acc n))))) (sum 100 0))").unwrap();
+        assert_eq!(result, Value::Int(5050));
     }
 }

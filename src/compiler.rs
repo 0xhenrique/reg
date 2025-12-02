@@ -505,12 +505,23 @@ impl Compiler {
             return Err("if expects 2 or 3 arguments".to_string());
         }
 
-        // Compile condition into dest
+        // Try to use combined compare-and-jump opcodes for comparison conditions
+        if let Some(jump_to_else) = self.try_compile_compare_jump(&args[0], dest)? {
+            // Successfully emitted a combined compare-and-jump opcode
+            return self.compile_if_branches(args, dest, tail_pos, jump_to_else);
+        }
+
+        // Fallback: compile condition into dest and use JumpIfFalse
         self.compile_expr(&args[0], dest, false)?;
 
         // Jump to else if false
         let jump_to_else = self.emit(Op::jump_if_false(dest, 0));
 
+        self.compile_if_branches(args, dest, tail_pos, jump_to_else)
+    }
+
+    /// Compile the then/else branches of an if expression
+    fn compile_if_branches(&mut self, args: &[Value], dest: Reg, tail_pos: bool, jump_to_else: usize) -> Result<(), String> {
         // Compile then branch
         self.compile_expr(&args[1], dest, tail_pos)?;
 
@@ -541,6 +552,68 @@ impl Compiler {
         }
 
         Ok(())
+    }
+
+    /// Try to compile a comparison condition as a combined compare-and-jump opcode.
+    /// Returns Some(jump_pos) if successful, None if condition is not a simple comparison.
+    ///
+    /// For `(if (< a b) then else)`, we need to jump to else when condition is FALSE.
+    /// So we emit the OPPOSITE comparison:
+    /// - `<`  → JumpIfGe (jump if a >= b)
+    /// - `<=` → JumpIfGt (jump if a > b)
+    /// - `>`  → JumpIfLe (jump if a <= b)
+    /// - `>=` → JumpIfLt (jump if a < b)
+    fn try_compile_compare_jump(&mut self, cond: &Value, dest: Reg) -> Result<Option<usize>, String> {
+        let items = match cond.as_list() {
+            Some(items) if items.len() == 3 => items,
+            _ => return Ok(None),
+        };
+
+        let op = match items[0].as_symbol() {
+            Some(s) if s == "<" || s == "<=" || s == ">" || s == ">=" => s,
+            _ => return Ok(None),
+        };
+
+        let left = &items[1];
+        let right = &items[2];
+
+        // Check for immediate optimization: (< x 0), (<= n 10), etc.
+        if let Some(imm) = right.as_int() {
+            if imm >= i8::MIN as i64 && imm <= i8::MAX as i64 {
+                // Compile left operand into dest
+                self.compile_expr(left, dest, false)?;
+
+                // Emit combined compare-jump with OPPOSITE comparison
+                // placeholder offset 0, will be patched later
+                let jump_pos = match op {
+                    "<"  => self.emit(Op::jump_if_ge_imm(dest, imm as i8, 0)),
+                    "<=" => self.emit(Op::jump_if_gt_imm(dest, imm as i8, 0)),
+                    ">"  => self.emit(Op::jump_if_le_imm(dest, imm as i8, 0)),
+                    ">=" => self.emit(Op::jump_if_lt_imm(dest, imm as i8, 0)),
+                    _ => unreachable!(),
+                };
+                return Ok(Some(jump_pos));
+            }
+        }
+
+        // Register-register comparison
+        // Compile left into dest
+        self.compile_expr(left, dest, false)?;
+        // Compile right into temp register
+        let right_reg = self.alloc_reg();
+        self.compile_expr(right, right_reg, false)?;
+
+        // Emit combined compare-jump with OPPOSITE comparison
+        let jump_pos = match op {
+            "<"  => self.emit(Op::jump_if_ge(dest, right_reg, 0)),
+            "<=" => self.emit(Op::jump_if_gt(dest, right_reg, 0)),
+            ">"  => self.emit(Op::jump_if_le(dest, right_reg, 0)),
+            ">=" => self.emit(Op::jump_if_lt(dest, right_reg, 0)),
+            _ => unreachable!(),
+        };
+
+        self.free_reg(); // free right_reg
+        Ok(Some(jump_pos))
     }
 
     fn compile_def(&mut self, args: &[Value], dest: Reg) -> Result<(), String> {

@@ -60,6 +60,14 @@ impl std::fmt::Debug for Op {
             Self::LE_IMM => write!(f, "LeImm({}, {}, {})", self.a(), self.b(), self.c() as i8),
             Self::GT_IMM => write!(f, "GtImm({}, {}, {})", self.a(), self.b(), self.c() as i8),
             Self::GE_IMM => write!(f, "GeImm({}, {}, {})", self.a(), self.b(), self.c() as i8),
+            Self::JUMP_IF_LT => write!(f, "JumpIfLt({}, {}, {})", self.a(), self.b(), self.c() as i8),
+            Self::JUMP_IF_LE => write!(f, "JumpIfLe({}, {}, {})", self.a(), self.b(), self.c() as i8),
+            Self::JUMP_IF_GT => write!(f, "JumpIfGt({}, {}, {})", self.a(), self.b(), self.c() as i8),
+            Self::JUMP_IF_GE => write!(f, "JumpIfGe({}, {}, {})", self.a(), self.b(), self.c() as i8),
+            Self::JUMP_IF_LT_IMM => write!(f, "JumpIfLtImm({}, {}, {})", self.a(), self.b() as i8, self.c() as i8),
+            Self::JUMP_IF_LE_IMM => write!(f, "JumpIfLeImm({}, {}, {})", self.a(), self.b() as i8, self.c() as i8),
+            Self::JUMP_IF_GT_IMM => write!(f, "JumpIfGtImm({}, {}, {})", self.a(), self.b() as i8, self.c() as i8),
+            Self::JUMP_IF_GE_IMM => write!(f, "JumpIfGeImm({}, {}, {})", self.a(), self.b() as i8, self.c() as i8),
             _ => write!(f, "Unknown(0x{:08x})", self.0),
         }
     }
@@ -107,6 +115,15 @@ impl Op {
     pub const LE_IMM: u8 = 37;         // ABC: dest, src, imm (C is i8) - src <= imm
     pub const GT_IMM: u8 = 38;         // ABC: dest, src, imm (C is i8) - src > imm
     pub const GE_IMM: u8 = 39;         // ABC: dest, src, imm (C is i8) - src >= imm
+    // Combined compare-and-jump opcodes (saves a register + dispatch overhead)
+    pub const JUMP_IF_LT: u8 = 40;     // ABC: left, right, offset (i8) - jump if left < right
+    pub const JUMP_IF_LE: u8 = 41;     // ABC: left, right, offset (i8) - jump if left <= right
+    pub const JUMP_IF_GT: u8 = 42;     // ABC: left, right, offset (i8) - jump if left > right
+    pub const JUMP_IF_GE: u8 = 43;     // ABC: left, right, offset (i8) - jump if left >= right
+    pub const JUMP_IF_LT_IMM: u8 = 44; // ABC: src, imm (i8), offset (i8) - jump if src < imm
+    pub const JUMP_IF_LE_IMM: u8 = 45; // ABC: src, imm (i8), offset (i8) - jump if src <= imm
+    pub const JUMP_IF_GT_IMM: u8 = 46; // ABC: src, imm (i8), offset (i8) - jump if src > imm
+    pub const JUMP_IF_GE_IMM: u8 = 47; // ABC: src, imm (i8), offset (i8) - jump if src >= imm
 
     // ========== Constructors ==========
 
@@ -370,6 +387,48 @@ impl Op {
         Self::abc(Self::GE_IMM, dest, src, imm as u8)
     }
 
+    // Combined compare-and-jump (register vs register)
+    #[inline(always)]
+    pub const fn jump_if_lt(left: Reg, right: Reg, offset: i8) -> Self {
+        Self::abc(Self::JUMP_IF_LT, left, right, offset as u8)
+    }
+
+    #[inline(always)]
+    pub const fn jump_if_le(left: Reg, right: Reg, offset: i8) -> Self {
+        Self::abc(Self::JUMP_IF_LE, left, right, offset as u8)
+    }
+
+    #[inline(always)]
+    pub const fn jump_if_gt(left: Reg, right: Reg, offset: i8) -> Self {
+        Self::abc(Self::JUMP_IF_GT, left, right, offset as u8)
+    }
+
+    #[inline(always)]
+    pub const fn jump_if_ge(left: Reg, right: Reg, offset: i8) -> Self {
+        Self::abc(Self::JUMP_IF_GE, left, right, offset as u8)
+    }
+
+    // Combined compare-and-jump (register vs immediate)
+    #[inline(always)]
+    pub const fn jump_if_lt_imm(src: Reg, imm: i8, offset: i8) -> Self {
+        Self::abc(Self::JUMP_IF_LT_IMM, src, imm as u8, offset as u8)
+    }
+
+    #[inline(always)]
+    pub const fn jump_if_le_imm(src: Reg, imm: i8, offset: i8) -> Self {
+        Self::abc(Self::JUMP_IF_LE_IMM, src, imm as u8, offset as u8)
+    }
+
+    #[inline(always)]
+    pub const fn jump_if_gt_imm(src: Reg, imm: i8, offset: i8) -> Self {
+        Self::abc(Self::JUMP_IF_GT_IMM, src, imm as u8, offset as u8)
+    }
+
+    #[inline(always)]
+    pub const fn jump_if_ge_imm(src: Reg, imm: i8, offset: i8) -> Self {
+        Self::abc(Self::JUMP_IF_GE_IMM, src, imm as u8, offset as u8)
+    }
+
     // ========== Jump patching helpers ==========
 
     /// Check if this is a jump instruction (for patching)
@@ -377,6 +436,10 @@ impl Op {
     pub const fn is_jump(self) -> bool {
         let op = self.opcode();
         op == Self::JUMP || op == Self::JUMP_IF_FALSE || op == Self::JUMP_IF_TRUE
+            || op == Self::JUMP_IF_LT || op == Self::JUMP_IF_LE
+            || op == Self::JUMP_IF_GT || op == Self::JUMP_IF_GE
+            || op == Self::JUMP_IF_LT_IMM || op == Self::JUMP_IF_LE_IMM
+            || op == Self::JUMP_IF_GT_IMM || op == Self::JUMP_IF_GE_IMM
     }
 
     /// Patch the offset of a jump instruction
@@ -384,8 +447,12 @@ impl Op {
     pub fn patch_offset(&mut self, new_offset: i16) {
         let opcode = self.opcode();
         let a = self.a();
-        // Reconstruct with new offset
-        if opcode == Self::JUMP {
+        let b = self.b();
+        // Combined compare-and-jump use ABC format with C as 8-bit offset
+        if opcode >= Self::JUMP_IF_LT && opcode <= Self::JUMP_IF_GE_IMM {
+            // For these opcodes: A=left/src, B=right/imm, C=offset (i8)
+            *self = Self::abc(opcode, a, b, new_offset as i8 as u8);
+        } else if opcode == Self::JUMP {
             *self = Self::make_sbx(opcode, new_offset);
         } else {
             *self = Self::asbx(opcode, a, new_offset);
