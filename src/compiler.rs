@@ -1,14 +1,98 @@
 use crate::bytecode::{Chunk, ConstIdx, Op, Reg};
 use crate::value::Value;
+use std::collections::HashMap;
+
+/// A pure function definition (for compile-time evaluation)
+#[derive(Clone)]
+struct PureFunction {
+    params: Vec<String>,
+    body: Value,
+}
+
+/// Registry of pure functions for compile-time evaluation
+#[derive(Clone, Default)]
+struct PureFunctions {
+    funcs: HashMap<String, PureFunction>,
+}
+
+impl PureFunctions {
+    fn new() -> Self {
+        PureFunctions {
+            funcs: HashMap::new(),
+        }
+    }
+
+    fn register(&mut self, name: &str, params: Vec<String>, body: Value) {
+        self.funcs.insert(name.to_string(), PureFunction { params, body });
+    }
+
+    fn get(&self, name: &str) -> Option<&PureFunction> {
+        self.funcs.get(name)
+    }
+}
 
 pub struct Compiler {
     chunk: Chunk,
-    locals: Vec<String>,   // local variable names, index = register
+    locals: Vec<String>,
     scope_depth: usize,
+    pure_fns: PureFunctions,
 }
 
-/// Try to evaluate a constant expression recursively
-fn try_const_eval(expr: &Value) -> Option<Value> {
+/// Check if an expression is pure (no side effects)
+fn is_pure_expr_with_fns(expr: &Value, pure_fns: &PureFunctions) -> bool {
+    match expr {
+        // Literals are pure
+        Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Nil | Value::String(_) => true,
+        // Symbols are pure (just variable references)
+        Value::Symbol(_) => true,
+        // Lists need to be checked
+        Value::List(items) if items.is_empty() => true,
+        Value::List(items) => {
+            let first = &items[0];
+            if let Some(sym) = first.as_symbol() {
+                match sym {
+                    // Pure built-in operations
+                    "+" | "-" | "*" | "/" | "mod" | "<" | "<=" | ">" | ">=" | "=" | "!=" | "not" => {
+                        items[1..].iter().all(|e| is_pure_expr_with_fns(e, pure_fns))
+                    }
+                    // Conditional is pure if branches are pure
+                    "if" => items[1..].iter().all(|e| is_pure_expr_with_fns(e, pure_fns)),
+                    // Let is pure if bindings and body are pure
+                    "let" => {
+                        if items.len() >= 3 {
+                            if let Some(bindings) = items[1].as_list() {
+                                bindings.iter().all(|e| is_pure_expr_with_fns(e, pure_fns)) &&
+                                items[2..].iter().all(|e| is_pure_expr_with_fns(e, pure_fns))
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    }
+                    // Quote is pure
+                    "quote" => true,
+                    // Check if it's a known pure function
+                    _ => {
+                        if pure_fns.get(sym).is_some() {
+                            // It's a call to a known pure function, check args are pure
+                            items[1..].iter().all(|e| is_pure_expr_with_fns(e, pure_fns))
+                        } else {
+                            false
+                        }
+                    }
+                }
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+
+/// Try to evaluate a constant expression recursively, including pure function calls
+fn try_const_eval_with_fns(expr: &Value, pure_fns: &PureFunctions) -> Option<Value> {
     match expr {
         // Literals are constants
         Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Nil | Value::String(_) => {
@@ -18,13 +102,53 @@ fn try_const_eval(expr: &Value) -> Option<Value> {
         Value::List(items) if !items.is_empty() => {
             let op = items[0].as_symbol()?;
             let args = &items[1..];
-            // Recursively evaluate arguments
-            let const_args: Option<Vec<Value>> = args.iter().map(try_const_eval).collect();
+
+            // First try built-in operations
+            let const_args: Option<Vec<Value>> = args.iter()
+                .map(|a| try_const_eval_with_fns(a, pure_fns))
+                .collect();
             let const_args = const_args?;
             let const_refs: Vec<&Value> = const_args.iter().collect();
-            fold_op(op, &const_refs)
+
+            if let Some(result) = fold_op(op, &const_refs) {
+                return Some(result);
+            }
+
+            // Try pure user-defined functions
+            if let Some(pure_fn) = pure_fns.get(op) {
+                if pure_fn.params.len() == const_args.len() {
+                    // Substitute parameters with constant values
+                    let substituted = substitute(&pure_fn.body, &pure_fn.params, &const_args);
+                    // Recursively evaluate the substituted body
+                    return try_const_eval_with_fns(&substituted, pure_fns);
+                }
+            }
+
+            None
         }
         _ => None,
+    }
+}
+
+/// Substitute parameters with values in an expression
+fn substitute(expr: &Value, params: &[String], args: &[Value]) -> Value {
+    match expr {
+        Value::Symbol(name) => {
+            for (i, param) in params.iter().enumerate() {
+                if param == name.as_ref() {
+                    return args[i].clone();
+                }
+            }
+            expr.clone()
+        }
+        Value::List(items) => {
+            let new_items: Vec<Value> = items
+                .iter()
+                .map(|item| substitute(item, params, args))
+                .collect();
+            Value::list(new_items)
+        }
+        _ => expr.clone(),
     }
 }
 
@@ -227,6 +351,7 @@ impl Compiler {
             chunk: Chunk::new(),
             locals: Vec::new(),
             scope_depth: 0,
+            pure_fns: PureFunctions::new(),
         }
     }
 
@@ -236,6 +361,28 @@ impl Compiler {
         compiler.compile_expr(expr, dest, true)?;
         compiler.emit(Op::Return(dest));
         compiler.chunk.num_registers = compiler.locals.len().max(1) as u8 + 16; // extra for temps
+        Ok(compiler.chunk)
+    }
+
+    /// Compile multiple expressions, allowing pure function definitions to be used
+    /// in subsequent expressions
+    pub fn compile_all(exprs: &[Value]) -> Result<Chunk, String> {
+        let mut compiler = Compiler::new();
+        let dest = compiler.alloc_reg();
+
+        if exprs.is_empty() {
+            compiler.emit(Op::LoadNil(dest));
+        } else {
+            // Compile all but last expression (not in tail position)
+            for expr in &exprs[..exprs.len() - 1] {
+                compiler.compile_expr(expr, dest, false)?;
+            }
+            // Last expression in tail position
+            compiler.compile_expr(&exprs[exprs.len() - 1], dest, true)?;
+        }
+
+        compiler.emit(Op::Return(dest));
+        compiler.chunk.num_registers = compiler.locals.len().max(1) as u8 + 16;
         Ok(compiler.chunk)
     }
 
@@ -400,6 +547,39 @@ impl Compiler {
             .as_symbol()
             .ok_or("def expects a symbol as first argument")?;
 
+        // Check if we're defining a pure function: (def name (fn (params) body))
+        if let Some(fn_expr) = args[1].as_list() {
+            if fn_expr.len() >= 3 {
+                if let Some(fn_sym) = fn_expr[0].as_symbol() {
+                    if fn_sym == "fn" {
+                        if let Some(params_list) = fn_expr[1].as_list() {
+                            // Get parameter names
+                            let params: Option<Vec<String>> = params_list
+                                .iter()
+                                .map(|p| p.as_symbol().map(|s| s.to_string()))
+                                .collect();
+
+                            if let Some(params) = params {
+                                // Get the body (handle multi-expression body)
+                                let body = if fn_expr.len() == 3 {
+                                    fn_expr[2].clone()
+                                } else {
+                                    let mut do_list = vec![Value::symbol("do")];
+                                    do_list.extend(fn_expr[2..].iter().cloned());
+                                    Value::list(do_list)
+                                };
+
+                                // Check if body is pure (with knowledge of already-registered pure fns)
+                                if is_pure_expr_with_fns(&body, &self.pure_fns) {
+                                    self.pure_fns.register(name, params, body);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Compile value
         self.compile_expr(&args[1], dest, false)?;
 
@@ -513,9 +693,9 @@ impl Compiler {
     }
 
     fn compile_call(&mut self, items: &[Value], dest: Reg, tail_pos: bool) -> Result<(), String> {
-        // Try constant folding for the entire call expression
+        // Try constant folding for the entire call expression (including pure user functions)
         let call_expr = Value::list(items.to_vec());
-        if let Some(folded) = try_const_eval(&call_expr) {
+        if let Some(folded) = try_const_eval_with_fns(&call_expr, &self.pure_fns) {
             let idx = self.add_constant(folded);
             self.emit(Op::LoadConst(dest, idx));
             return Ok(());
@@ -702,5 +882,48 @@ mod tests {
         let chunk = compile_str("(mod 17 5)").unwrap();
         assert!(matches!(chunk.code[0], Op::LoadConst(0, _)));
         assert_eq!(chunk.constants[0], Value::Int(2));
+    }
+
+    #[test]
+    fn test_pure_function_folding() {
+        use crate::parser::parse_all;
+
+        // Define a pure function and call it with constants
+        let exprs = parse_all("(def square (fn (n) (* n n))) (square 5)").unwrap();
+        let chunk = Compiler::compile_all(&exprs).unwrap();
+
+        // The call (square 5) should be folded to 25
+        // Look for LoadConst 25 in the chunk
+        let has_25 = chunk.constants.iter().any(|c| *c == Value::Int(25));
+        assert!(has_25, "Expected constant 25 from folding (square 5)");
+
+        // Should NOT have a function call for (square 5)
+        // (there may be a call for def though, so just check we have the constant)
+    }
+
+    #[test]
+    fn test_pure_function_nested() {
+        use crate::parser::parse_all;
+
+        // Define two pure functions
+        let exprs = parse_all("(def double (fn (x) (* x 2))) (def quad (fn (x) (double (double x)))) (quad 3)").unwrap();
+        let chunk = Compiler::compile_all(&exprs).unwrap();
+
+        // (quad 3) = (double (double 3)) = (double 6) = 12
+        let has_12 = chunk.constants.iter().any(|c| *c == Value::Int(12));
+        assert!(has_12, "Expected constant 12 from folding (quad 3)");
+    }
+
+    #[test]
+    fn test_impure_function_not_folded() {
+        use crate::parser::parse_all;
+
+        // A function that calls println is not pure
+        let exprs = parse_all("(def greet (fn (x) (println x))) (greet 5)").unwrap();
+        let chunk = Compiler::compile_all(&exprs).unwrap();
+
+        // Should have a function call (not folded)
+        let has_call = chunk.code.iter().any(|op| matches!(op, Op::Call(_, _, _) | Op::TailCall(_, _)));
+        assert!(has_call, "Impure function should not be folded");
     }
 }
