@@ -28,8 +28,10 @@ pub enum Op {
     JumpIfTrue(Reg, Offset),
 
     // Function calls
-    Call(Reg, Reg, u8),     // dest, func, nargs (args in func+1, func+2, ...)
-    TailCall(Reg, u8),      // func, nargs
+    Call(Reg, Reg, u8),       // dest, func, nargs (args in func+1, func+2, ...)
+    CallGlobal(Reg, ConstIdx, u8), // dest, name_idx, nargs (args in dest+1, dest+2, ...) - optimized call to global
+    TailCall(Reg, u8),        // func, nargs
+    TailCallGlobal(ConstIdx, Reg, u8), // name_idx, arg_start, nargs - optimized tail call to global
     Return(Reg),
 
     // Arithmetic (dest, left, right)

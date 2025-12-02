@@ -62,10 +62,11 @@ impl VM {
 
     fn execute(&mut self) -> Result<Value, String> {
         loop {
-            let frame = self.frames.last().ok_or("No active frame")?;
-            let op = frame.chunk.code.get(frame.ip).cloned();
-            let base = frame.base;
-            let chunk = frame.chunk.clone();
+            // Get op and base without cloning the chunk Rc
+            let (op, base) = {
+                let frame = self.frames.last().ok_or("No active frame")?;
+                (frame.chunk.code.get(frame.ip).cloned(), frame.base)
+            };
 
             // Advance IP
             if let Some(frame) = self.frames.last_mut() {
@@ -79,7 +80,8 @@ impl VM {
 
             match op {
                 Op::LoadConst(dest, idx) => {
-                    let value = chunk.constants[idx as usize].clone();
+                    // Access chunk only when needed
+                    let value = self.frames.last().unwrap().chunk.constants[idx as usize].clone();
                     self.registers[base + dest as usize] = value;
                 }
 
@@ -102,7 +104,8 @@ impl VM {
 
                 Op::GetGlobal(dest, name_idx) => {
                     // Use chunk pointer as part of cache key for uniqueness
-                    let chunk_ptr = Rc::as_ptr(&chunk) as usize;
+                    let chunk = &self.frames.last().unwrap().chunk;
+                    let chunk_ptr = Rc::as_ptr(chunk) as usize;
                     let cache_key = (chunk_ptr, name_idx);
 
                     let value = if let Some(cached) = self.global_cache.get(&cache_key) {
@@ -124,6 +127,7 @@ impl VM {
                 }
 
                 Op::SetGlobal(name_idx, src) => {
+                    let chunk = &self.frames.last().unwrap().chunk;
                     let name: &str = match &chunk.constants[name_idx as usize] {
                         Value::Symbol(s) => s,
                         _ => return Err("SetGlobal: expected symbol".to_string()),
@@ -135,6 +139,7 @@ impl VM {
                 }
 
                 Op::Closure(dest, proto_idx) => {
+                    let chunk = &self.frames.last().unwrap().chunk;
                     let proto = chunk.protos[proto_idx as usize].clone();
                     let func = Value::CompiledFunction(Rc::new(proto));
                     self.registers[base + dest as usize] = func;
@@ -163,9 +168,8 @@ impl VM {
                 }
 
                 Op::Call(dest, func_reg, nargs) => {
-                    let func = self.registers[base + func_reg as usize].clone();
-
-                    match &func {
+                    // Match on reference to avoid cloning the function value
+                    match &self.registers[base + func_reg as usize] {
                         Value::CompiledFunction(cf) => {
                             if cf.num_params != nargs {
                                 return Err(format!(
@@ -174,11 +178,15 @@ impl VM {
                                 ));
                             }
 
-                            let new_base = base + chunk.num_registers as usize;
+                            let num_registers = self.frames.last().unwrap().chunk.num_registers;
+                            let new_base = base + num_registers as usize;
 
                             if new_base + cf.num_registers as usize > MAX_REGISTERS {
                                 return Err("Stack overflow".to_string());
                             }
+
+                            // Clone the Rc<Chunk> directly (not the entire Value)
+                            let cf_chunk = cf.clone();
 
                             // Copy args directly to new frame's registers (no Vec allocation!)
                             let arg_start = base + func_reg as usize + 1;
@@ -188,30 +196,31 @@ impl VM {
 
                             // Push new frame - will continue in the loop
                             self.frames.push(CallFrame {
-                                chunk: cf.clone(),
+                                chunk: cf_chunk,
                                 ip: 0,
                                 base: new_base,
                                 return_reg: base + dest as usize,
                             });
                         }
                         Value::NativeFunction(nf) => {
+                            // Clone the function pointer before the mutable borrow
+                            let func_ptr = nf.func;
                             // Pass a slice directly to native function (no Vec allocation!)
                             let arg_start = base + func_reg as usize + 1;
                             let arg_end = arg_start + nargs as usize;
-                            let result = (nf.func)(&self.registers[arg_start..arg_end])?;
+                            let result = func_ptr(&self.registers[arg_start..arg_end])?;
                             self.registers[base + dest as usize] = result;
                         }
                         Value::Function(_) => {
                             return Err("Cannot call interpreted function from VM".to_string());
                         }
-                        _ => return Err(format!("Not a function: {}", func)),
+                        other => return Err(format!("Not a function: {}", other)),
                     }
                 }
 
                 Op::TailCall(func_reg, nargs) => {
-                    let func = self.registers[base + func_reg as usize].clone();
-
-                    match &func {
+                    // Match on reference to avoid cloning the function value
+                    match &self.registers[base + func_reg as usize] {
                         Value::CompiledFunction(cf) => {
                             if cf.num_params != nargs {
                                 return Err(format!(
@@ -219,9 +228,11 @@ impl VM {
                                     cf.num_params, nargs
                                 ));
                             }
+                            // Clone the Rc<Chunk> directly (not the entire Value)
+                            let cf_chunk = cf.clone();
                             // Reuse current frame for tail call
                             if let Some(frame) = self.frames.last_mut() {
-                                frame.chunk = cf.clone();
+                                frame.chunk = cf_chunk;
                                 frame.ip = 0;
                             }
                             // Copy args directly to base registers (no Vec allocation!)
@@ -233,11 +244,13 @@ impl VM {
                             }
                         }
                         Value::NativeFunction(nf) => {
+                            // Clone the function pointer before the mutable borrow
+                            let func_ptr = nf.func;
+                            let return_reg = self.frames.last().unwrap().return_reg;
                             // Pass a slice directly to native function (no Vec allocation!)
                             let arg_start = base + func_reg as usize + 1;
                             let arg_end = arg_start + nargs as usize;
-                            let result = (nf.func)(&self.registers[arg_start..arg_end])?;
-                            let return_reg = self.frames.last().unwrap().return_reg;
+                            let result = func_ptr(&self.registers[arg_start..arg_end])?;
                             self.frames.pop();
                             if self.frames.is_empty() {
                                 return Ok(result);
@@ -248,7 +261,124 @@ impl VM {
                         Value::Function(_) => {
                             return Err("Cannot call interpreted function from VM".to_string());
                         }
-                        _ => return Err(format!("Not a function: {}", func)),
+                        other => return Err(format!("Not a function: {}", other)),
+                    }
+                }
+
+                Op::CallGlobal(dest, name_idx, nargs) => {
+                    // Optimized: look up global and call directly without intermediate register
+                    let chunk = &self.frames.last().unwrap().chunk;
+                    let chunk_ptr = Rc::as_ptr(chunk) as usize;
+                    let cache_key = (chunk_ptr, name_idx);
+
+                    // Get function from cache or globals
+                    let func_value = if let Some(cached) = self.global_cache.get(&cache_key) {
+                        cached
+                    } else {
+                        let name: &str = match &chunk.constants[name_idx as usize] {
+                            Value::Symbol(s) => s,
+                            _ => return Err("CallGlobal: expected symbol".to_string()),
+                        };
+                        let v = self.globals.borrow().get(name).cloned()
+                            .ok_or_else(|| format!("Undefined function: {}", name))?;
+                        self.global_cache.insert(cache_key, v);
+                        self.global_cache.get(&cache_key).unwrap()
+                    };
+
+                    match func_value {
+                        Value::CompiledFunction(cf) => {
+                            if cf.num_params != nargs {
+                                return Err(format!(
+                                    "Expected {} arguments, got {}",
+                                    cf.num_params, nargs
+                                ));
+                            }
+
+                            let num_registers = self.frames.last().unwrap().chunk.num_registers;
+                            let new_base = base + num_registers as usize;
+
+                            if new_base + cf.num_registers as usize > MAX_REGISTERS {
+                                return Err("Stack overflow".to_string());
+                            }
+
+                            let cf_chunk = cf.clone();
+
+                            // Copy args from dest+1, dest+2, ... to new frame
+                            let arg_start = base + dest as usize + 1;
+                            for i in 0..nargs as usize {
+                                self.registers[new_base + i] = self.registers[arg_start + i].clone();
+                            }
+
+                            self.frames.push(CallFrame {
+                                chunk: cf_chunk,
+                                ip: 0,
+                                base: new_base,
+                                return_reg: base + dest as usize,
+                            });
+                        }
+                        Value::NativeFunction(nf) => {
+                            let func_ptr = nf.func;
+                            let arg_start = base + dest as usize + 1;
+                            let arg_end = arg_start + nargs as usize;
+                            let result = func_ptr(&self.registers[arg_start..arg_end])?;
+                            self.registers[base + dest as usize] = result;
+                        }
+                        _ => return Err(format!("Not a function: {}", func_value)),
+                    }
+                }
+
+                Op::TailCallGlobal(name_idx, arg_start, nargs) => {
+                    // Optimized: look up global and tail-call directly
+                    let chunk = &self.frames.last().unwrap().chunk;
+                    let chunk_ptr = Rc::as_ptr(chunk) as usize;
+                    let cache_key = (chunk_ptr, name_idx);
+
+                    // Get function from cache or globals
+                    let func_value = if let Some(cached) = self.global_cache.get(&cache_key) {
+                        cached
+                    } else {
+                        let name: &str = match &chunk.constants[name_idx as usize] {
+                            Value::Symbol(s) => s,
+                            _ => return Err("TailCallGlobal: expected symbol".to_string()),
+                        };
+                        let v = self.globals.borrow().get(name).cloned()
+                            .ok_or_else(|| format!("Undefined function: {}", name))?;
+                        self.global_cache.insert(cache_key, v);
+                        self.global_cache.get(&cache_key).unwrap()
+                    };
+
+                    match func_value {
+                        Value::CompiledFunction(cf) => {
+                            if cf.num_params != nargs {
+                                return Err(format!(
+                                    "Expected {} arguments, got {}",
+                                    cf.num_params, nargs
+                                ));
+                            }
+                            let cf_chunk = cf.clone();
+                            if let Some(frame) = self.frames.last_mut() {
+                                frame.chunk = cf_chunk;
+                                frame.ip = 0;
+                            }
+                            // Copy args from temp registers (at arg_start+1, arg_start+2, ...) to base+0, base+1, ...
+                            let src_start = base + arg_start as usize + 1;
+                            for i in 0..nargs as usize {
+                                self.registers[base + i] = self.registers[src_start + i].clone();
+                            }
+                        }
+                        Value::NativeFunction(nf) => {
+                            let func_ptr = nf.func;
+                            let return_reg = self.frames.last().unwrap().return_reg;
+                            let src_start = base + arg_start as usize + 1;
+                            let src_end = src_start + nargs as usize;
+                            let result = func_ptr(&self.registers[src_start..src_end])?;
+                            self.frames.pop();
+                            if self.frames.is_empty() {
+                                return Ok(result);
+                            }
+                            self.registers[return_reg] = result;
+                        }
+                        _ => return Err(format!("Not a function: {}", func_value)),
                     }
                 }
 

@@ -772,6 +772,58 @@ impl Compiler {
             }
         }
 
+        // Check if calling a global symbol (optimization: use CallGlobal/TailCallGlobal)
+        let is_global_call = if let Some(name) = items[0].as_symbol() {
+            // It's a global if it's not in our local variables
+            !self.locals.iter().any(|local| local == name)
+        } else {
+            false
+        };
+
+        if is_global_call {
+            // Use optimized CallGlobal/TailCallGlobal opcode
+            let name = items[0].as_symbol().unwrap();
+            let name_idx = self.add_constant(Value::symbol(name));
+            let args = &items[1..];
+            let nargs = args.len() as u8;
+
+            if tail_pos {
+                // For TailCallGlobal, we need to be careful not to overwrite parameters
+                // that might be used in later arguments. Compile to temp registers first,
+                // then we'll copy to r0, r1, ... at call time.
+                let arg_start = self.alloc_reg();
+                for arg in args.iter() {
+                    let arg_reg = self.alloc_reg();
+                    self.compile_expr(arg, arg_reg, false)?;
+                }
+                self.emit(Op::TailCallGlobal(name_idx, arg_start, nargs));
+                self.emit(Op::LoadNil(dest));
+                // Free the temp registers
+                for _ in 0..=nargs {
+                    self.free_reg();
+                }
+            } else {
+                // For CallGlobal, args go in dest+1, dest+2, ...
+                // First allocate registers for args
+                let start_locals = self.locals.len();
+                for (i, arg) in args.iter().enumerate() {
+                    let arg_reg = dest + 1 + i as Reg;
+                    // Ensure we have enough registers allocated
+                    while (self.locals.len() as Reg) <= arg_reg {
+                        self.alloc_reg();
+                    }
+                    self.compile_expr(arg, arg_reg, false)?;
+                }
+                self.emit(Op::CallGlobal(dest, name_idx, nargs));
+                // Free the temporary arg registers
+                while self.locals.len() > start_locals {
+                    self.free_reg();
+                }
+            }
+            return Ok(());
+        }
+
+        // Regular call path
         let func_reg = self.alloc_reg();
 
         // Compile function
@@ -884,14 +936,16 @@ mod tests {
 
     #[test]
     fn test_compile_call() {
-        // Top-level call is in tail position, so it's a TailCall
+        // Top-level call is in tail position, so it's a TailCall or TailCallGlobal
         let chunk = compile_str("(foo 1 2)").unwrap();
-        let has_tail_call = chunk.code.iter().any(|op| matches!(op, Op::TailCall(_, _)));
+        let has_tail_call = chunk.code.iter().any(|op|
+            matches!(op, Op::TailCall(_, _) | Op::TailCallGlobal(_, _, _)));
         assert!(has_tail_call);
 
         // Non-tail call (if condition is not in tail position)
         let chunk = compile_str("(if (foo) 1 2)").unwrap();
-        let has_call = chunk.code.iter().any(|op| matches!(op, Op::Call(_, _, _)));
+        let has_call = chunk.code.iter().any(|op|
+            matches!(op, Op::Call(_, _, _) | Op::CallGlobal(_, _, _)));
         assert!(has_call);
     }
 
@@ -998,7 +1052,8 @@ mod tests {
         let chunk = Compiler::compile_all(&exprs).unwrap();
 
         // Should have a function call (not folded)
-        let has_call = chunk.code.iter().any(|op| matches!(op, Op::Call(_, _, _) | Op::TailCall(_, _)));
+        let has_call = chunk.code.iter().any(|op| matches!(op,
+            Op::Call(_, _, _) | Op::TailCall(_, _) | Op::CallGlobal(_, _, _) | Op::TailCallGlobal(_, _, _)));
         assert!(has_call, "Impure function should not be folded");
     }
 }
