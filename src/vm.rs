@@ -770,6 +770,16 @@ pub fn standard_vm() -> VM {
         Ok(Value::symbol(&format!("G__{}", id)))
     }));
 
+    // Timing functions (for benchmarking)
+    vm.define_global("clock", native("clock", |_args| {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let duration = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let secs = duration.as_secs_f64();
+        Ok(Value::float(secs))
+    }));
+
     vm
 }
 
