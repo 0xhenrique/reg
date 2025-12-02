@@ -1,7 +1,46 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
 use crate::bytecode::Chunk;
+
+//=============================================================================
+// Symbol Interner
+//=============================================================================
+//
+// All symbols are interned for O(1) comparison. The interner maintains a
+// mapping from string content to Rc<str>, ensuring identical symbols share
+// the same Rc. Symbol comparison then uses Rc::ptr_eq() instead of string
+// comparison.
+
+thread_local! {
+    static SYMBOL_INTERNER: RefCell<SymbolInterner> = RefCell::new(SymbolInterner::new());
+}
+
+struct SymbolInterner {
+    symbols: HashMap<Box<str>, Rc<str>>,
+}
+
+impl SymbolInterner {
+    fn new() -> Self {
+        SymbolInterner {
+            symbols: HashMap::new(),
+        }
+    }
+
+    /// Intern a symbol string, returning a shared Rc<str>.
+    /// If the symbol already exists, returns the existing Rc.
+    /// Otherwise, creates a new Rc and stores it.
+    fn intern(&mut self, s: &str) -> Rc<str> {
+        if let Some(rc) = self.symbols.get(s) {
+            return rc.clone();
+        }
+        let rc: Rc<str> = Rc::from(s);
+        self.symbols.insert(s.into(), rc.clone());
+        rc
+    }
+}
 
 //=============================================================================
 // NaN-Boxing Implementation
@@ -133,9 +172,10 @@ impl Value {
         Value::from_heap(heap)
     }
 
-    /// Create a symbol value
+    /// Create a symbol value (interned for O(1) comparison)
     pub fn symbol(s: &str) -> Value {
-        let heap = Rc::new(HeapObject::Symbol(Rc::from(s)));
+        let interned = SYMBOL_INTERNER.with(|interner| interner.borrow_mut().intern(s));
+        let heap = Rc::new(HeapObject::Symbol(interned));
         Value::from_heap(heap)
     }
 
@@ -369,8 +409,11 @@ impl Value {
     }
 
     /// Create Symbol (backwards compat) - from Rc<str>
+    /// Note: For proper interning, prefer Value::symbol(&str) instead
     pub fn Symbol(s: Rc<str>) -> Value {
-        let heap = Rc::new(HeapObject::Symbol(s));
+        // Re-intern to ensure pointer equality works correctly
+        let interned = SYMBOL_INTERNER.with(|interner| interner.borrow_mut().intern(&s));
+        let heap = Rc::new(HeapObject::Symbol(interned));
         Value::from_heap(heap)
     }
 
@@ -549,7 +592,8 @@ impl PartialEq for Value {
         // Heap object comparison
         match (self.as_heap(), other.as_heap()) {
             (Some(HeapObject::String(a)), Some(HeapObject::String(b))) => a == b,
-            (Some(HeapObject::Symbol(a)), Some(HeapObject::Symbol(b))) => a == b,
+            // Symbol comparison uses Rc::ptr_eq for O(1) - symbols are interned!
+            (Some(HeapObject::Symbol(a)), Some(HeapObject::Symbol(b))) => Rc::ptr_eq(a, b),
             (Some(HeapObject::List(a)), Some(HeapObject::List(b))) => a == b,
             (Some(HeapObject::Cons(a)), Some(HeapObject::Cons(b))) => {
                 a.car == b.car && a.cdr == b.cdr
