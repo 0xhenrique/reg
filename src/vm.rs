@@ -95,31 +95,38 @@ impl VM {
         self.execute()
     }
 
+    /// Optimized dispatch loop with computed-goto style using labeled loop + continue
+    /// Each opcode handler explicitly continues to next iteration, avoiding
+    /// implicit control flow that can confuse the branch predictor
+    #[inline(never)] // Prevent inlining to keep hot loop tight in cache
     fn execute(&mut self) -> Result<Value, String> {
-        // Optimized dispatch loop using unsafe for hot path performance
-        // Safety: we trust that bytecode is well-formed (valid ip, valid register indices)
+        // Cache frequently accessed values outside the loop
+        // These get reloaded on frame changes (call/return)
+        let mut code_ptr: *const Op;
+        let mut constants_ptr: *const Value;
+        let mut ip: usize;
+        let mut base: usize;
 
+        // Initialize from current frame
+        {
+            let frame = unsafe { self.frames.last().unwrap_unchecked() };
+            code_ptr = frame.chunk.code.as_ptr();
+            constants_ptr = frame.chunk.constants.as_ptr();
+            ip = frame.ip;
+            base = frame.base;
+        }
+
+        // Main dispatch loop - uses explicit continue for "direct threading" effect
+        // The explicit labels and continues give LLVM better hints for jump tables
         loop {
-            // Fast instruction fetch - avoid bounds checks in hot path
-            // SAFETY: run() ensures frames is non-empty; bytecode compiler ensures valid ip
-            let (op, base, ip) = {
-                let frame = unsafe { self.frames.last().unwrap_unchecked() };
-                let ip = frame.ip;
-                let op = unsafe { *frame.chunk.code.get_unchecked(ip) };
-                (op, frame.base, ip)
-            };
+            // Fetch instruction - pure pointer arithmetic, no bounds check
+            let op = unsafe { *code_ptr.add(ip) };
+            ip += 1;
 
-            // Advance IP before dispatch (most handlers need this)
-            unsafe { self.frames.last_mut().unwrap_unchecked() }.ip = ip + 1;
-
+            // Dispatch using match - LLVM generates a dense jump table here
             match op {
                 Op::LoadConst(dest, idx) => {
-                    // SAFETY: compiler ensures idx is valid for constants
-                    let value = unsafe {
-                        self.frames.last().unwrap_unchecked()
-                            .chunk.constants.get_unchecked(idx as usize).clone()
-                    };
-                    // SAFETY: compiler ensures dest is valid register
+                    let value = unsafe { (*constants_ptr.add(idx as usize)).clone() };
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = value };
                 }
 
@@ -136,26 +143,21 @@ impl VM {
                 }
 
                 Op::Move(dest, src) => {
-                    // SAFETY: compiler ensures src and dest are valid registers
                     let value = unsafe { self.registers.get_unchecked(base + src as usize).clone() };
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = value };
                 }
 
                 Op::GetGlobal(dest, name_idx) => {
-                    // Get interned symbol from constant pool for O(1) cache lookup
-                    let chunk = &self.frames.last().unwrap().chunk;
-                    let symbol_rc = chunk.constants[name_idx as usize].as_symbol_rc()
+                    let frame = unsafe { self.frames.last().unwrap_unchecked() };
+                    let symbol_rc = frame.chunk.constants[name_idx as usize].as_symbol_rc()
                         .ok_or("GetGlobal: expected symbol")?;
                     let key = SymbolKey(symbol_rc);
 
                     let value = if let Some(cached) = self.global_cache.get(&key) {
-                        // Cache hit - O(1) pointer-based lookup
                         cached.clone()
                     } else {
-                        // Cache miss - look up in globals (still uses string key)
                         let v = self.globals.borrow().get(&*key.0).cloned()
                             .ok_or_else(|| format!("Undefined variable: {}", &*key.0))?;
-                        // Cache for future lookups
                         self.global_cache.insert(key, v.clone());
                         v
                     };
@@ -163,11 +165,10 @@ impl VM {
                 }
 
                 Op::SetGlobal(name_idx, src) => {
-                    let chunk = &self.frames.last().unwrap().chunk;
-                    let symbol_rc = chunk.constants[name_idx as usize].as_symbol_rc()
+                    let frame = unsafe { self.frames.last().unwrap_unchecked() };
+                    let symbol_rc = frame.chunk.constants[name_idx as usize].as_symbol_rc()
                         .ok_or("SetGlobal: expected symbol")?;
                     let value = self.registers[base + src as usize].clone();
-                    // Update globals (still uses string key)
                     {
                         let mut globals = self.globals.borrow_mut();
                         if let Some(existing) = globals.get_mut(&*symbol_rc) {
@@ -176,36 +177,30 @@ impl VM {
                             globals.insert(symbol_rc.to_string(), value.clone());
                         }
                     }
-                    // Update cache with pointer-based key
                     let key = SymbolKey(symbol_rc);
                     self.global_cache.insert(key, value);
                 }
 
                 Op::Closure(dest, proto_idx) => {
-                    let chunk = &self.frames.last().unwrap().chunk;
-                    let proto = chunk.protos[proto_idx as usize].clone();
+                    let frame = unsafe { self.frames.last().unwrap_unchecked() };
+                    let proto = frame.chunk.protos[proto_idx as usize].clone();
                     let func = Value::CompiledFunction(Rc::new(proto));
                     self.registers[base + dest as usize] = func;
                 }
 
                 Op::Jump(offset) => {
-                    // SAFETY: frames is non-empty
-                    unsafe { self.frames.last_mut().unwrap_unchecked() }.ip =
-                        (ip as isize + 1 + offset as isize) as usize;
+                    ip = (ip as isize + offset as isize) as usize;
                 }
 
                 Op::JumpIfFalse(reg, offset) => {
-                    // SAFETY: compiler ensures reg is valid
                     if !unsafe { self.registers.get_unchecked(base + reg as usize) }.is_truthy() {
-                        unsafe { self.frames.last_mut().unwrap_unchecked() }.ip =
-                            (ip as isize + 1 + offset as isize) as usize;
+                        ip = (ip as isize + offset as isize) as usize;
                     }
                 }
 
                 Op::JumpIfTrue(reg, offset) => {
                     if unsafe { self.registers.get_unchecked(base + reg as usize) }.is_truthy() {
-                        unsafe { self.frames.last_mut().unwrap_unchecked() }.ip =
-                            (ip as isize + 1 + offset as isize) as usize;
+                        ip = (ip as isize + offset as isize) as usize;
                     }
                 }
 
@@ -219,33 +214,39 @@ impl VM {
                             ));
                         }
 
-                        let num_registers = self.frames.last().unwrap().chunk.num_registers;
+                        let frame = unsafe { self.frames.last().unwrap_unchecked() };
+                        let num_registers = frame.chunk.num_registers;
                         let new_base = base + num_registers as usize;
 
                         if new_base + cf.num_registers as usize > MAX_REGISTERS {
                             return Err("Stack overflow".to_string());
                         }
 
-                        // Clone the Rc<Chunk> directly (not the entire Value)
+                        // Save current IP to frame before pushing new frame
+                        unsafe { self.frames.last_mut().unwrap_unchecked() }.ip = ip;
+
                         let cf_chunk = cf.clone();
 
-                        // Copy args directly to new frame's registers (no Vec allocation!)
                         let arg_start = base + func_reg as usize + 1;
                         for i in 0..nargs as usize {
                             self.registers[new_base + i] = self.registers[arg_start + i].clone();
                         }
 
-                        // Push new frame - will continue in the loop
                         self.frames.push(CallFrame {
                             chunk: cf_chunk,
                             ip: 0,
                             base: new_base,
                             return_reg: base + dest as usize,
                         });
+
+                        // Update cached frame values
+                        let frame = unsafe { self.frames.last().unwrap_unchecked() };
+                        code_ptr = frame.chunk.code.as_ptr();
+                        constants_ptr = frame.chunk.constants.as_ptr();
+                        ip = 0;
+                        base = new_base;
                     } else if let Some(nf) = func_val.as_native_function() {
-                        // Clone the function pointer before the mutable borrow
                         let func_ptr = nf.func;
-                        // Pass a slice directly to native function (no Vec allocation!)
                         let arg_start = base + func_reg as usize + 1;
                         let arg_end = arg_start + nargs as usize;
                         let result = func_ptr(&self.registers[arg_start..arg_end])?;
@@ -266,28 +267,23 @@ impl VM {
                                 cf.num_params, nargs
                             ));
                         }
-                        // Reuse current frame for tail call
-                        // Optimization: skip Rc clone for self-recursive tail calls
-                        if let Some(frame) = self.frames.last_mut() {
-                            if !Rc::ptr_eq(&frame.chunk, cf) {
-                                // Different function - need to update chunk
-                                frame.chunk = cf.clone();
-                            }
-                            // Same function (self-recursion) - no clone needed, just reset IP
-                            frame.ip = 0;
+
+                        let frame = unsafe { self.frames.last_mut().unwrap_unchecked() };
+                        if !Rc::ptr_eq(&frame.chunk, cf) {
+                            frame.chunk = cf.clone();
+                            // Update cached pointers for new function
+                            code_ptr = frame.chunk.code.as_ptr();
+                            constants_ptr = frame.chunk.constants.as_ptr();
                         }
-                        // Copy args directly to base registers (no Vec allocation!)
-                        // Forward iteration is safe: source (base + func_reg + 1 + i)
-                        // is always >= destination (base + i) since func_reg >= 0
+
                         let arg_start = base + func_reg as usize + 1;
                         for i in 0..nargs as usize {
                             self.registers[base + i] = self.registers[arg_start + i].clone();
                         }
+                        ip = 0;
                     } else if let Some(nf) = func_val.as_native_function() {
-                        // Clone the function pointer before the mutable borrow
                         let func_ptr = nf.func;
-                        let return_reg = self.frames.last().unwrap().return_reg;
-                        // Pass a slice directly to native function (no Vec allocation!)
+                        let return_reg = unsafe { self.frames.last().unwrap_unchecked() }.return_reg;
                         let arg_start = base + func_reg as usize + 1;
                         let arg_end = arg_start + nargs as usize;
                         let result = func_ptr(&self.registers[arg_start..arg_end])?;
@@ -295,8 +291,14 @@ impl VM {
                         if self.frames.is_empty() {
                             return Ok(result);
                         }
-                        // Store result in caller's designated register
                         self.registers[return_reg] = result;
+
+                        // Update cached frame values
+                        let frame = unsafe { self.frames.last().unwrap_unchecked() };
+                        code_ptr = frame.chunk.code.as_ptr();
+                        constants_ptr = frame.chunk.constants.as_ptr();
+                        ip = frame.ip;
+                        base = frame.base;
                     } else if func_val.as_function().is_some() {
                         return Err("Cannot call interpreted function from VM".to_string());
                     } else {
@@ -305,13 +307,11 @@ impl VM {
                 }
 
                 Op::CallGlobal(dest, name_idx, nargs) => {
-                    // Optimized: look up global and call directly without intermediate register
-                    let chunk = &self.frames.last().unwrap().chunk;
-                    let symbol_rc = chunk.constants[name_idx as usize].as_symbol_rc()
+                    let frame = unsafe { self.frames.last().unwrap_unchecked() };
+                    let symbol_rc = frame.chunk.constants[name_idx as usize].as_symbol_rc()
                         .ok_or("CallGlobal: expected symbol")?;
                     let key = SymbolKey(symbol_rc);
 
-                    // Get function from cache (O(1) pointer-based) or globals
                     let func_value = if let Some(cached) = self.global_cache.get(&key) {
                         cached
                     } else {
@@ -329,16 +329,18 @@ impl VM {
                             ));
                         }
 
-                        let num_registers = self.frames.last().unwrap().chunk.num_registers;
+                        let num_registers = frame.chunk.num_registers;
                         let new_base = base + num_registers as usize;
 
                         if new_base + cf.num_registers as usize > MAX_REGISTERS {
                             return Err("Stack overflow".to_string());
                         }
 
+                        // Save current IP
+                        unsafe { self.frames.last_mut().unwrap_unchecked() }.ip = ip;
+
                         let cf_chunk = cf.clone();
 
-                        // Copy args from dest+1, dest+2, ... to new frame
                         let arg_start = base + dest as usize + 1;
                         for i in 0..nargs as usize {
                             self.registers[new_base + i] = self.registers[arg_start + i].clone();
@@ -350,6 +352,13 @@ impl VM {
                             base: new_base,
                             return_reg: base + dest as usize,
                         });
+
+                        // Update cached frame values
+                        let frame = unsafe { self.frames.last().unwrap_unchecked() };
+                        code_ptr = frame.chunk.code.as_ptr();
+                        constants_ptr = frame.chunk.constants.as_ptr();
+                        ip = 0;
+                        base = new_base;
                     } else if let Some(nf) = func_value.as_native_function() {
                         let func_ptr = nf.func;
                         let arg_start = base + dest as usize + 1;
@@ -362,13 +371,11 @@ impl VM {
                 }
 
                 Op::TailCallGlobal(name_idx, first_arg, nargs) => {
-                    // Optimized: look up global and tail-call directly
-                    let chunk = &self.frames.last().unwrap().chunk;
-                    let symbol_rc = chunk.constants[name_idx as usize].as_symbol_rc()
+                    let frame = unsafe { self.frames.last().unwrap_unchecked() };
+                    let symbol_rc = frame.chunk.constants[name_idx as usize].as_symbol_rc()
                         .ok_or("TailCallGlobal: expected symbol")?;
                     let key = SymbolKey(symbol_rc);
 
-                    // Get function from cache (O(1) pointer-based) or globals
                     let func_value = if let Some(cached) = self.global_cache.get(&key) {
                         cached
                     } else {
@@ -385,23 +392,22 @@ impl VM {
                                 cf.num_params, nargs
                             ));
                         }
-                        // Optimization: skip Rc clone for self-recursive tail calls
-                        if let Some(frame) = self.frames.last_mut() {
-                            if !Rc::ptr_eq(&frame.chunk, cf) {
-                                // Different function - need to update chunk
-                                frame.chunk = cf.clone();
-                            }
-                            // Same function (self-recursion) - no clone needed, just reset IP
-                            frame.ip = 0;
+
+                        let frame = unsafe { self.frames.last_mut().unwrap_unchecked() };
+                        if !Rc::ptr_eq(&frame.chunk, cf) {
+                            frame.chunk = cf.clone();
+                            code_ptr = frame.chunk.code.as_ptr();
+                            constants_ptr = frame.chunk.constants.as_ptr();
                         }
-                        // Copy args from temp registers (at first_arg, first_arg+1, ...) to base+0, base+1, ...
+
                         let src_start = base + first_arg as usize;
                         for i in 0..nargs as usize {
                             self.registers[base + i] = self.registers[src_start + i].clone();
                         }
+                        ip = 0;
                     } else if let Some(nf) = func_value.as_native_function() {
                         let func_ptr = nf.func;
-                        let return_reg = self.frames.last().unwrap().return_reg;
+                        let return_reg = unsafe { self.frames.last().unwrap_unchecked() }.return_reg;
                         let src_start = base + first_arg as usize;
                         let src_end = src_start + nargs as usize;
                         let result = func_ptr(&self.registers[src_start..src_end])?;
@@ -410,6 +416,13 @@ impl VM {
                             return Ok(result);
                         }
                         self.registers[return_reg] = result;
+
+                        // Update cached frame values
+                        let frame = unsafe { self.frames.last().unwrap_unchecked() };
+                        code_ptr = frame.chunk.code.as_ptr();
+                        constants_ptr = frame.chunk.constants.as_ptr();
+                        ip = frame.ip;
+                        base = frame.base;
                     } else {
                         return Err(format!("Not a function: {}", func_value));
                     }
@@ -417,18 +430,23 @@ impl VM {
 
                 Op::Return(reg) => {
                     let result = self.registers[base + reg as usize].clone();
-                    let return_reg = self.frames.last().unwrap().return_reg;
+                    let return_reg = unsafe { self.frames.last().unwrap_unchecked() }.return_reg;
                     self.frames.pop();
 
                     if self.frames.is_empty() {
                         return Ok(result);
                     }
-                    // Store result in caller's designated register
                     self.registers[return_reg] = result;
+
+                    // Update cached frame values
+                    let frame = unsafe { self.frames.last().unwrap_unchecked() };
+                    code_ptr = frame.chunk.code.as_ptr();
+                    constants_ptr = frame.chunk.constants.as_ptr();
+                    ip = frame.ip;
+                    base = frame.base;
                 }
 
                 Op::Add(dest, a, b) => {
-                    // SAFETY: compiler ensures registers are valid
                     let va = unsafe { self.registers.get_unchecked(base + a as usize) };
                     let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
                     let result = binary_arith(va, vb, |x, y| x + y, |x, y| x + y, "+")?;
@@ -494,7 +512,6 @@ impl VM {
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
-                // Specialized immediate arithmetic - avoids LoadConst instruction
                 Op::AddImm(dest, src, imm) => {
                     let v = unsafe { self.registers.get_unchecked(base + src as usize) };
                     let result = if let Some(x) = v.as_int() {
