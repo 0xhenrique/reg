@@ -361,7 +361,7 @@ impl VM {
                     }
                 }
 
-                Op::TailCallGlobal(name_idx, arg_start, nargs) => {
+                Op::TailCallGlobal(name_idx, first_arg, nargs) => {
                     // Optimized: look up global and tail-call directly
                     let chunk = &self.frames.last().unwrap().chunk;
                     let symbol_rc = chunk.constants[name_idx as usize].as_symbol_rc()
@@ -394,15 +394,15 @@ impl VM {
                             // Same function (self-recursion) - no clone needed, just reset IP
                             frame.ip = 0;
                         }
-                        // Copy args from temp registers (at arg_start+1, arg_start+2, ...) to base+0, base+1, ...
-                        let src_start = base + arg_start as usize + 1;
+                        // Copy args from temp registers (at first_arg, first_arg+1, ...) to base+0, base+1, ...
+                        let src_start = base + first_arg as usize;
                         for i in 0..nargs as usize {
                             self.registers[base + i] = self.registers[src_start + i].clone();
                         }
                     } else if let Some(nf) = func_value.as_native_function() {
                         let func_ptr = nf.func;
                         let return_reg = self.frames.last().unwrap().return_reg;
-                        let src_start = base + arg_start as usize + 1;
+                        let src_start = base + first_arg as usize;
                         let src_end = src_start + nargs as usize;
                         let result = func_ptr(&self.registers[src_start..src_end])?;
                         self.frames.pop();

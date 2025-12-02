@@ -3,6 +3,7 @@
        "rust"
        "python"
        "ruby"
+       "node"
        "lua"
        "bash"
        "rust:cargo"

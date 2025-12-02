@@ -708,14 +708,13 @@ impl Compiler {
                 // Check if second arg is a small constant integer
                 if let Some(imm) = args[1].as_int() {
                     if imm >= i8::MIN as i64 && imm <= i8::MAX as i64 {
-                        let a_reg = self.alloc_reg();
-                        self.compile_expr(&args[0], a_reg, false)?;
+                        // Optimization: compile first arg directly into dest
+                        self.compile_expr(&args[0], dest, false)?;
                         if op == "+" {
-                            self.emit(Op::AddImm(dest, a_reg, imm as i8));
+                            self.emit(Op::AddImm(dest, dest, imm as i8));
                         } else {
-                            self.emit(Op::SubImm(dest, a_reg, imm as i8));
+                            self.emit(Op::SubImm(dest, dest, imm as i8));
                         }
-                        self.free_reg();
                         return Ok(Some(true));
                     }
                 }
@@ -723,10 +722,9 @@ impl Compiler {
                 if op == "+" {
                     if let Some(imm) = args[0].as_int() {
                         if imm >= i8::MIN as i64 && imm <= i8::MAX as i64 {
-                            let b_reg = self.alloc_reg();
-                            self.compile_expr(&args[1], b_reg, false)?;
-                            self.emit(Op::AddImm(dest, b_reg, imm as i8));
-                            self.free_reg();
+                            // Optimization: compile second arg directly into dest
+                            self.compile_expr(&args[1], dest, false)?;
+                            self.emit(Op::AddImm(dest, dest, imm as i8));
                             return Ok(Some(true));
                         }
                     }
@@ -749,17 +747,15 @@ impl Compiler {
             };
 
             if let Some(make_op) = make_binary_op {
-                // Compile both arguments
-                let a_reg = self.alloc_reg();
-                self.compile_expr(&args[0], a_reg, false)?;
+                // Optimization: compile first arg directly into dest to save a register
+                self.compile_expr(&args[0], dest, false)?;
                 let b_reg = self.alloc_reg();
                 self.compile_expr(&args[1], b_reg, false)?;
 
-                // Emit the operation
-                self.emit(make_op(dest, a_reg, b_reg));
+                // Emit the operation (dest = dest op b_reg)
+                self.emit(make_op(dest, dest, b_reg));
 
-                // Free temp registers
-                self.free_reg();
+                // Free temp register
                 self.free_reg();
 
                 return Ok(Some(true));
@@ -769,19 +765,17 @@ impl Compiler {
         // Unary operators
         if args.len() == 1 {
             if op == "not" {
-                let a_reg = self.alloc_reg();
-                self.compile_expr(&args[0], a_reg, false)?;
-                self.emit(Op::Not(dest, a_reg));
-                self.free_reg();
+                // Optimization: compile arg directly into dest
+                self.compile_expr(&args[0], dest, false)?;
+                self.emit(Op::Not(dest, dest));
                 return Ok(Some(true));
             }
 
             // Unary minus: (- x)
             if op == "-" {
-                let a_reg = self.alloc_reg();
-                self.compile_expr(&args[0], a_reg, false)?;
-                self.emit(Op::Neg(dest, a_reg));
-                self.free_reg();
+                // Optimization: compile arg directly into dest
+                self.compile_expr(&args[0], dest, false)?;
+                self.emit(Op::Neg(dest, dest));
                 return Ok(Some(true));
             }
         }
@@ -824,18 +818,18 @@ impl Compiler {
             let nargs = args.len() as u8;
 
             if tail_pos {
-                // For TailCallGlobal, we need to be careful not to overwrite parameters
-                // that might be used in later arguments. Compile to temp registers first,
+                // For TailCallGlobal, compile args to temp registers first,
                 // then we'll copy to r0, r1, ... at call time.
-                let arg_start = self.alloc_reg();
+                // Optimization: track first_arg position without allocating unused marker register
+                let first_arg = self.locals.len() as Reg;
                 for arg in args.iter() {
                     let arg_reg = self.alloc_reg();
                     self.compile_expr(arg, arg_reg, false)?;
                 }
-                self.emit(Op::TailCallGlobal(name_idx, arg_start, nargs));
+                self.emit(Op::TailCallGlobal(name_idx, first_arg, nargs));
                 self.emit(Op::LoadNil(dest));
                 // Free the temp registers
-                for _ in 0..=nargs {
+                for _ in 0..nargs {
                     self.free_reg();
                 }
             } else {
