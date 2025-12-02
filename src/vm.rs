@@ -4,8 +4,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-const MAX_REGISTERS: usize = 256;
-const MAX_FRAMES: usize = 256;
+const MAX_REGISTERS: usize = 8192;  // Increased for deep recursion (fib needs ~30 depth)
+const MAX_FRAMES: usize = 1024;
 
 #[derive(Clone)]
 struct CallFrame {
@@ -563,6 +563,50 @@ pub fn standard_vm() -> VM {
         }
         println!();
         Ok(Value::Nil)
+    }));
+
+    // Type predicates
+    vm.define_global("nil?", native("nil?", |args| {
+        if args.len() != 1 { return Err("nil? expects 1 argument".to_string()); }
+        Ok(Value::Bool(matches!(args[0], Value::Nil)))
+    }));
+
+    vm.define_global("int?", native("int?", |args| {
+        if args.len() != 1 { return Err("int? expects 1 argument".to_string()); }
+        Ok(Value::Bool(matches!(args[0], Value::Int(_))))
+    }));
+
+    vm.define_global("float?", native("float?", |args| {
+        if args.len() != 1 { return Err("float? expects 1 argument".to_string()); }
+        Ok(Value::Bool(matches!(args[0], Value::Float(_))))
+    }));
+
+    vm.define_global("string?", native("string?", |args| {
+        if args.len() != 1 { return Err("string? expects 1 argument".to_string()); }
+        Ok(Value::Bool(matches!(args[0], Value::String(_))))
+    }));
+
+    vm.define_global("list?", native("list?", |args| {
+        if args.len() != 1 { return Err("list? expects 1 argument".to_string()); }
+        Ok(Value::Bool(matches!(args[0], Value::List(_))))
+    }));
+
+    vm.define_global("fn?", native("fn?", |args| {
+        if args.len() != 1 { return Err("fn? expects 1 argument".to_string()); }
+        Ok(Value::Bool(matches!(args[0], Value::Function(_) | Value::NativeFunction(_) | Value::CompiledFunction(_))))
+    }));
+
+    vm.define_global("symbol?", native("symbol?", |args| {
+        if args.len() != 1 { return Err("symbol? expects 1 argument".to_string()); }
+        Ok(Value::Bool(matches!(args[0], Value::Symbol(_))))
+    }));
+
+    // Symbol operations (useful for macros)
+    vm.define_global("gensym", native("gensym", |_args| {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        Ok(Value::symbol(&format!("G__{}", id)))
     }));
 
     vm

@@ -692,6 +692,68 @@ impl Compiler {
         self.compile_expr(&args[args.len() - 1], dest, tail_pos)
     }
 
+    /// Try to compile a binary operation using specialized opcodes
+    /// Returns Some(true) if compiled, Some(false) if not applicable, Err on error
+    fn try_compile_binary_op(&mut self, op: &str, args: &[Value], dest: Reg) -> Result<Option<bool>, String> {
+        // Binary arithmetic/comparison operators
+        if args.len() == 2 {
+            let make_binary_op: Option<fn(Reg, Reg, Reg) -> Op> = match op {
+                "+" => Some(Op::Add),
+                "-" => Some(Op::Sub),
+                "*" => Some(Op::Mul),
+                "/" => Some(Op::Div),
+                "mod" => Some(Op::Mod),
+                "<" => Some(Op::Lt),
+                "<=" => Some(Op::Le),
+                ">" => Some(Op::Gt),
+                ">=" => Some(Op::Ge),
+                "=" => Some(Op::Eq),
+                "!=" => Some(Op::Ne),
+                _ => None,
+            };
+
+            if let Some(make_op) = make_binary_op {
+                // Compile both arguments
+                let a_reg = self.alloc_reg();
+                self.compile_expr(&args[0], a_reg, false)?;
+                let b_reg = self.alloc_reg();
+                self.compile_expr(&args[1], b_reg, false)?;
+
+                // Emit the operation
+                self.emit(make_op(dest, a_reg, b_reg));
+
+                // Free temp registers
+                self.free_reg();
+                self.free_reg();
+
+                return Ok(Some(true));
+            }
+        }
+
+        // Unary operators
+        if args.len() == 1 {
+            if op == "not" {
+                let a_reg = self.alloc_reg();
+                self.compile_expr(&args[0], a_reg, false)?;
+                self.emit(Op::Not(dest, a_reg));
+                self.free_reg();
+                return Ok(Some(true));
+            }
+
+            // Unary minus: (- x)
+            if op == "-" {
+                let a_reg = self.alloc_reg();
+                self.compile_expr(&args[0], a_reg, false)?;
+                self.emit(Op::Neg(dest, a_reg));
+                self.free_reg();
+                return Ok(Some(true));
+            }
+        }
+
+        // Not a specialized operation
+        Ok(None)
+    }
+
     fn compile_call(&mut self, items: &[Value], dest: Reg, tail_pos: bool) -> Result<(), String> {
         // Try constant folding for the entire call expression (including pure user functions)
         let call_expr = Value::list(items.to_vec());
@@ -699,6 +761,15 @@ impl Compiler {
             let idx = self.add_constant(folded);
             self.emit(Op::LoadConst(dest, idx));
             return Ok(());
+        }
+
+        // Try to compile as specialized binary operation
+        if let Some(op) = items[0].as_symbol() {
+            if let Some(result) = self.try_compile_binary_op(op, &items[1..], dest)? {
+                if result {
+                    return Ok(());
+                }
+            }
         }
 
         let func_reg = self.alloc_reg();
@@ -863,11 +934,15 @@ mod tests {
 
     #[test]
     fn test_no_fold_with_variables() {
-        // If any arg is not a constant, don't fold
+        // If any arg is not a constant, don't fold to LoadConst
         let chunk = compile_str("(+ x 1)").unwrap();
-        // Should have a call, not just LoadConst
-        let has_call = chunk.code.iter().any(|op| matches!(op, Op::Call(_, _, _) | Op::TailCall(_, _)));
-        assert!(has_call);
+        // Should use Op::Add (specialized opcode), not fold to LoadConst
+        let has_add = chunk.code.iter().any(|op| matches!(op, Op::Add(_, _, _)));
+        assert!(has_add, "Expected Op::Add for (+ x 1)");
+        // Should NOT have LoadConst as first instruction (that would mean folding)
+        // First instruction should be GetGlobal for 'x'
+        let first_is_get_global = matches!(chunk.code[0], Op::GetGlobal(_, _));
+        assert!(first_is_get_global, "First op should be GetGlobal for variable x");
     }
 
     #[test]

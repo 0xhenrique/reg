@@ -1,4 +1,4 @@
-use lisp_vm::{eval, expand, parse, parse_all, standard_env, MacroRegistry, Value};
+use lisp_vm::{expand, parse, parse_all, standard_env, standard_vm, Compiler, MacroRegistry, Value};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -25,25 +25,38 @@ fn run_file(filename: &str) -> Result<Value, String> {
         .map_err(|e| format!("Could not read file '{}': {}", filename, e))?;
 
     let exprs = parse_all(&contents)?;
+
+    // For macro expansion, we still need the tree-walking environment
     let env = standard_env();
     let macros = MacroRegistry::new();
 
-    let mut result = Value::Nil;
-    for expr in exprs {
-        let expanded = expand(&expr, &macros, &env)?;
-        result = eval(&expanded, &env)?;
-    }
+    // Expand macros on all expressions first
+    let expanded: Result<Vec<Value>, String> = exprs
+        .iter()
+        .map(|expr| expand(expr, &macros, &env))
+        .collect();
+    let expanded = expanded?;
 
-    Ok(result)
+    // Compile all expressions to bytecode
+    let chunk = Compiler::compile_all(&expanded)?;
+
+    // Execute via bytecode VM
+    let mut vm = standard_vm();
+    vm.run(chunk)
 }
 
 fn run_repl() {
-    println!("Lisp VM v0.1.0");
+    println!("Lisp VM v0.1.0 (bytecode)");
     println!("Type :q or :quit to exit.");
     println!();
 
+    // For macro expansion, we still need the tree-walking environment
     let env = standard_env();
     let macros = MacroRegistry::new();
+
+    // Create a single VM instance to maintain globals across expressions
+    let mut vm = standard_vm();
+
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -66,17 +79,26 @@ fn run_repl() {
 
                 match parse(line) {
                     Ok(expr) => {
-                        // First expand macros, then evaluate
+                        // First expand macros
                         match expand(&expr, &macros, &env) {
-                            Ok(expanded) => match eval(&expanded, &env) {
-                                Ok(result) => {
-                                    // Don't display nil results (common REPL behavior)
-                                    if !result.is_nil() {
-                                        println!("{}", result);
+                            Ok(expanded) => {
+                                // Compile to bytecode
+                                match Compiler::compile(&expanded) {
+                                    Ok(chunk) => {
+                                        // Execute via VM
+                                        match vm.run(chunk) {
+                                            Ok(result) => {
+                                                // Don't display nil results (common REPL behavior)
+                                                if !result.is_nil() {
+                                                    println!("{}", result);
+                                                }
+                                            }
+                                            Err(e) => eprintln!("Error: {}", e),
+                                        }
                                     }
+                                    Err(e) => eprintln!("Compile error: {}", e),
                                 }
-                                Err(e) => eprintln!("Error: {}", e),
-                            },
+                            }
                             Err(e) => eprintln!("Macro error: {}", e),
                         }
                     }

@@ -6,25 +6,25 @@ pub mod parser;
 pub mod value;
 pub mod vm;
 
+pub use compiler::Compiler;
 pub use eval::{eval, standard_env, Env};
 pub use macros::{expand, MacroRegistry};
 pub use parser::{parse, parse_all};
 pub use value::Value;
+pub use vm::{standard_vm, VM};
 
-/// Convenience function to evaluate a string in a standard environment
+/// Convenience function to evaluate a string using the bytecode VM
 pub fn run(input: &str) -> Result<Value, String> {
     let expr = parse(input)?;
-    let env = standard_env();
-    eval(&expr, &env)
+    let chunk = Compiler::compile(&expr)?;
+    let mut vm = standard_vm();
+    vm.run(chunk)
 }
 
-/// Convenience function to evaluate multiple expressions
+/// Convenience function to evaluate multiple expressions using the bytecode VM
 pub fn run_all(input: &str) -> Result<Value, String> {
     let exprs = parse_all(input)?;
-    let env = standard_env();
-    let mut result = Value::Nil;
-    for expr in exprs {
-        result = eval(&expr, &env)?;
-    }
-    Ok(result)
+    let chunk = Compiler::compile_all(&exprs)?;
+    let mut vm = standard_vm();
+    vm.run(chunk)
 }
