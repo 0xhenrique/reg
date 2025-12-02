@@ -87,21 +87,35 @@ const INT_SIGN_BIT: u64 = 0x0000_8000_0000_0000;  // Bit 47
 
 /// A cons cell - the fundamental building block of Lisp lists
 /// (cons car cdr) creates a pair where car is the head and cdr is the tail
-#[derive(Debug)]
+///
+/// NOTE: This struct is now stored INLINE in HeapObject, not behind an Rc.
+/// This eliminates one pointer dereference for every car/cdr operation.
+#[derive(Debug, Clone)]
 pub struct ConsCell {
     pub car: Value,
     pub cdr: Value,
 }
 
 /// Heap object types - what the pointer points to
+///
+/// OPTIMIZED: Data is now stored inline (no double Rc indirection).
+/// Before: Value → Rc<HeapObject> → Rc<data>  (two pointer chases)
+/// After:  Value → Rc<HeapObject with data>   (one pointer chase)
 #[derive(Debug)]
 pub enum HeapObject {
-    String(Rc<str>),
+    /// String data stored inline (Box, not Rc)
+    String(Box<str>),
+    /// Symbol - keeps Rc<str> for interning (multiple Values share same string)
     Symbol(Rc<str>),
-    List(Rc<[Value]>),
-    Cons(Rc<ConsCell>),
-    Function(Rc<Function>),
-    NativeFunction(Rc<NativeFunction>),
+    /// List stored inline (Box, not Rc)
+    List(Box<[Value]>),
+    /// Cons cell stored INLINE - the key optimization for list performance
+    Cons(ConsCell),
+    /// Function for tree-walking interpreter
+    Function(Box<Function>),
+    /// Native function stored inline
+    NativeFunction(NativeFunction),
+    /// Compiled function - keeps Rc<Chunk> for sharing in tail calls
     CompiledFunction(Rc<Chunk>),
 }
 
@@ -120,7 +134,7 @@ impl Clone for HeapObject {
 }
 
 /// A user-defined function (for tree-walking interpreter)
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Function {
     pub params: Vec<String>,
     pub body: Value,
@@ -128,6 +142,7 @@ pub struct Function {
 }
 
 /// A native (Rust) function
+#[derive(Clone)]
 pub struct NativeFunction {
     pub name: String,
     pub func: fn(&[Value]) -> Result<Value, String>,
@@ -175,7 +190,7 @@ impl Value {
 
     /// Create a string value
     pub fn string(s: &str) -> Value {
-        let heap = Rc::new(HeapObject::String(Rc::from(s)));
+        let heap = Rc::new(HeapObject::String(s.into()));
         Value::from_heap(heap)
     }
 
@@ -188,14 +203,31 @@ impl Value {
 
     /// Create a list value
     pub fn list(items: Vec<Value>) -> Value {
-        let heap = Rc::new(HeapObject::List(Rc::from(items)));
+        let heap = Rc::new(HeapObject::List(items.into_boxed_slice()));
         Value::from_heap(heap)
     }
 
     /// Create a cons cell - O(1) operation
     /// (cons car cdr) creates a pair where car is the head and cdr is the tail
+    ///
+    /// OPTIMIZED: ConsCell is now stored inline in HeapObject
     pub fn cons(car: Value, cdr: Value) -> Value {
-        let heap = Rc::new(HeapObject::Cons(Rc::new(ConsCell { car, cdr })));
+        let heap = Rc::new(HeapObject::Cons(ConsCell { car, cdr }));
+        Value::from_heap(heap)
+    }
+
+    /// Create a user-defined function value
+    pub fn function(f: Function) -> Value {
+        let heap = Rc::new(HeapObject::Function(Box::new(f)));
+        Value::from_heap(heap)
+    }
+
+    /// Create a native function value
+    pub fn native_function(name: &str, func: fn(&[Value]) -> Result<Value, String>) -> Value {
+        let heap = Rc::new(HeapObject::NativeFunction(NativeFunction {
+            name: name.to_string(),
+            func,
+        }));
         Value::from_heap(heap)
     }
 
@@ -321,7 +353,7 @@ impl Value {
         }
     }
 
-    /// Get as a cons cell reference
+    /// Get as a cons cell reference (now directly from HeapObject, no Rc deref)
     pub fn as_cons(&self) -> Option<&ConsCell> {
         match self.as_heap() {
             Some(HeapObject::Cons(c)) => Some(c),
@@ -335,7 +367,7 @@ impl Value {
     }
 
     /// Get as a function reference
-    pub fn as_function(&self) -> Option<&Rc<Function>> {
+    pub fn as_function(&self) -> Option<&Function> {
         match self.as_heap() {
             Some(HeapObject::Function(f)) => Some(f),
             _ => None,
@@ -343,7 +375,7 @@ impl Value {
     }
 
     /// Get as a native function reference
-    pub fn as_native_function(&self) -> Option<&Rc<NativeFunction>> {
+    pub fn as_native_function(&self) -> Option<&NativeFunction> {
         match self.as_heap() {
             Some(HeapObject::NativeFunction(f)) => Some(f),
             _ => None,
@@ -420,7 +452,7 @@ impl Value {
 
     /// Create String (backwards compat) - from Rc<str>
     pub fn String(s: Rc<str>) -> Value {
-        let heap = Rc::new(HeapObject::String(s));
+        let heap = Rc::new(HeapObject::String(Box::from(&*s)));
         Value::from_heap(heap)
     }
 
@@ -435,19 +467,21 @@ impl Value {
 
     /// Create List (backwards compat) - from Rc<[Value]>
     pub fn List(items: Rc<[Value]>) -> Value {
-        let heap = Rc::new(HeapObject::List(items));
+        let heap = Rc::new(HeapObject::List(items.to_vec().into_boxed_slice()));
         Value::from_heap(heap)
     }
 
     /// Create Function (backwards compat)
     pub fn Function(f: Rc<Function>) -> Value {
-        let heap = Rc::new(HeapObject::Function(f));
+        // Convert Rc to Box by cloning the inner value
+        let heap = Rc::new(HeapObject::Function(Box::new((*f).clone())));
         Value::from_heap(heap)
     }
 
     /// Create NativeFunction (backwards compat)
     pub fn NativeFunction(f: Rc<NativeFunction>) -> Value {
-        let heap = Rc::new(HeapObject::NativeFunction(f));
+        // Clone the inner value since NativeFunction is now stored inline
+        let heap = Rc::new(HeapObject::NativeFunction((*f).clone()));
         Value::from_heap(heap)
     }
 
@@ -796,5 +830,28 @@ mod tests {
     fn test_size() {
         // Value should be 8 bytes (u64)
         assert_eq!(std::mem::size_of::<Value>(), 8);
+    }
+
+    #[test]
+    fn test_cons_cell() {
+        // Test that cons cells work with the flattened structure
+        let cell = Value::cons(Value::int(1), Value::nil());
+        assert!(cell.is_cons());
+        let cons = cell.as_cons().unwrap();
+        assert_eq!(cons.car.as_int(), Some(1));
+        assert!(cons.cdr.is_nil());
+    }
+
+    #[test]
+    fn test_cons_list_display() {
+        // Build a cons list: (1 2 3)
+        let list = Value::cons(
+            Value::int(1),
+            Value::cons(
+                Value::int(2),
+                Value::cons(Value::int(3), Value::nil()),
+            ),
+        );
+        assert_eq!(format!("{}", list), "(1 2 3)");
     }
 }

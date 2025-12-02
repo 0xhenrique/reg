@@ -1,4 +1,4 @@
-use crate::value::{Function, NativeFunction, Value};
+use crate::value::{Function, Value};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -56,7 +56,7 @@ impl Default for Env {
 enum Trampoline {
     Value(Value),
     TailCall {
-        func: Rc<Function>,
+        func: Function,  // Function stored directly (flattened - no Rc)
         args: Vec<Value>,
     },
 }
@@ -72,8 +72,8 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, String> {
             Trampoline::TailCall { func, args } => {
                 // Set up call environment
                 let call_env = func.env.extend();
-                for (param, arg) in func.params.iter().zip(args.iter()) {
-                    call_env.define(param, arg.clone());
+                for (param, arg) in func.params.iter().zip(args.into_iter()) {
+                    call_env.define(&param, arg);
                 }
                 // Evaluate body in tail position (it's always the last thing)
                 result = eval_inner(&func.body, &call_env, true)?;
@@ -277,11 +277,12 @@ fn eval_fn(args: &[Value], env: &Env) -> Result<Trampoline, String> {
         Value::list(do_list)
     };
 
-    Ok(Trampoline::Value(Value::Function(Rc::new(Function {
+    // Create function value - HeapObject::Function now stores Box<Function> inline
+    Ok(Trampoline::Value(Value::function(Function {
         params,
         body,
         env: env.clone(),
-    }))))
+    })))
 }
 
 fn eval_do(args: &[Value], env: &Env, tail_pos: bool) -> Result<Trampoline, String> {
@@ -347,10 +348,7 @@ pub fn standard_env() -> Env {
 }
 
 fn native_fn(name: &str, func: fn(&[Value]) -> Result<Value, String>) -> Value {
-    Value::NativeFunction(Rc::new(NativeFunction {
-        name: name.to_string(),
-        func,
-    }))
+    Value::native_function(name, func)
 }
 
 // Built-in function implementations
