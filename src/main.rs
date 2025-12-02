@@ -29,7 +29,12 @@ fn main() {
 
                 match parse(line) {
                     Ok(expr) => match eval(&expr, &env) {
-                        Ok(result) => println!("{}", result),
+                        Ok(result) => {
+                            // Don't display nil results (common REPL behavior)
+                            if !result.is_nil() {
+                                println!("{}", result);
+                            }
+                        }
                         Err(e) => eprintln!("Error: {}", e),
                     },
                     Err(e) => eprintln!("Parse error: {}", e),

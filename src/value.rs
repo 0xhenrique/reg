@@ -46,6 +46,10 @@ impl Value {
         !matches!(self, Value::Nil | Value::Bool(false))
     }
 
+    pub fn is_nil(&self) -> bool {
+        matches!(self, Value::Nil)
+    }
+
     /// Get the type name as a string.
     pub fn type_name(&self) -> &'static str {
         match self {
