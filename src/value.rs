@@ -396,6 +396,7 @@ impl Value {
 
     /// Check if a value is truthy.
     /// Only nil and false are falsy, everything else is truthy (like Lua).
+    #[inline]
     pub fn is_truthy(&self) -> bool {
         self.0 != TAG_NIL && self.0 != TAG_FALSE
     }
@@ -509,6 +510,7 @@ impl Drop for Value {
 }
 
 impl Clone for Value {
+    #[inline(always)]
     fn clone(&self) -> Self {
         if self.is_ptr() {
             // Just increment the Rc reference count - no new allocation!

@@ -157,7 +157,8 @@ impl VM {
                     let dest = instr.a();
                     let name_idx = instr.bx();
                     let frame = unsafe { self.frames.last().unwrap_unchecked() };
-                    let symbol_rc = frame.chunk.constants[name_idx as usize].as_symbol_rc()
+                    let symbol_rc = unsafe { frame.chunk.constants.get_unchecked(name_idx as usize) }
+                        .as_symbol_rc()
                         .ok_or("GetGlobal: expected symbol")?;
                     let key = SymbolKey(symbol_rc);
 
@@ -169,16 +170,17 @@ impl VM {
                         self.global_cache.insert(key, v.clone());
                         v
                     };
-                    self.registers[base + dest as usize] = value;
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = value };
                 }
 
                 Op::SET_GLOBAL => {
                     let src = instr.a();
                     let name_idx = instr.bx();
                     let frame = unsafe { self.frames.last().unwrap_unchecked() };
-                    let symbol_rc = frame.chunk.constants[name_idx as usize].as_symbol_rc()
+                    let symbol_rc = unsafe { frame.chunk.constants.get_unchecked(name_idx as usize) }
+                        .as_symbol_rc()
                         .ok_or("SetGlobal: expected symbol")?;
-                    let value = self.registers[base + src as usize].clone();
+                    let value = unsafe { self.registers.get_unchecked(base + src as usize).clone() };
                     {
                         let mut globals = self.globals.borrow_mut();
                         if let Some(existing) = globals.get_mut(&*symbol_rc) {
@@ -195,9 +197,9 @@ impl VM {
                     let dest = instr.a();
                     let proto_idx = instr.bx();
                     let frame = unsafe { self.frames.last().unwrap_unchecked() };
-                    let proto = frame.chunk.protos[proto_idx as usize].clone();
+                    let proto = unsafe { frame.chunk.protos.get_unchecked(proto_idx as usize).clone() };
                     let func = Value::CompiledFunction(Rc::new(proto));
-                    self.registers[base + dest as usize] = func;
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = func };
                 }
 
                 Op::JUMP => {
@@ -225,7 +227,7 @@ impl VM {
                     let dest = instr.a();
                     let func_reg = instr.b();
                     let nargs = instr.c();
-                    let func_val = &self.registers[base + func_reg as usize];
+                    let func_val = unsafe { self.registers.get_unchecked(base + func_reg as usize) };
                     if let Some(cf) = func_val.as_compiled_function() {
                         if cf.num_params != nargs {
                             return Err(format!(
@@ -249,7 +251,10 @@ impl VM {
 
                         let arg_start = base + func_reg as usize + 1;
                         for i in 0..nargs as usize {
-                            self.registers[new_base + i] = self.registers[arg_start + i].clone();
+                            unsafe {
+                                *self.registers.get_unchecked_mut(new_base + i) =
+                                    self.registers.get_unchecked(arg_start + i).clone();
+                            }
                         }
 
                         self.frames.push(CallFrame {
@@ -269,8 +274,9 @@ impl VM {
                         let func_ptr = nf.func;
                         let arg_start = base + func_reg as usize + 1;
                         let arg_end = arg_start + nargs as usize;
+                        // Native function calls need slice - keep safe access
                         let result = func_ptr(&self.registers[arg_start..arg_end])?;
-                        self.registers[base + dest as usize] = result;
+                        unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                     } else if func_val.as_function().is_some() {
                         return Err("Cannot call interpreted function from VM".to_string());
                     } else {
@@ -281,7 +287,7 @@ impl VM {
                 Op::TAIL_CALL => {
                     let func_reg = instr.a();
                     let nargs = instr.b();
-                    let func_val = &self.registers[base + func_reg as usize];
+                    let func_val = unsafe { self.registers.get_unchecked(base + func_reg as usize) };
                     if let Some(cf) = func_val.as_compiled_function() {
                         if cf.num_params != nargs {
                             return Err(format!(
@@ -300,7 +306,10 @@ impl VM {
 
                         let arg_start = base + func_reg as usize + 1;
                         for i in 0..nargs as usize {
-                            self.registers[base + i] = self.registers[arg_start + i].clone();
+                            unsafe {
+                                *self.registers.get_unchecked_mut(base + i) =
+                                    self.registers.get_unchecked(arg_start + i).clone();
+                            }
                         }
                         ip = 0;
                     } else if let Some(nf) = func_val.as_native_function() {
@@ -308,12 +317,13 @@ impl VM {
                         let return_reg = unsafe { self.frames.last().unwrap_unchecked() }.return_reg;
                         let arg_start = base + func_reg as usize + 1;
                         let arg_end = arg_start + nargs as usize;
+                        // Native function calls need slice - keep safe access
                         let result = func_ptr(&self.registers[arg_start..arg_end])?;
                         self.frames.pop();
                         if self.frames.is_empty() {
                             return Ok(result);
                         }
-                        self.registers[return_reg] = result;
+                        unsafe { *self.registers.get_unchecked_mut(return_reg) = result };
 
                         // Update cached frame values
                         let frame = unsafe { self.frames.last().unwrap_unchecked() };
@@ -333,7 +343,8 @@ impl VM {
                     let name_idx = instr.b(); // 8-bit constant index
                     let nargs = instr.c();
                     let frame = unsafe { self.frames.last().unwrap_unchecked() };
-                    let symbol_rc = frame.chunk.constants[name_idx as usize].as_symbol_rc()
+                    let symbol_rc = unsafe { frame.chunk.constants.get_unchecked(name_idx as usize) }
+                        .as_symbol_rc()
                         .ok_or("CallGlobal: expected symbol")?;
                     let key = SymbolKey(symbol_rc);
 
@@ -368,7 +379,10 @@ impl VM {
 
                         let arg_start = base + dest as usize + 1;
                         for i in 0..nargs as usize {
-                            self.registers[new_base + i] = self.registers[arg_start + i].clone();
+                            unsafe {
+                                *self.registers.get_unchecked_mut(new_base + i) =
+                                    self.registers.get_unchecked(arg_start + i).clone();
+                            }
                         }
 
                         self.frames.push(CallFrame {
@@ -388,8 +402,9 @@ impl VM {
                         let func_ptr = nf.func;
                         let arg_start = base + dest as usize + 1;
                         let arg_end = arg_start + nargs as usize;
+                        // Native function calls need slice - keep safe access for now
                         let result = func_ptr(&self.registers[arg_start..arg_end])?;
-                        self.registers[base + dest as usize] = result;
+                        unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                     } else {
                         return Err(format!("Not a function: {}", func_value));
                     }
@@ -400,7 +415,8 @@ impl VM {
                     let first_arg = instr.b();
                     let nargs = instr.c();
                     let frame = unsafe { self.frames.last().unwrap_unchecked() };
-                    let symbol_rc = frame.chunk.constants[name_idx as usize].as_symbol_rc()
+                    let symbol_rc = unsafe { frame.chunk.constants.get_unchecked(name_idx as usize) }
+                        .as_symbol_rc()
                         .ok_or("TailCallGlobal: expected symbol")?;
                     let key = SymbolKey(symbol_rc);
 
@@ -430,7 +446,10 @@ impl VM {
 
                         let src_start = base + first_arg as usize;
                         for i in 0..nargs as usize {
-                            self.registers[base + i] = self.registers[src_start + i].clone();
+                            unsafe {
+                                *self.registers.get_unchecked_mut(base + i) =
+                                    self.registers.get_unchecked(src_start + i).clone();
+                            }
                         }
                         ip = 0;
                     } else if let Some(nf) = func_value.as_native_function() {
@@ -438,12 +457,13 @@ impl VM {
                         let return_reg = unsafe { self.frames.last().unwrap_unchecked() }.return_reg;
                         let src_start = base + first_arg as usize;
                         let src_end = src_start + nargs as usize;
+                        // Native function calls need slice - keep safe access for now
                         let result = func_ptr(&self.registers[src_start..src_end])?;
                         self.frames.pop();
                         if self.frames.is_empty() {
                             return Ok(result);
                         }
-                        self.registers[return_reg] = result;
+                        unsafe { *self.registers.get_unchecked_mut(return_reg) = result };
 
                         // Update cached frame values
                         let frame = unsafe { self.frames.last().unwrap_unchecked() };
@@ -458,14 +478,14 @@ impl VM {
 
                 Op::RETURN => {
                     let src = instr.a();
-                    let result = self.registers[base + src as usize].clone();
+                    let result = unsafe { self.registers.get_unchecked(base + src as usize).clone() };
                     let return_reg = unsafe { self.frames.last().unwrap_unchecked() }.return_reg;
                     self.frames.pop();
 
                     if self.frames.is_empty() {
                         return Ok(result);
                     }
-                    self.registers[return_reg] = result;
+                    unsafe { *self.registers.get_unchecked_mut(return_reg) = result };
 
                     // Update cached frame values
                     let frame = unsafe { self.frames.last().unwrap_unchecked() };
