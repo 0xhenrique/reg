@@ -73,45 +73,49 @@ impl VM {
     }
 
     fn execute(&mut self) -> Result<Value, String> {
+        // Optimized dispatch loop using unsafe for hot path performance
+        // Safety: we trust that bytecode is well-formed (valid ip, valid register indices)
+
         loop {
-            // Get op and base (Op is Copy, so no allocation needed)
-            let (op, base) = {
-                let frame = self.frames.last().ok_or("No active frame")?;
-                (frame.chunk.code.get(frame.ip).copied(), frame.base)
+            // Fast instruction fetch - avoid bounds checks in hot path
+            // SAFETY: run() ensures frames is non-empty; bytecode compiler ensures valid ip
+            let (op, base, ip) = {
+                let frame = unsafe { self.frames.last().unwrap_unchecked() };
+                let ip = frame.ip;
+                let op = unsafe { *frame.chunk.code.get_unchecked(ip) };
+                (op, frame.base, ip)
             };
 
-            // Advance IP
-            if let Some(frame) = self.frames.last_mut() {
-                frame.ip += 1;
-            }
-
-            let op = match op {
-                Some(op) => op,
-                None => return Err("Unexpected end of bytecode".to_string()),
-            };
+            // Advance IP before dispatch (most handlers need this)
+            unsafe { self.frames.last_mut().unwrap_unchecked() }.ip = ip + 1;
 
             match op {
                 Op::LoadConst(dest, idx) => {
-                    // Access chunk only when needed
-                    let value = self.frames.last().unwrap().chunk.constants[idx as usize].clone();
-                    self.registers[base + dest as usize] = value;
+                    // SAFETY: compiler ensures idx is valid for constants
+                    let value = unsafe {
+                        self.frames.last().unwrap_unchecked()
+                            .chunk.constants.get_unchecked(idx as usize).clone()
+                    };
+                    // SAFETY: compiler ensures dest is valid register
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = value };
                 }
 
                 Op::LoadNil(dest) => {
-                    self.registers[base + dest as usize] = Value::nil();
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = Value::nil() };
                 }
 
                 Op::LoadTrue(dest) => {
-                    self.registers[base + dest as usize] = Value::bool(true);
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = Value::bool(true) };
                 }
 
                 Op::LoadFalse(dest) => {
-                    self.registers[base + dest as usize] = Value::bool(false);
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = Value::bool(false) };
                 }
 
                 Op::Move(dest, src) => {
-                    let value = self.registers[base + src as usize].clone();
-                    self.registers[base + dest as usize] = value;
+                    // SAFETY: compiler ensures src and dest are valid registers
+                    let value = unsafe { self.registers.get_unchecked(base + src as usize).clone() };
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = value };
                 }
 
                 Op::GetGlobal(dest, name_idx) => {
@@ -164,24 +168,23 @@ impl VM {
                 }
 
                 Op::Jump(offset) => {
-                    if let Some(frame) = self.frames.last_mut() {
-                        frame.ip = (frame.ip as isize + offset as isize) as usize;
-                    }
+                    // SAFETY: frames is non-empty
+                    unsafe { self.frames.last_mut().unwrap_unchecked() }.ip =
+                        (ip as isize + 1 + offset as isize) as usize;
                 }
 
                 Op::JumpIfFalse(reg, offset) => {
-                    if !self.registers[base + reg as usize].is_truthy() {
-                        if let Some(frame) = self.frames.last_mut() {
-                            frame.ip = (frame.ip as isize + offset as isize) as usize;
-                        }
+                    // SAFETY: compiler ensures reg is valid
+                    if !unsafe { self.registers.get_unchecked(base + reg as usize) }.is_truthy() {
+                        unsafe { self.frames.last_mut().unwrap_unchecked() }.ip =
+                            (ip as isize + 1 + offset as isize) as usize;
                     }
                 }
 
                 Op::JumpIfTrue(reg, offset) => {
-                    if self.registers[base + reg as usize].is_truthy() {
-                        if let Some(frame) = self.frames.last_mut() {
-                            frame.ip = (frame.ip as isize + offset as isize) as usize;
-                        }
+                    if unsafe { self.registers.get_unchecked(base + reg as usize) }.is_truthy() {
+                        unsafe { self.frames.last_mut().unwrap_unchecked() }.ip =
+                            (ip as isize + 1 + offset as isize) as usize;
                     }
                 }
 
@@ -395,29 +398,30 @@ impl VM {
                 }
 
                 Op::Add(dest, a, b) => {
-                    let va = &self.registers[base + a as usize];
-                    let vb = &self.registers[base + b as usize];
+                    // SAFETY: compiler ensures registers are valid
+                    let va = unsafe { self.registers.get_unchecked(base + a as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
                     let result = binary_arith(va, vb, |x, y| x + y, |x, y| x + y, "+")?;
-                    self.registers[base + dest as usize] = result;
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
                 Op::Sub(dest, a, b) => {
-                    let va = &self.registers[base + a as usize];
-                    let vb = &self.registers[base + b as usize];
+                    let va = unsafe { self.registers.get_unchecked(base + a as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
                     let result = binary_arith(va, vb, |x, y| x - y, |x, y| x - y, "-")?;
-                    self.registers[base + dest as usize] = result;
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
                 Op::Mul(dest, a, b) => {
-                    let va = &self.registers[base + a as usize];
-                    let vb = &self.registers[base + b as usize];
+                    let va = unsafe { self.registers.get_unchecked(base + a as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
                     let result = binary_arith(va, vb, |x, y| x * y, |x, y| x * y, "*")?;
-                    self.registers[base + dest as usize] = result;
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
                 Op::Div(dest, a, b) => {
-                    let va = &self.registers[base + a as usize];
-                    let vb = &self.registers[base + b as usize];
+                    let va = unsafe { self.registers.get_unchecked(base + a as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
                     let result = if let (Some(x), Some(y)) = (va.as_int(), vb.as_int()) {
                         if y == 0 { return Err("Division by zero".to_string()); }
                         Value::float(x as f64 / y as f64)
@@ -433,23 +437,23 @@ impl VM {
                     } else {
                         return Err("/ expects numbers".to_string());
                     };
-                    self.registers[base + dest as usize] = result;
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
                 Op::Mod(dest, a, b) => {
-                    let va = &self.registers[base + a as usize];
-                    let vb = &self.registers[base + b as usize];
+                    let va = unsafe { self.registers.get_unchecked(base + a as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
                     let result = if let (Some(x), Some(y)) = (va.as_int(), vb.as_int()) {
                         if y == 0 { return Err("Division by zero".to_string()); }
                         Value::int(x % y)
                     } else {
                         return Err("mod expects integers".to_string());
                     };
-                    self.registers[base + dest as usize] = result;
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
                 Op::Neg(dest, src) => {
-                    let v = &self.registers[base + src as usize];
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
                     let result = if let Some(x) = v.as_int() {
                         Value::int(-x)
                     } else if let Some(x) = v.as_float() {
@@ -457,12 +461,12 @@ impl VM {
                     } else {
                         return Err("- expects a number".to_string());
                     };
-                    self.registers[base + dest as usize] = result;
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
                 // Specialized immediate arithmetic - avoids LoadConst instruction
                 Op::AddImm(dest, src, imm) => {
-                    let v = &self.registers[base + src as usize];
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
                     let result = if let Some(x) = v.as_int() {
                         Value::int(x + imm as i64)
                     } else if let Some(x) = v.as_float() {
@@ -470,11 +474,11 @@ impl VM {
                     } else {
                         return Err("+ expects numbers".to_string());
                     };
-                    self.registers[base + dest as usize] = result;
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
                 Op::SubImm(dest, src, imm) => {
-                    let v = &self.registers[base + src as usize];
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
                     let result = if let Some(x) = v.as_int() {
                         Value::int(x - imm as i64)
                     } else if let Some(x) = v.as_float() {
@@ -482,52 +486,52 @@ impl VM {
                     } else {
                         return Err("- expects numbers".to_string());
                     };
-                    self.registers[base + dest as usize] = result;
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
                 Op::Lt(dest, a, b) => {
-                    let va = &self.registers[base + a as usize];
-                    let vb = &self.registers[base + b as usize];
+                    let va = unsafe { self.registers.get_unchecked(base + a as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
                     let result = Value::bool(compare_values(va, vb)? == std::cmp::Ordering::Less);
-                    self.registers[base + dest as usize] = result;
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
                 Op::Le(dest, a, b) => {
-                    let va = &self.registers[base + a as usize];
-                    let vb = &self.registers[base + b as usize];
+                    let va = unsafe { self.registers.get_unchecked(base + a as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
                     let result = Value::bool(compare_values(va, vb)? != std::cmp::Ordering::Greater);
-                    self.registers[base + dest as usize] = result;
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
                 Op::Gt(dest, a, b) => {
-                    let va = &self.registers[base + a as usize];
-                    let vb = &self.registers[base + b as usize];
+                    let va = unsafe { self.registers.get_unchecked(base + a as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
                     let result = Value::bool(compare_values(va, vb)? == std::cmp::Ordering::Greater);
-                    self.registers[base + dest as usize] = result;
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
                 Op::Ge(dest, a, b) => {
-                    let va = &self.registers[base + a as usize];
-                    let vb = &self.registers[base + b as usize];
+                    let va = unsafe { self.registers.get_unchecked(base + a as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
                     let result = Value::bool(compare_values(va, vb)? != std::cmp::Ordering::Less);
-                    self.registers[base + dest as usize] = result;
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
                 Op::Eq(dest, a, b) => {
-                    let va = &self.registers[base + a as usize];
-                    let vb = &self.registers[base + b as usize];
-                    self.registers[base + dest as usize] = Value::bool(va == vb);
+                    let va = unsafe { self.registers.get_unchecked(base + a as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = Value::bool(va == vb) };
                 }
 
                 Op::Ne(dest, a, b) => {
-                    let va = &self.registers[base + a as usize];
-                    let vb = &self.registers[base + b as usize];
-                    self.registers[base + dest as usize] = Value::bool(va != vb);
+                    let va = unsafe { self.registers.get_unchecked(base + a as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = Value::bool(va != vb) };
                 }
 
                 Op::Not(dest, src) => {
-                    let v = &self.registers[base + src as usize];
-                    self.registers[base + dest as usize] = Value::bool(!v.is_truthy());
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = Value::bool(!v.is_truthy()) };
                 }
 
                 Op::NewList(dest, nargs) => {
@@ -872,6 +876,7 @@ pub fn standard_vm() -> VM {
     vm
 }
 
+#[inline(always)]
 fn binary_arith<FI, FF>(
     a: &Value,
     b: &Value,
@@ -883,6 +888,7 @@ where
     FI: Fn(i64, i64) -> i64,
     FF: Fn(f64, f64) -> f64,
 {
+    // Fast path: integer arithmetic (most common in benchmarks)
     if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
         return Ok(Value::int(int_op(x, y)));
     }
@@ -898,7 +904,9 @@ where
     Err(format!("{} expects numbers", name))
 }
 
+#[inline(always)]
 fn compare_values(a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> {
+    // Fast path: integer comparison (most common in benchmarks)
     if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
         return Ok(x.cmp(&y));
     }
