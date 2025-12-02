@@ -142,16 +142,13 @@ impl VM {
 
                 Op::Call(dest, func_reg, nargs) => {
                     let func = self.registers[base + func_reg as usize].clone();
-                    let args: Vec<Value> = (0..nargs)
-                        .map(|i| self.registers[base + func_reg as usize + 1 + i as usize].clone())
-                        .collect();
 
                     match &func {
                         Value::CompiledFunction(cf) => {
-                            if cf.num_params as usize != args.len() {
+                            if cf.num_params != nargs {
                                 return Err(format!(
                                     "Expected {} arguments, got {}",
-                                    cf.num_params, args.len()
+                                    cf.num_params, nargs
                                 ));
                             }
 
@@ -161,9 +158,10 @@ impl VM {
                                 return Err("Stack overflow".to_string());
                             }
 
-                            // Copy args to new frame's registers
-                            for (i, arg) in args.iter().enumerate() {
-                                self.registers[new_base + i] = arg.clone();
+                            // Copy args directly to new frame's registers (no Vec allocation!)
+                            let arg_start = base + func_reg as usize + 1;
+                            for i in 0..nargs as usize {
+                                self.registers[new_base + i] = self.registers[arg_start + i].clone();
                             }
 
                             // Push new frame - will continue in the loop
@@ -175,7 +173,10 @@ impl VM {
                             });
                         }
                         Value::NativeFunction(nf) => {
-                            let result = (nf.func)(&args)?;
+                            // Pass a slice directly to native function (no Vec allocation!)
+                            let arg_start = base + func_reg as usize + 1;
+                            let arg_end = arg_start + nargs as usize;
+                            let result = (nf.func)(&self.registers[arg_start..arg_end])?;
                             self.registers[base + dest as usize] = result;
                         }
                         Value::Function(_) => {
@@ -187,16 +188,13 @@ impl VM {
 
                 Op::TailCall(func_reg, nargs) => {
                     let func = self.registers[base + func_reg as usize].clone();
-                    let args: Vec<Value> = (0..nargs)
-                        .map(|i| self.registers[base + func_reg as usize + 1 + i as usize].clone())
-                        .collect();
 
                     match &func {
                         Value::CompiledFunction(cf) => {
-                            if cf.num_params as usize != args.len() {
+                            if cf.num_params != nargs {
                                 return Err(format!(
                                     "Expected {} arguments, got {}",
-                                    cf.num_params, args.len()
+                                    cf.num_params, nargs
                                 ));
                             }
                             // Reuse current frame for tail call
@@ -204,13 +202,19 @@ impl VM {
                                 frame.chunk = cf.clone();
                                 frame.ip = 0;
                             }
-                            // Copy args to base registers
-                            for (i, arg) in args.iter().enumerate() {
-                                self.registers[base + i] = arg.clone();
+                            // Copy args directly to base registers (no Vec allocation!)
+                            // Forward iteration is safe: source (base + func_reg + 1 + i)
+                            // is always >= destination (base + i) since func_reg >= 0
+                            let arg_start = base + func_reg as usize + 1;
+                            for i in 0..nargs as usize {
+                                self.registers[base + i] = self.registers[arg_start + i].clone();
                             }
                         }
                         Value::NativeFunction(nf) => {
-                            let result = (nf.func)(&args)?;
+                            // Pass a slice directly to native function (no Vec allocation!)
+                            let arg_start = base + func_reg as usize + 1;
+                            let arg_end = arg_start + nargs as usize;
+                            let result = (nf.func)(&self.registers[arg_start..arg_end])?;
                             let return_reg = self.frames.last().unwrap().return_reg;
                             self.frames.pop();
                             if self.frames.is_empty() {
