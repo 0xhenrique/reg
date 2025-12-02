@@ -91,7 +91,9 @@ fn eval_inner(expr: &Value, env: &Env, tail_pos: bool) -> Result<Trampoline, Str
         }
 
         // Functions evaluate to themselves
-        Value::Function(_) | Value::NativeFunction(_) => Ok(Trampoline::Value(expr.clone())),
+        Value::Function(_) | Value::NativeFunction(_) | Value::CompiledFunction(_) => {
+            Ok(Trampoline::Value(expr.clone()))
+        }
 
         // Symbol lookup
         Value::Symbol(name) => env

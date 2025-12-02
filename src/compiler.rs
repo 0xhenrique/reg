@@ -118,7 +118,7 @@ impl Compiler {
                 // Function call
                 self.compile_call(items, dest, tail_pos)?;
             }
-            Value::Function(_) | Value::NativeFunction(_) => {
+            Value::Function(_) | Value::NativeFunction(_) | Value::CompiledFunction(_) => {
                 return Err("Cannot compile function value directly".to_string());
             }
         }

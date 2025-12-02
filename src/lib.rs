@@ -3,6 +3,7 @@ pub mod compiler;
 pub mod eval;
 pub mod parser;
 pub mod value;
+pub mod vm;
 
 pub use eval::{eval, standard_env, Env};
 pub use parser::{parse, parse_all};

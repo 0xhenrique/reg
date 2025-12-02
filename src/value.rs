@@ -1,6 +1,8 @@
 use std::fmt;
 use std::rc::Rc;
 
+use crate::bytecode::Chunk;
+
 /// The core value type for our Lisp.
 /// Uses Rc for reference counting (not Arc - single-threaded by default).
 #[derive(Clone, Debug)]
@@ -14,6 +16,7 @@ pub enum Value {
     List(Rc<[Value]>),
     Function(Rc<Function>),
     NativeFunction(Rc<NativeFunction>),
+    CompiledFunction(Rc<Chunk>),
 }
 
 /// A user-defined function
@@ -55,6 +58,7 @@ impl Value {
             Value::List(_) => "list",
             Value::Function(_) => "function",
             Value::NativeFunction(_) => "native-function",
+            Value::CompiledFunction(_) => "function",
         }
     }
 
@@ -112,6 +116,7 @@ impl fmt::Display for Value {
             }
             Value::Function(_) => write!(f, "<function>"),
             Value::NativeFunction(nf) => write!(f, "<native fn {}>", nf.name),
+            Value::CompiledFunction(_) => write!(f, "<function>"),
         }
     }
 }
