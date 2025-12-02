@@ -52,26 +52,57 @@ impl Default for Env {
     }
 }
 
-/// Evaluate an expression in an environment
+/// Trampoline: either a final value or a tail call to execute
+enum Trampoline {
+    Value(Value),
+    TailCall {
+        func: Rc<Function>,
+        args: Vec<Value>,
+    },
+}
+
+/// Evaluate an expression (public API - handles trampolining)
 pub fn eval(expr: &Value, env: &Env) -> Result<Value, String> {
+    let mut result = eval_inner(expr, env, false)?;
+
+    // Trampoline loop - handles tail calls without growing Rust stack
+    loop {
+        match result {
+            Trampoline::Value(v) => return Ok(v),
+            Trampoline::TailCall { func, args } => {
+                // Set up call environment
+                let call_env = func.env.extend();
+                for (param, arg) in func.params.iter().zip(args.iter()) {
+                    call_env.define(param, arg.clone());
+                }
+                // Evaluate body in tail position (it's always the last thing)
+                result = eval_inner(&func.body, &call_env, true)?;
+            }
+        }
+    }
+}
+
+/// Inner eval that tracks tail position and returns Trampoline
+fn eval_inner(expr: &Value, env: &Env, tail_pos: bool) -> Result<Trampoline, String> {
     match expr {
         // Self-evaluating forms
         Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::String(_) => {
-            Ok(expr.clone())
+            Ok(Trampoline::Value(expr.clone()))
         }
 
         // Functions evaluate to themselves
-        Value::Function(_) | Value::NativeFunction(_) => Ok(expr.clone()),
+        Value::Function(_) | Value::NativeFunction(_) => Ok(Trampoline::Value(expr.clone())),
 
         // Symbol lookup
         Value::Symbol(name) => env
             .get(name)
+            .map(Trampoline::Value)
             .ok_or_else(|| format!("Undefined variable: {}", name)),
 
         // List: function call or special form
         Value::List(items) => {
             if items.is_empty() {
-                return Ok(Value::list(vec![])); // () evaluates to ()
+                return Ok(Trampoline::Value(Value::list(vec![]))); // () evaluates to ()
             }
 
             let first = &items[0];
@@ -80,28 +111,28 @@ pub fn eval(expr: &Value, env: &Env) -> Result<Value, String> {
             if let Some(sym) = first.as_symbol() {
                 match sym {
                     "quote" => return eval_quote(&items[1..]),
-                    "if" => return eval_if(&items[1..], env),
+                    "if" => return eval_if(&items[1..], env, tail_pos),
                     "def" => return eval_def(&items[1..], env),
-                    "let" => return eval_let(&items[1..], env),
+                    "let" => return eval_let(&items[1..], env, tail_pos),
                     "fn" => return eval_fn(&items[1..], env),
-                    "do" => return eval_do(&items[1..], env),
+                    "do" => return eval_do(&items[1..], env, tail_pos),
                     _ => {}
                 }
             }
 
-            // Regular function call
+            // Regular function call - evaluate function and arguments
             let func = eval(first, env)?;
             let args: Result<Vec<Value>, String> =
                 items[1..].iter().map(|arg| eval(arg, env)).collect();
             let args = args?;
 
-            apply(&func, &args)
+            apply(&func, args, tail_pos)
         }
     }
 }
 
 /// Apply a function to arguments
-fn apply(func: &Value, args: &[Value]) -> Result<Value, String> {
+fn apply(func: &Value, args: Vec<Value>, tail_pos: bool) -> Result<Trampoline, String> {
     match func {
         Value::Function(f) => {
             if f.params.len() != args.len() {
@@ -112,19 +143,26 @@ fn apply(func: &Value, args: &[Value]) -> Result<Value, String> {
                 ));
             }
 
-            // Create new environment extending the closure's environment
-            let call_env = f.env.extend();
-
-            // Bind parameters to arguments
-            for (param, arg) in f.params.iter().zip(args.iter()) {
-                call_env.define(param, arg.clone());
+            if tail_pos {
+                // In tail position: return thunk for trampoline
+                Ok(Trampoline::TailCall {
+                    func: f.clone(),
+                    args,
+                })
+            } else {
+                // Not in tail position: evaluate now (will trampoline internally)
+                let call_env = f.env.extend();
+                for (param, arg) in f.params.iter().zip(args.iter()) {
+                    call_env.define(param, arg.clone());
+                }
+                eval_inner(&f.body, &call_env, true)
             }
-
-            // Evaluate body
-            eval(&f.body, &call_env)
         }
 
-        Value::NativeFunction(nf) => (nf.func)(args),
+        Value::NativeFunction(nf) => {
+            let result = (nf.func)(&args)?;
+            Ok(Trampoline::Value(result))
+        }
 
         _ => Err(format!("Not a function: {}", func)),
     }
@@ -132,30 +170,32 @@ fn apply(func: &Value, args: &[Value]) -> Result<Value, String> {
 
 // Special form implementations
 
-fn eval_quote(args: &[Value]) -> Result<Value, String> {
+fn eval_quote(args: &[Value]) -> Result<Trampoline, String> {
     if args.len() != 1 {
         return Err("quote expects exactly 1 argument".to_string());
     }
-    Ok(args[0].clone())
+    Ok(Trampoline::Value(args[0].clone()))
 }
 
-fn eval_if(args: &[Value], env: &Env) -> Result<Value, String> {
+fn eval_if(args: &[Value], env: &Env, tail_pos: bool) -> Result<Trampoline, String> {
     if args.len() < 2 || args.len() > 3 {
         return Err("if expects 2 or 3 arguments".to_string());
     }
 
+    // Condition is NOT in tail position
     let cond = eval(&args[0], env)?;
 
+    // Branches ARE in tail position (if the if itself is)
     if cond.is_truthy() {
-        eval(&args[1], env)
+        eval_inner(&args[1], env, tail_pos)
     } else if args.len() == 3 {
-        eval(&args[2], env)
+        eval_inner(&args[2], env, tail_pos)
     } else {
-        Ok(Value::Nil)
+        Ok(Trampoline::Value(Value::Nil))
     }
 }
 
-fn eval_def(args: &[Value], env: &Env) -> Result<Value, String> {
+fn eval_def(args: &[Value], env: &Env) -> Result<Trampoline, String> {
     if args.len() != 2 {
         return Err("def expects exactly 2 arguments".to_string());
     }
@@ -164,12 +204,13 @@ fn eval_def(args: &[Value], env: &Env) -> Result<Value, String> {
         .as_symbol()
         .ok_or("def expects a symbol as first argument")?;
 
+    // def value is NOT in tail position
     let value = eval(&args[1], env)?;
     env.define(name, value.clone());
-    Ok(value)
+    Ok(Trampoline::Value(value))
 }
 
-fn eval_let(args: &[Value], env: &Env) -> Result<Value, String> {
+fn eval_let(args: &[Value], env: &Env, tail_pos: bool) -> Result<Trampoline, String> {
     if args.len() < 2 {
         return Err("let expects at least 2 arguments (bindings and body)".to_string());
     }
@@ -184,7 +225,7 @@ fn eval_let(args: &[Value], env: &Env) -> Result<Value, String> {
 
     let let_env = env.extend();
 
-    // Process bindings in pairs
+    // Process bindings - NOT in tail position
     for chunk in bindings.chunks(2) {
         let name = chunk[0]
             .as_symbol()
@@ -193,15 +234,22 @@ fn eval_let(args: &[Value], env: &Env) -> Result<Value, String> {
         let_env.define(name, value);
     }
 
-    // Evaluate body expressions (implicit do)
-    let mut result = Value::Nil;
-    for body_expr in &args[1..] {
-        result = eval(body_expr, &let_env)?;
+    // Evaluate body expressions - only LAST is in tail position
+    let body = &args[1..];
+    if body.is_empty() {
+        return Ok(Trampoline::Value(Value::Nil));
     }
-    Ok(result)
+
+    // All but last: not in tail position
+    for expr in &body[..body.len() - 1] {
+        eval(expr, &let_env)?;
+    }
+
+    // Last expression: in tail position (if let itself is)
+    eval_inner(&body[body.len() - 1], &let_env, tail_pos)
 }
 
-fn eval_fn(args: &[Value], env: &Env) -> Result<Value, String> {
+fn eval_fn(args: &[Value], env: &Env) -> Result<Trampoline, String> {
     if args.len() < 2 {
         return Err("fn expects at least 2 arguments (params and body)".to_string());
     }
@@ -229,19 +277,25 @@ fn eval_fn(args: &[Value], env: &Env) -> Result<Value, String> {
         Value::list(do_list)
     };
 
-    Ok(Value::Function(Rc::new(Function {
+    Ok(Trampoline::Value(Value::Function(Rc::new(Function {
         params,
         body,
         env: env.clone(),
-    })))
+    }))))
 }
 
-fn eval_do(args: &[Value], env: &Env) -> Result<Value, String> {
-    let mut result = Value::Nil;
-    for expr in args {
-        result = eval(expr, env)?;
+fn eval_do(args: &[Value], env: &Env, tail_pos: bool) -> Result<Trampoline, String> {
+    if args.is_empty() {
+        return Ok(Trampoline::Value(Value::Nil));
     }
-    Ok(result)
+
+    // All but last: not in tail position
+    for expr in &args[..args.len() - 1] {
+        eval(expr, env)?;
+    }
+
+    // Last expression: in tail position (if do itself is)
+    eval_inner(&args[args.len() - 1], env, tail_pos)
 }
 
 /// Create an environment with standard built-in functions
@@ -768,57 +822,46 @@ mod tests {
 
     #[test]
     fn test_milestone_square() {
-        // This is the Phase 1 milestone test
         let env = standard_env();
-
-        // (def x 10)
-        let expr = parse("(def x 10)").unwrap();
-        eval(&expr, &env).unwrap();
-
-        // (def square (fn (n) (* n n)))
-        let expr = parse("(def square (fn (n) (* n n)))").unwrap();
-        eval(&expr, &env).unwrap();
-
-        // (square x) => 100
-        let expr = parse("(square x)").unwrap();
-        let result = eval(&expr, &env).unwrap();
+        eval(&parse("(def x 10)").unwrap(), &env).unwrap();
+        eval(&parse("(def square (fn (n) (* n n)))").unwrap(), &env).unwrap();
+        let result = eval(&parse("(square x)").unwrap(), &env).unwrap();
         assert_eq!(result, Value::Int(100));
     }
 
     #[test]
     fn test_recursion() {
-        // Test that recursion works
         let env = standard_env();
-
-        // Define factorial
-        let expr = parse(
-            "(def factorial (fn (n) (if (<= n 1) 1 (* n (factorial (- n 1))))))",
-        )
-        .unwrap();
-        eval(&expr, &env).unwrap();
-
-        // factorial(5) = 120
-        let expr = parse("(factorial 5)").unwrap();
-        let result = eval(&expr, &env).unwrap();
+        eval(&parse("(def factorial (fn (n) (if (<= n 1) 1 (* n (factorial (- n 1))))))").unwrap(), &env).unwrap();
+        let result = eval(&parse("(factorial 5)").unwrap(), &env).unwrap();
         assert_eq!(result, Value::Int(120));
     }
 
     #[test]
     fn test_closure() {
-        // Test that closures capture their environment
         let env = standard_env();
-
-        // (def make-adder (fn (x) (fn (y) (+ x y))))
-        let expr = parse("(def make-adder (fn (x) (fn (y) (+ x y))))").unwrap();
-        eval(&expr, &env).unwrap();
-
-        // (def add5 (make-adder 5))
-        let expr = parse("(def add5 (make-adder 5))").unwrap();
-        eval(&expr, &env).unwrap();
-
-        // (add5 10) => 15
-        let expr = parse("(add5 10)").unwrap();
-        let result = eval(&expr, &env).unwrap();
+        eval(&parse("(def make-adder (fn (x) (fn (y) (+ x y))))").unwrap(), &env).unwrap();
+        eval(&parse("(def add5 (make-adder 5))").unwrap(), &env).unwrap();
+        let result = eval(&parse("(add5 10)").unwrap(), &env).unwrap();
         assert_eq!(result, Value::Int(15));
+    }
+
+    #[test]
+    fn test_tail_call_sum() {
+        let env = standard_env();
+        eval(&parse("(def sum (fn (n acc) (if (<= n 0) acc (sum (- n 1) (+ acc n)))))").unwrap(), &env).unwrap();
+        // 100k iterations - would stack overflow without TCO
+        let result = eval(&parse("(sum 100000 0)").unwrap(), &env).unwrap();
+        assert_eq!(result, Value::Int(5000050000));
+    }
+
+    #[test]
+    fn test_mutual_recursion() {
+        let env = standard_env();
+        eval(&parse("(def even? (fn (n) (if (= n 0) true (odd? (- n 1)))))").unwrap(), &env).unwrap();
+        eval(&parse("(def odd? (fn (n) (if (= n 0) false (even? (- n 1)))))").unwrap(), &env).unwrap();
+        // 10k mutual calls - would stack overflow without TCO
+        assert_eq!(eval(&parse("(even? 10000)").unwrap(), &env).unwrap(), Value::Bool(true));
+        assert_eq!(eval(&parse("(odd? 10001)").unwrap(), &env).unwrap(), Value::Bool(true));
     }
 }
