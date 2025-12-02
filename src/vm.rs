@@ -266,11 +266,14 @@ impl VM {
                                 cf.num_params, nargs
                             ));
                         }
-                        // Clone the Rc<Chunk> directly (not the entire Value)
-                        let cf_chunk = cf.clone();
                         // Reuse current frame for tail call
+                        // Optimization: skip Rc clone for self-recursive tail calls
                         if let Some(frame) = self.frames.last_mut() {
-                            frame.chunk = cf_chunk;
+                            if !Rc::ptr_eq(&frame.chunk, cf) {
+                                // Different function - need to update chunk
+                                frame.chunk = cf.clone();
+                            }
+                            // Same function (self-recursion) - no clone needed, just reset IP
                             frame.ip = 0;
                         }
                         // Copy args directly to base registers (no Vec allocation!)
@@ -382,9 +385,13 @@ impl VM {
                                 cf.num_params, nargs
                             ));
                         }
-                        let cf_chunk = cf.clone();
+                        // Optimization: skip Rc clone for self-recursive tail calls
                         if let Some(frame) = self.frames.last_mut() {
-                            frame.chunk = cf_chunk;
+                            if !Rc::ptr_eq(&frame.chunk, cf) {
+                                // Different function - need to update chunk
+                                frame.chunk = cf.clone();
+                            }
+                            // Same function (self-recursion) - no clone needed, just reset IP
                             frame.ip = 0;
                         }
                         // Copy args from temp registers (at arg_start+1, arg_start+2, ...) to base+0, base+1, ...
