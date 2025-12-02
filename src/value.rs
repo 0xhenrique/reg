@@ -119,25 +119,26 @@ impl Value {
 
     /// Create a string value
     pub fn string(s: &str) -> Value {
-        let heap = Box::new(HeapObject::String(Rc::from(s)));
+        let heap = Rc::new(HeapObject::String(Rc::from(s)));
         Value::from_heap(heap)
     }
 
     /// Create a symbol value
     pub fn symbol(s: &str) -> Value {
-        let heap = Box::new(HeapObject::Symbol(Rc::from(s)));
+        let heap = Rc::new(HeapObject::Symbol(Rc::from(s)));
         Value::from_heap(heap)
     }
 
     /// Create a list value
     pub fn list(items: Vec<Value>) -> Value {
-        let heap = Box::new(HeapObject::List(Rc::from(items)));
+        let heap = Rc::new(HeapObject::List(Rc::from(items)));
         Value::from_heap(heap)
     }
 
-    /// Create a heap-allocated value from a Box<HeapObject>
-    fn from_heap(heap: Box<HeapObject>) -> Value {
-        let ptr = Box::into_raw(heap) as u64;
+    /// Create a heap-allocated value from an Rc<HeapObject>
+    /// Uses Rc::into_raw to store the pointer - refcount is NOT decremented
+    fn from_heap(heap: Rc<HeapObject>) -> Value {
+        let ptr = Rc::into_raw(heap) as u64;
         debug_assert!(ptr & TAG_MASK == 0, "Pointer uses more than 48 bits");
         Value(TAG_PTR | ptr)
     }
@@ -219,19 +220,8 @@ impl Value {
             return None;
         }
         let ptr = (self.0 & PAYLOAD_MASK) as *const HeapObject;
-        // Safety: we only create these pointers from Box::into_raw
+        // Safety: we only create these pointers from Rc::into_raw
         Some(unsafe { &*ptr })
-    }
-
-    /// Get the heap object mutably (for cloning the inner Rc)
-    #[inline]
-    fn as_heap_mut(&self) -> Option<&mut HeapObject> {
-        if !self.is_ptr() {
-            return None;
-        }
-        let ptr = (self.0 & PAYLOAD_MASK) as *mut HeapObject;
-        // Safety: we only create these pointers from Box::into_raw
-        Some(unsafe { &mut *ptr })
     }
 
     /// Get as a symbol string, if this is a symbol
@@ -343,50 +333,50 @@ impl Value {
 
     /// Create String (backwards compat) - from Rc<str>
     pub fn String(s: Rc<str>) -> Value {
-        let heap = Box::new(HeapObject::String(s));
+        let heap = Rc::new(HeapObject::String(s));
         Value::from_heap(heap)
     }
 
     /// Create Symbol (backwards compat) - from Rc<str>
     pub fn Symbol(s: Rc<str>) -> Value {
-        let heap = Box::new(HeapObject::Symbol(s));
+        let heap = Rc::new(HeapObject::Symbol(s));
         Value::from_heap(heap)
     }
 
     /// Create List (backwards compat) - from Rc<[Value]>
     pub fn List(items: Rc<[Value]>) -> Value {
-        let heap = Box::new(HeapObject::List(items));
+        let heap = Rc::new(HeapObject::List(items));
         Value::from_heap(heap)
     }
 
     /// Create Function (backwards compat)
     pub fn Function(f: Rc<Function>) -> Value {
-        let heap = Box::new(HeapObject::Function(f));
+        let heap = Rc::new(HeapObject::Function(f));
         Value::from_heap(heap)
     }
 
     /// Create NativeFunction (backwards compat)
     pub fn NativeFunction(f: Rc<NativeFunction>) -> Value {
-        let heap = Box::new(HeapObject::NativeFunction(f));
+        let heap = Rc::new(HeapObject::NativeFunction(f));
         Value::from_heap(heap)
     }
 
     /// Create CompiledFunction (backwards compat)
     pub fn CompiledFunction(c: Rc<Chunk>) -> Value {
-        let heap = Box::new(HeapObject::CompiledFunction(c));
+        let heap = Rc::new(HeapObject::CompiledFunction(c));
         Value::from_heap(heap)
     }
 }
 
 impl Drop for Value {
     fn drop(&mut self) {
-        // If this is a heap pointer, we need to drop the HeapObject
+        // If this is a heap pointer, we need to decrement the Rc refcount
         if self.is_ptr() {
-            let ptr = (self.0 & PAYLOAD_MASK) as *mut HeapObject;
-            // Safety: we only create these from Box::into_raw, and we set
-            // the tag to something else after dropping
+            let ptr = (self.0 & PAYLOAD_MASK) as *const HeapObject;
+            // Safety: we only create these from Rc::into_raw
+            // Rc::from_raw will decrement the refcount and free if it hits 0
             unsafe {
-                drop(Box::from_raw(ptr));
+                drop(Rc::from_raw(ptr));
             }
             // Mark as nil to prevent double-free
             self.0 = TAG_NIL;
@@ -397,13 +387,15 @@ impl Drop for Value {
 impl Clone for Value {
     fn clone(&self) -> Self {
         if self.is_ptr() {
-            // Clone the heap object (which clones the inner Rc)
-            if let Some(heap) = self.as_heap() {
-                let cloned = Box::new(heap.clone());
-                Value::from_heap(cloned)
-            } else {
-                Value::nil()
+            // Just increment the Rc reference count - no new allocation!
+            let ptr = (self.0 & PAYLOAD_MASK) as *const HeapObject;
+            // Safety: we only create these from Rc::into_raw
+            // increment_strong_count increases refcount without creating an Rc
+            unsafe {
+                Rc::increment_strong_count(ptr);
             }
+            // Return a Value with the same pointer (both now own a reference)
+            Value(self.0)
         } else {
             // Primitives: just copy the bits
             Value(self.0)
