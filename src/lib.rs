@@ -1,6 +1,7 @@
 pub mod bytecode;
 pub mod compiler;
 pub mod eval;
+pub mod jit;
 pub mod macros;
 pub mod parser;
 pub mod value;

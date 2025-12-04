@@ -739,6 +739,41 @@ impl Value {
         let heap = Rc::new(HeapObject::CompiledFunction(c));
         Value::from_heap(heap)
     }
+
+    // JIT support methods
+
+    /// Get the raw bits of this value (for JIT compilation)
+    /// This returns the NaN-boxed u64 representation
+    #[inline]
+    pub fn to_bits(&self) -> u64 {
+        self.0
+    }
+
+    /// Create a Value from raw bits (for JIT compilation)
+    /// # Safety
+    /// The caller must ensure the bits represent a valid NaN-boxed value
+    /// For primitive types (nil, bool, int, float), this is always safe
+    /// For heap types (TAG_PTR), the caller must ensure the pointer is valid
+    #[inline]
+    pub unsafe fn from_bits(bits: u64) -> Value {
+        Value(bits)
+    }
+
+    /// Create a Value from raw bits, with a reference count increment for heap values
+    /// This is the safe version for JIT use when the value might be a heap pointer
+    #[inline]
+    pub fn from_bits_safe(bits: u64) -> Value {
+        let tag = bits & TAG_MASK;
+        if tag == TAG_PTR {
+            // Heap pointer - need to increment reference count
+            let ptr = (bits & PAYLOAD_MASK) as *const HeapObject;
+            unsafe {
+                Rc::increment_strong_count(ptr);
+            }
+        }
+        // For primitives, arena values, and the newly-cloned ptr, just return
+        Value(bits)
+    }
 }
 
 impl Drop for Value {
