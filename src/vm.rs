@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
-const MAX_REGISTERS: usize = 8192;  // Increased for deep recursion (fib needs ~30 depth)
+const MAX_REGISTERS: usize = 8192;  // @TODO: Increased for deep recursion (fib needs ~30 depth)
 const MAX_FRAMES: usize = 1024;
 
 /// A wrapper for interned symbol Rc<str> that hashes/compares by pointer
@@ -17,7 +17,7 @@ struct SymbolKey(Rc<str>);
 impl Hash for SymbolKey {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Hash by pointer address only - O(1) instead of O(n) string hash
+        // Hash by pointer address only - O(1)
         // Cast fat pointer (*const str) to thin pointer (*const u8) first
         (Rc::as_ptr(&self.0) as *const u8 as usize).hash(state);
     }
@@ -88,10 +88,10 @@ impl VM {
                 globals.insert(name.to_string(), value.clone());
             }
         }
-        // Update cache using interned symbol key for O(1) lookup
+        // Update cache using interned symbol key
         let key = SymbolKey(intern_symbol(name));
 
-        // Populate inline caches for functions - this allows us to skip
+        // Populate inline caches for functions - this allows the VM skip
         // the type check in CALL_GLOBAL/TAIL_CALL_GLOBAL
         if let Some(cf) = value.as_compiled_function() {
             self.compiled_fn_cache.insert(key.clone(), cf.clone());
@@ -100,7 +100,7 @@ impl VM {
             self.native_fn_cache.insert(key.clone(), nf.func);
             self.compiled_fn_cache.remove(&key);
         } else {
-            // Not a function, clear both inline caches
+            // Not a function so clear both inline caches
             self.compiled_fn_cache.remove(&key);
             self.native_fn_cache.remove(&key);
         }
@@ -119,7 +119,7 @@ impl VM {
         self.execute()
     }
 
-    /// Optimized dispatch loop with packed 4-byte instructions
+    /// Dispatch loop with packed 4-byte instructions
     /// Uses opcode-based dispatch with match on u8 opcode constants
     #[inline(never)] // Prevent inlining to keep hot loop tight in cache
     fn execute(&mut self) -> Result<Value, String> {
@@ -139,14 +139,15 @@ impl VM {
             base = frame.base;
         }
 
-        // Main dispatch loop - uses explicit continue for "direct threading" effect
+        // This loop is necessary so LLVM can apply DFA jump threading and generate a jump table
         // The explicit labels and continues give LLVM better hints for jump tables
+        // More: https://github.com/llvm/llvm-project/commit/02077da7e7a8ff76c0576bb33adb462c337013f5
         loop {
             // Fetch instruction - pure pointer arithmetic, no bounds check
             let instr = unsafe { *code_ptr.add(ip) };
             ip += 1;
 
-            // Dispatch using match on opcode - LLVM generates a dense jump table here
+            // Dispatch using match on opcode (LLVM should give a dense jump table here)
             match instr.opcode() {
                 Op::LOAD_CONST => {
                     let dest = instr.a();
@@ -311,7 +312,7 @@ impl VM {
                         let func_ptr = nf.func;
                         let arg_start = base + func_reg as usize + 1;
                         let arg_end = arg_start + nargs as usize;
-                        // Native function calls need slice - keep safe access
+                        // Native function calls need slice
                         let result = func_ptr(&self.registers[arg_start..arg_end])?;
                         unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                     } else if func_val.as_function().is_some() {
@@ -344,8 +345,8 @@ impl VM {
                         let arg_start = base + func_reg as usize + 1;
                         for i in 0..nargs as usize {
                             unsafe {
-                                // Use take() instead of clone() - the source registers
-                                // won't be accessed again after this tail call
+                                // Use take instead of clone
+                                // The source registers won't be accessed again after this tail call
                                 *self.registers.get_unchecked_mut(base + i) =
                                     self.registers.get_unchecked_mut(arg_start + i).take();
                             }
@@ -356,7 +357,7 @@ impl VM {
                         let return_reg = unsafe { self.frames.last().unwrap_unchecked() }.return_reg;
                         let arg_start = base + func_reg as usize + 1;
                         let arg_end = arg_start + nargs as usize;
-                        // Native function calls need slice - keep safe access
+                        // Native function calls need slice
                         let result = func_ptr(&self.registers[arg_start..arg_end])?;
                         self.frames.pop();
                         if self.frames.is_empty() {
@@ -536,8 +537,8 @@ impl VM {
                         let src_start = base + first_arg as usize;
                         for i in 0..nargs as usize {
                             unsafe {
-                                // Use take() instead of clone() - the source registers
-                                // won't be accessed again after this tail call
+                                // Use take instead of clone
+                                // The source registers won't be accessed again after this tail call
                                 *self.registers.get_unchecked_mut(base + i) =
                                     self.registers.get_unchecked_mut(src_start + i).take();
                             }
@@ -595,8 +596,8 @@ impl VM {
                             let src_start = base + first_arg as usize;
                             for i in 0..nargs as usize {
                                 unsafe {
-                                    // Use take() instead of clone() - the source registers
-                                    // won't be accessed again after this tail call
+                                    // Use take instead of clone
+                                    // The source registers won't be accessed again after this tail call
                                     *self.registers.get_unchecked_mut(base + i) =
                                         self.registers.get_unchecked_mut(src_start + i).take();
                                 }
@@ -877,11 +878,11 @@ impl VM {
                     let result = if let Some(cons) = v.as_cons() {
                         cons.cdr.clone()
                     } else if let Some(list) = v.as_list() {
-                        // Array list - O(n) but rare with cons cells
+                        // Array list - convert to cons chain for O(1) following CDRs
                         if list.is_empty() {
                             return Err("cdr on empty list".to_string());
                         }
-                        Value::list(list[1..].to_vec())
+                        Value::slice_to_cons(&list[1..])
                     } else {
                         return Err("cdr expects a list or cons cell".to_string());
                     };
@@ -1081,7 +1082,7 @@ impl VM {
                     }
                 }
 
-                // Specialized cons opcode (very common in list construction)
+                // Specialized cons opcode
                 Op::CONS => {
                     let dest = instr.a();
                     let car_reg = instr.b();
@@ -1153,7 +1154,7 @@ impl VM {
 
                 // ========== Unboxed integer opcodes (skip type checking) ==========
                 // These are emitted when the compiler can prove operands are integers.
-                // They use as_int_unchecked() which skips the is_int() branch.
+                // They use as_int_unchecked which skips the is_int branch.
 
                 Op::ADD_INT => {
                     let dest = instr.a();
@@ -1294,7 +1295,7 @@ impl Default for VM {
     }
 }
 
-/// Create a VM with standard built-in functions
+/// Create a VM
 pub fn standard_vm() -> VM {
     use crate::value::NativeFunction;
 
@@ -1463,10 +1464,10 @@ pub fn standard_vm() -> VM {
         if let Some(cons) = args[0].as_cons() {
             return Ok(cons.cdr.clone());
         }
-        // Handle array lists - O(n) but rarely used now
+        // Handle array lists - convert to cons chain for O(1) subsequent CDRs
         if let Some(list) = args[0].as_list() {
             if list.is_empty() { return Err("cdr on empty list".to_string()); }
-            return Ok(Value::list(list[1..].to_vec()));
+            return Ok(Value::slice_to_cons(&list[1..]));
         }
         Err("cdr expects a list or cons cell".to_string())
     }));
@@ -1477,7 +1478,7 @@ pub fn standard_vm() -> VM {
         if let Some(items) = args[0].as_list() {
             return Ok(Value::int(items.len() as i64));
         }
-        // Handle cons cells - traverse and count
+        // Handle cons cells (traverse and count)
         if args[0].as_cons().is_some() {
             let mut count = 0i64;
             let mut current = &args[0];
@@ -1590,7 +1591,7 @@ pub fn standard_vm() -> VM {
         Ok(Value::symbol(&format!("G__{}", id)))
     }));
 
-    // Timing functions (for benchmarking)
+    // Timing functions
     vm.define_global("clock", native("clock", |_args| {
         use std::time::{SystemTime, UNIX_EPOCH};
         let duration = SystemTime::now()
@@ -1615,7 +1616,7 @@ where
     FI: Fn(i64, i64) -> i64,
     FF: Fn(f64, f64) -> f64,
 {
-    // Fast path: integer arithmetic (most common in benchmarks)
+    // Fast path: integer arithmetic
     if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
         return Ok(Value::int(int_op(x, y)));
     }
@@ -1633,7 +1634,7 @@ where
 
 #[inline(always)]
 fn compare_values(a: &Value, b: &Value) -> Result<std::cmp::Ordering, String> {
-    // Fast path: integer comparison (most common in benchmarks)
+    // Fast path: integer comparison
     if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
         return Ok(x.cmp(&y));
     }
@@ -1797,7 +1798,6 @@ mod tests {
 
     #[test]
     fn test_integration_milestone() {
-        // Phase 1 milestone
         let result = vm_eval("(do (def x 10) (def square (fn (n) (* n n))) (square x))").unwrap();
         assert_eq!(result, Value::Int(100));
     }
@@ -1810,7 +1810,7 @@ mod tests {
 
     #[test]
     fn test_integration_tail_call() {
-        // Phase 2 milestone - should not stack overflow
+        // Should not stack overflow
         let result = vm_eval("(do (def sum (fn (n acc) (if (<= n 0) acc (sum (- n 1) (+ acc n))))) (sum 10000 0))").unwrap();
         assert_eq!(result, Value::Int(50005000));
     }
@@ -1827,7 +1827,7 @@ mod tests {
 
     #[test]
     fn test_specialized_car_cdr() {
-        // Test specialized car/cdr opcodes with cons cells
+        // Test car/cdr opcodes with cons cells
         assert_eq!(vm_eval("(car (cons 1 (cons 2 nil)))").unwrap(), Value::Int(1));
         assert_eq!(vm_eval("(car (cdr (cons 1 (cons 2 nil))))").unwrap(), Value::Int(2));
 
@@ -1854,7 +1854,7 @@ mod tests {
         assert_eq!(vm_eval("(< -5 0)").unwrap(), Value::Bool(true));
         assert_eq!(vm_eval("(<= 0 0)").unwrap(), Value::Bool(true));
 
-        // Test in a loop context (sum function uses (<= n 0))
+        // Test in a loop (sum function uses (<= n 0))
         let result = vm_eval("(do (def count-down (fn (n) (if (<= n 0) 0 (+ 1 (count-down (- n 1)))))) (count-down 10))").unwrap();
         assert_eq!(result, Value::Int(10));
     }
@@ -1891,7 +1891,7 @@ mod tests {
 
     #[test]
     fn test_nil_check_jump() {
-        // Test specialized nil check opcodes
+        // Test nil check opcodes
         // These are generated for (if (nil? x) ...) patterns
 
         // Direct nil check
@@ -1977,7 +1977,7 @@ mod tests {
             (car (reverse (cons 1 (cons 2 (cons 3 nil))))))").unwrap();
         assert_eq!(result, Value::Int(3));
 
-        // List sum - uses car/cdr
+        // List sum using car/cdr
         let result = vm_eval("(do
             (def sum (fn (lst)
                 (if (nil? lst)
@@ -1989,7 +1989,7 @@ mod tests {
 
     #[test]
     fn test_specialized_cons() {
-        // Test specialized cons opcode
+        // Test cons opcode
         // Basic cons
         let result = vm_eval("(cons 1 nil)").unwrap();
         let cons = result.as_cons().expect("expected cons cell");
@@ -2001,7 +2001,7 @@ mod tests {
         let cons = result.as_cons().expect("expected cons cell");
         assert_eq!(cons.car.as_int(), Some(1));
 
-        // List reversal using cons (exercises the opcode heavily)
+        // List reversal using cons (should use the opcode a lot)
         let result = vm_eval("(do
             (def reverse-acc (fn (lst acc)
                 (if (nil? lst)
@@ -2023,7 +2023,7 @@ mod tests {
 
     #[test]
     fn test_integer_specialized_opcodes() {
-        // Test that integer-specialized opcodes produce correct results
+        // Test that integer-specialized opcodes produces correct results
         // These are used in loop-optimized functions where types are known
 
         // Test sum function - should use ADD_INT_IMM, SUB_INT_IMM, ADD_INT

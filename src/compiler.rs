@@ -40,7 +40,7 @@ impl PureFunctions {
     }
 }
 
-/// Registry of ALL function definitions for inlining (regardless of purity)
+/// Registry of ALL function definitions for inlining (not matter the purity)
 #[derive(Clone, Default)]
 struct InlineCandidates {
     funcs: HashMap<String, FunctionDef>,
@@ -80,7 +80,7 @@ pub struct Compiler {
     param_types: Vec<StaticType>,
 }
 
-/// Check if an expression is pure (no side effects)
+/// Check if an expression is pure
 fn is_pure_expr_with_fns(expr: &Value, pure_fns: &PureFunctions) -> bool {
     // Literals are pure
     if expr.is_nil() || expr.is_bool() || expr.is_int() || expr.is_float() {
@@ -246,11 +246,11 @@ fn contains_call_to_any(expr: &Value, names: &[String]) -> bool {
     false
 }
 
-/// Check if a function body is small enough to inline.
+/// Check if a function body is small enough to inline
 /// We inline if the body is a single expression that is:
-/// - A simple call to another function (thin wrapper)
-/// - A simple arithmetic/comparison expression
-/// - A small if expression
+/// >a simple call to another function (thin wrapper)
+/// >a simple arithmetic/comparison expression
+/// >a small if expression
 fn is_small_body(body: &Value) -> bool {
     if let Some(items) = body.as_list() {
         // Body is a list (an expression)
@@ -271,7 +271,7 @@ fn is_small_body(body: &Value) -> bool {
             }
         }
     }
-    // Non-list values (symbols, literals) are trivially small
+    // Non-list values (symbols, literals) are too small
     true
 }
 
@@ -414,7 +414,7 @@ fn fold_div(args: &[&Value]) -> Option<Value> {
         return None;
     };
     if b == 0.0 {
-        return None; // Don't fold division by zero
+        return None; // don't fold division by zero
     }
     Some(Value::float(a / b))
 }
@@ -500,7 +500,7 @@ impl Compiler {
     }
 
     /// Compile multiple expressions, allowing pure function definitions to be used
-    /// in subsequent expressions
+    /// in next expressions
     pub fn compile_all(exprs: &[Value]) -> Result<Chunk, String> {
         let mut compiler = Compiler::new();
         let dest = compiler.alloc_reg();
@@ -527,8 +527,8 @@ impl Compiler {
         Self::compile_function_named(params, body, None)
     }
 
-    /// Compile a function with an optional name for self-recursion loop optimization.
-    /// When `name` is provided, tail-recursive calls to that name are compiled as loops.
+    /// Compile a function with an optional name for self-recursion loop optimization
+    /// When a name is provided, tail-recursive calls to that name are compiled as loops
     pub fn compile_function_named(params: &[String], body: &Value, name: Option<&str>) -> Result<Chunk, String> {
         let mut compiler = Compiler::new();
         compiler.chunk.num_params = params.len() as u8;
@@ -540,8 +540,8 @@ impl Compiler {
         }
 
         // Parameters occupy the first registers
-        // For loop-optimized functions (self-recursive), assume numeric parameters are integers.
-        // This is a heuristic that enables integer-specialized opcodes for common patterns
+        // For loop-optimized functions (self-recursive), assume numeric parameters are integers
+        // This is a technique that enables integer-specialized opcodes for common patterns
         // like sum(n, acc) where n and acc are typically integers.
         let is_loop_optimized = name.is_some();
         for param in params {
@@ -561,7 +561,7 @@ impl Compiler {
         compiler.compile_expr(body, dest, true)?;
         compiler.emit(Op::ret(dest));
         compiler.chunk.num_registers = compiler.locals.len().max(1) as u8 + 16;
-        // Note: Don't call optimize_moves() here - it's called recursively from
+        // Note: Don't call optimize_moves here, it's called recursively from
         // parent chunk's optimize_moves() to ensure each proto is only optimized once
         Ok(compiler.chunk)
     }
@@ -704,7 +704,7 @@ impl Compiler {
                 }
             }
 
-            // Function call
+            // Func call
             self.compile_call(items, dest, tail_pos)?;
         } else if expr.as_function().is_some() || expr.as_native_function().is_some() || expr.as_compiled_function().is_some() {
             return Err("Cannot compile function value directly".to_string());
@@ -780,8 +780,8 @@ impl Compiler {
         Ok(())
     }
 
-    /// Try to compile a comparison condition as a combined compare-and-jump opcode.
-    /// Returns Some(jump_pos) if successful, None if condition is not a simple comparison.
+    /// Try to compile a comparison condition as a combined compare-and-jump opcode
+    /// Returns Some(jump_pos) if successful, None if condition is not a simple comparison
     ///
     /// For `(if (< a b) then else)`, we need to jump to else when condition is FALSE.
     /// So we emit the OPPOSITE comparison:
@@ -842,14 +842,14 @@ impl Compiler {
         Ok(Some(jump_pos))
     }
 
-    /// Try to compile a nil check condition as a specialized jump opcode.
-    /// Returns Some(jump_pos) if successful, None if condition is not a nil check.
+    /// Try to compile a nil check condition as a specialized jump opcode
+    /// Returns Some(jump_pos) if successful, None if condition is not a nil check
     ///
     /// Handles pattern:
     /// - `(nil? x)` → JumpIfNotNil (jump to else if x is NOT nil)
     ///
     /// Note: We don't optimize `(empty? x)` because it handles array-based lists
-    /// differently (empty array [] is not nil but is empty).
+    /// differently (empty array [] is not nil but is empty)
     fn try_compile_nil_check_jump(&mut self, cond: &Value, dest: Reg) -> Result<Option<usize>, String> {
         let items = match cond.as_list() {
             Some(items) if items.len() == 2 => items,
@@ -866,9 +866,9 @@ impl Compiler {
         // Compile argument into dest
         self.compile_expr(arg, dest, false)?;
 
-        // For `(if (nil? x) then else)`, we jump to else when condition is FALSE.
-        // Condition is TRUE when x IS nil.
-        // So we jump to else when x is NOT nil.
+        // For `(if (nil? x) then else)`, we jump to else when condition is FALSE
+        // Condition is TRUE when x IS nil
+        // So we jump to else when x is NOT nil
         let jump_pos = self.emit(Op::jump_if_not_nil(dest, 0));
 
         Ok(Some(jump_pos))
@@ -1600,7 +1600,7 @@ mod tests {
         assert!(has_25, "Expected constant 25 from folding (square 5)");
 
         // Should NOT have a function call for (square 5)
-        // (there may be a call for def though, so just check we have the constant)
+        // (there may be a call for def thougheverbeit, so just check we have the constant)
     }
 
     #[test]

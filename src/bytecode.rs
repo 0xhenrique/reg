@@ -11,7 +11,7 @@ pub type Offset = i16;
 /// - ABC:  [opcode:8][A:8][B:8][C:8] - for 3-operand instructions
 /// - ABx:  [opcode:8][A:8][Bx:16]    - for instructions with 16-bit constant/offset
 ///
-/// The sBx (signed Bx) variant interprets Bx as i16 for jump offsets.
+/// The sBx (signed Bx) variant interprets Bx as i16 for jump offsets
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct Op(pub u32);
@@ -641,10 +641,10 @@ impl Chunk {
         }
     }
 
-    /// Perform liveness analysis and upgrade opcodes to move variants where profitable.
+    /// Perform liveness analysis and upgrade opcodes to move variants where is worth it
     /// This is a backward dataflow analysis that tracks which registers are "live"
     /// (will be used later). When a register is used for the last time, we can
-    /// use move semantics instead of clone.
+    /// use move semantics instead of clone
     pub fn optimize_moves(&mut self) {
         if self.code.is_empty() {
             return;

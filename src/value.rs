@@ -6,7 +6,7 @@ use std::rc::Rc;
 use crate::bytecode::Chunk;
 
 //=============================================================================
-// Arena Allocator
+// Arena Allocator - EXPERIMENTAL!
 //=============================================================================
 //
 // Arena allocation eliminates per-object reference counting overhead by:
@@ -21,11 +21,10 @@ use crate::bytecode::Chunk;
 //
 // IMPORTANT: Arena has a size limit to prevent unbounded memory growth in
 // long-running programs. When the limit is reached, new allocations fall
-// back to Rc allocation. This provides fast allocation for short-lived
-// programs while preventing memory exhaustion.
+// back to Rc allocation. The ideia is fast allocation for short-lived programs
 
 /// Maximum number of objects in arena before falling back to Rc allocation.
-/// This prevents unbounded memory growth in long-running programs.
+/// This prevents memory growth in long-running programs
 /// 64K objects * ~40 bytes/cons = ~2.5MB max arena size
 const ARENA_SIZE_LIMIT: usize = 64 * 1024;
 
@@ -43,7 +42,7 @@ impl Arena {
     /// Create a new empty arena
     pub fn new() -> Self {
         Arena {
-            objects: Vec::with_capacity(1024), // Pre-allocate for common case
+            objects: Vec::with_capacity(1024), // Pre-allocation
             max_size: 0,
         }
     }
@@ -84,13 +83,13 @@ impl Arena {
         self.objects.clear();
     }
 
-    /// Check if arena is full (at size limit)
+    /// Check if arena is at size limit
     #[inline]
     pub fn is_full(&self) -> bool {
         self.objects.len() >= ARENA_SIZE_LIMIT
     }
 
-    /// Check if arena is empty (used for testing)
+    /// Check if arena is empty (for testing purposes)
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.objects.is_empty()
@@ -112,8 +111,8 @@ impl Default for Arena {
 // Thread-local arena for allocation from native functions
 thread_local! {
     static ARENA: RefCell<Arena> = RefCell::new(Arena::new());
-    // Flag to enable/disable arena allocation (for testing Rc fallback)
-    static ARENA_ENABLED: RefCell<bool> = const { RefCell::new(true) };
+    // Flag to enable/disable arena allocation (disabled by default, enable with --arena CLI flag)
+    static ARENA_ENABLED: RefCell<bool> = const { RefCell::new(false) };
 }
 
 /// Enable or disable arena allocation (for testing)
@@ -153,8 +152,7 @@ unsafe fn arena_get(idx: u32) -> *const HeapObject {
 //
 // All symbols are interned for O(1) comparison. The interner maintains a
 // mapping from string content to Rc<str>, ensuring identical symbols share
-// the same Rc. Symbol comparison then uses Rc::ptr_eq() instead of string
-// comparison.
+// the same Rc. Symbol comparison then uses Rc::ptr_eq instead of string comparison
 
 thread_local! {
     static SYMBOL_INTERNER: RefCell<SymbolInterner> = RefCell::new(SymbolInterner::new());
@@ -171,9 +169,9 @@ impl SymbolInterner {
         }
     }
 
-    /// Intern a symbol string, returning a shared Rc<str>.
-    /// If the symbol already exists, returns the existing Rc.
-    /// Otherwise, creates a new Rc and stores it.
+    /// Intern a symbol string, returning a shared Rc<str>
+    /// If the symbol already exists, returns the existing Rc
+    /// Otherwise, creates a new Rc and stores it
     fn intern(&mut self, s: &str) -> Rc<str> {
         if let Some(rc) = self.symbols.get(s) {
             return rc.clone();
@@ -185,8 +183,8 @@ impl SymbolInterner {
 }
 
 /// Public function to intern a symbol string.
-/// Returns an Rc<str> that can be used for pointer-based caching.
-/// Equal symbol strings will return the same Rc (pointer equality).
+/// Returns an Rc<str> that can be used for pointer-based caching
+/// Equal symbol strings will return the same Rc (pointer equality)
 pub fn intern_symbol(s: &str) -> Rc<str> {
     SYMBOL_INTERNER.with(|interner| interner.borrow_mut().intern(s))
 }
@@ -211,7 +209,7 @@ pub fn intern_symbol(s: &str) -> Rc<str> {
 // │ 0x7FFE_XXXX_XXXX_XXXX = Heap pointer (48-bit address)              │
 // └────────────────────────────────────────────────────────────────────┘
 //
-// Heap objects (String, Symbol, List, Function, etc.) use tagged pointers.
+// Heap objects (String, Symbol, List, Function, etc.) use tagged pointers
 
 // Bit patterns for NaN-boxing
 const QNAN: u64 = 0x7FFC_0000_0000_0000;  // Quiet NaN base
@@ -231,11 +229,11 @@ const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;  // 48 bits
 // Sign extension for 48-bit integers
 const INT_SIGN_BIT: u64 = 0x0000_8000_0000_0000;  // Bit 47
 
-/// A cons cell - the fundamental building block of Lisp lists
+/// A cons cell
 /// (cons car cdr) creates a pair where car is the head and cdr is the tail
 ///
 /// NOTE: This struct is now stored INLINE in HeapObject, not behind an Rc.
-/// This eliminates one pointer dereference for every car/cdr operation.
+/// This eliminates one pointer dereference for every car/cdr operation
 #[derive(Debug, Clone)]
 pub struct ConsCell {
     pub car: Value,
@@ -244,9 +242,7 @@ pub struct ConsCell {
 
 /// Heap object types - what the pointer points to
 ///
-/// OPTIMIZED: Data is now stored inline (no double Rc indirection).
-/// Before: Value → Rc<HeapObject> → Rc<data>  (two pointer chases)
-/// After:  Value → Rc<HeapObject with data>   (one pointer chase)
+/// NOTE: Data is now stored inline (no double Rc indirection)
 #[derive(Debug)]
 pub enum HeapObject {
     /// String data stored inline (Box, not Rc)
@@ -255,7 +251,7 @@ pub enum HeapObject {
     Symbol(Rc<str>),
     /// List stored inline (Box, not Rc)
     List(Box<[Value]>),
-    /// Cons cell stored INLINE - the key optimization for list performance
+    /// Cons cell stored INLINE - for list performance
     Cons(ConsCell),
     /// Function for tree-walking interpreter
     Function(Box<Function>),
@@ -300,13 +296,11 @@ impl fmt::Debug for NativeFunction {
     }
 }
 
-/// The core value type for our Lisp - NaN-boxed into 8 bytes.
+/// The core value type - NaN-boxed into 8 bytes.
 pub struct Value(u64);
 
 impl Value {
-    //-------------------------------------------------------------------------
     // Constructors
-    //-------------------------------------------------------------------------
 
     /// Create a Nil value
     #[inline]
@@ -356,9 +350,9 @@ impl Value {
     /// Create a cons cell - O(1) operation
     /// (cons car cdr) creates a pair where car is the head and cdr is the tail
     ///
-    /// OPTIMIZED: Uses arena allocation when enabled for zero-refcount cloning.
-    /// When arena is enabled, cons cells are allocated in the thread-local arena.
-    /// When arena is full or disabled, falls back to Rc allocation.
+    /// NOTE: Uses arena allocation when enabled for zero-refcount cloning
+    /// When arena is enabled, cons cells are allocated in the thread-local arena
+    /// When arena is full or disabled, falls back to Rc allocation
     pub fn cons(car: Value, cdr: Value) -> Value {
         if arena_enabled() && !ARENA.with(|a| a.borrow().is_full()) {
             // Arena allocation - zero overhead clone/drop
@@ -402,9 +396,7 @@ impl Value {
         Value(TAG_PTR | ptr)
     }
 
-    //-------------------------------------------------------------------------
     // Type checks
-    //-------------------------------------------------------------------------
 
     #[inline]
     pub fn is_nil(&self) -> bool {
@@ -448,9 +440,7 @@ impl Value {
         tag == TAG_PTR || tag == TAG_ARENA
     }
 
-    //-------------------------------------------------------------------------
     // Value extraction
-    //-------------------------------------------------------------------------
 
     #[inline]
     pub fn as_bool(&self) -> Option<bool> {
@@ -476,9 +466,9 @@ impl Value {
         }
     }
 
-    /// Unchecked integer extraction - ONLY call when you're certain this is an integer.
-    /// Skips the is_int() check for performance in specialized opcodes.
-    /// Safety: Caller must ensure this Value is an integer (is_int() == true).
+    /// Unchecked integer extraction - ONLY call when you're certain this is an integer
+    /// Skips the is_int check for performance in specialized opcodes
+    /// Safety: Caller must ensure this Value is an integer (is_int() == true)
     #[inline(always)]
     pub unsafe fn as_int_unchecked(&self) -> i64 {
         let payload = self.0 & PAYLOAD_MASK;
@@ -586,24 +576,20 @@ impl Value {
         }
     }
 
-    //-------------------------------------------------------------------------
     // Lisp semantics
-    //-------------------------------------------------------------------------
 
-    /// Check if a value is truthy.
-    /// Only nil and false are falsy, everything else is truthy (like Lua).
+    /// Check if a value is truthy
+    /// Only nil and false are falsy, everything else is truthy (like Lua)
     #[inline]
     pub fn is_truthy(&self) -> bool {
         self.0 != TAG_NIL && self.0 != TAG_FALSE
     }
 
-    //-------------------------------------------------------------------------
     // Move semantics support
-    //-------------------------------------------------------------------------
 
-    /// Take the value, leaving Nil in its place.
-    /// This is O(1) and avoids Rc increment/decrement entirely.
-    /// Use this when you know the source won't be used again.
+    /// Take the value, leaving Nil in its place
+    /// This is O(1) and avoids Rc increment/decrement entirely
+    /// Use this when you know the source won't be used again
     #[inline]
     pub fn take(&mut self) -> Value {
         let bits = self.0;
@@ -611,13 +597,14 @@ impl Value {
         Value(bits)
     }
 
-    /// Take and get car of a cons cell, consuming the cons cell.
-    /// Returns None if not a cons cell.
+    /// Take and get car of a cons cell, consuming the cons cell
+    /// Returns None if not a cons cell
     ///
-    /// This is more efficient than clone + car because:
-    /// 1. No Rc increment for the cons cell
-    /// 2. Cons cell is freed immediately if refcount was 1
-    /// 3. If refcount is 1, we can move car out without cloning
+    /// After some benchmarking we discovered that this is more
+    /// efficient than clone + car probably because:
+    /// >no Rc increment for the cons cell
+    /// >cons cell is freed immediately if refcount was 1
+    /// >if refcount is 1, we can move car out without cloning
     #[inline]
     pub fn take_car(self) -> Option<Value> {
         // Get the cons cell reference
@@ -634,8 +621,8 @@ impl Value {
         }
     }
 
-    /// Take and get cdr of a cons cell, consuming the cons cell.
-    /// Returns None if not a cons cell.
+    /// Take and get cdr of a cons cell, consuming the cons cell
+    /// Returns None if not a cons cell
     #[inline]
     pub fn take_cdr(self) -> Option<Value> {
         if let Some(cons) = self.as_cons() {
@@ -645,14 +632,26 @@ impl Value {
             if list.is_empty() {
                 None
             } else {
-                Some(Value::list(list[1..].to_vec()))
+                // Convert array tail to cons chain for O(1) following CDR operations
+                Some(Value::slice_to_cons(&list[1..]))
             }
         } else {
             None
         }
     }
 
-    /// Get the type name as a string.
+    /// Convert an array slice to a cons chain
+    /// Used when CDR is called on an array-backed list to avoid O(n) copies
+    /// The resulting cons chain enables O(1) subsequent CDR operations
+    pub fn slice_to_cons(slice: &[Value]) -> Value {
+        let mut result = Value::nil();
+        for item in slice.iter().rev() {
+            result = Value::cons(item.clone(), result);
+        }
+        result
+    }
+
+    /// Get the type name as a string
     pub fn type_name(&self) -> &'static str {
         if self.is_nil() {
             "nil"
@@ -677,9 +676,7 @@ impl Value {
         }
     }
 
-    //-------------------------------------------------------------------------
     // Backwards compatibility constructors
-    //-------------------------------------------------------------------------
 
     /// Create Nil (backwards compat)
     pub const Nil: Value = Value(TAG_NIL);
@@ -758,7 +755,7 @@ impl Drop for Value {
             // Mark as nil to prevent double-free
             self.0 = TAG_NIL;
         }
-        // Arena values: no-op drop - the arena will free them all at once
+        // Arena values: no-op drop (the arena will free them all at once)
     }
 }
 
@@ -787,12 +784,12 @@ impl Clone for Value {
 }
 
 impl Value {
-    /// Promote an arena-allocated value to Rc-allocated for escape from arena scope.
-    /// This is called when a value needs to outlive the arena (e.g., returned from VM).
-    /// Non-arena values are returned unchanged.
+    /// Promote an arena-allocated value to Rc-allocated for escape from arena scope
+    /// This is called when a value needs to outlive the arena (for exemplo returned from VM)
+    /// Non-arena values are returned unchanged
     ///
     /// This recursively promotes nested values (cons cells) to ensure the entire
-    /// structure is Rc-allocated.
+    /// structure is Rc-allocated
     pub fn promote(&self) -> Value {
         if self.is_arena() {
             // Get the heap object and create an Rc copy
@@ -898,7 +895,7 @@ impl fmt::Display for Value {
                     write!(f, ")")
                 }
                 HeapObject::Cons(_) => {
-                    // Print cons cells as proper lists by traversing the chain
+                    // Print cons cells as lists by traversing the chain
                     write!(f, "(")?;
                     let mut current = self;
                     let mut first = true;
@@ -979,10 +976,6 @@ impl PartialEq for Value {
         }
     }
 }
-
-//=============================================================================
-// Tests
-//=============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -1181,9 +1174,7 @@ mod tests {
         assert_eq!(format!("{}", list), "(1 2 3)");
     }
 
-    //=========================================================================
     // Arena Allocation Tests
-    //=========================================================================
 
     #[test]
     fn test_arena_cons_is_arena() {
@@ -1302,7 +1293,7 @@ mod tests {
         super::set_arena_enabled(true);
         super::clear_arena();
 
-        // Allocate many cons cells (similar to benchmark workload)
+        // Allocate many cons cells
         let mut list = Value::nil();
         for i in 0..1000 {
             list = Value::cons(Value::int(i), list);

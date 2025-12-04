@@ -13,7 +13,7 @@ pub use parser::{parse, parse_all};
 pub use value::{clear_arena, set_arena_enabled, Value};
 pub use vm::{standard_vm, VM};
 
-/// Convenience function to evaluate a string using the bytecode VM
+/// Debugging function to evaluate a string using the bytecode VM
 pub fn run(input: &str) -> Result<Value, String> {
     let expr = parse(input)?;
     let chunk = Compiler::compile(&expr)?;
@@ -26,7 +26,7 @@ pub fn run(input: &str) -> Result<Value, String> {
     Ok(promoted)
 }
 
-/// Convenience function to evaluate multiple expressions using the bytecode VM
+/// Debugging function to evaluate multiple expressions using the bytecode VM
 pub fn run_all(input: &str) -> Result<Value, String> {
     let exprs = parse_all(input)?;
     let chunk = Compiler::compile_all(&exprs)?;

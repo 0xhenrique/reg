@@ -263,7 +263,7 @@ mod tests {
         let env = standard_env();
 
         // Define a simple swap macro that uses gensym for a temporary variable
-        // Note: This is a simplified test - real swap would need mutation
+        // Note: This is a simplified test - real swap would need mutation!
         expand(
             &parse("(defmacro my-add (a b) (list '+ a b))").unwrap(),
             &registry,

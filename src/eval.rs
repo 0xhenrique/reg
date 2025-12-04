@@ -65,17 +65,17 @@ enum Trampoline {
 pub fn eval(expr: &Value, env: &Env) -> Result<Value, String> {
     let mut result = eval_inner(expr, env, false)?;
 
-    // Trampoline loop - handles tail calls without growing Rust stack
+    // Trampoline loop - to use tail call without growing Rust stack
     loop {
         match result {
             Trampoline::Value(v) => return Ok(v),
             Trampoline::TailCall { func, args } => {
-                // Set up call environment
+                // Setup call environment
                 let call_env = func.env.extend();
                 for (param, arg) in func.params.iter().zip(args.into_iter()) {
                     call_env.define(&param, arg);
                 }
-                // Evaluate body in tail position (it's always the last thing)
+                // Eval body in tail position (it's always the last thing)
                 result = eval_inner(&func.body, &call_env, true)?;
             }
         }
@@ -299,7 +299,7 @@ fn eval_do(args: &[Value], env: &Env, tail_pos: bool) -> Result<Trampoline, Stri
     eval_inner(&args[args.len() - 1], env, tail_pos)
 }
 
-/// Create an environment with standard built-in functions
+/// Create an environment
 pub fn standard_env() -> Env {
     let env = Env::new();
 
@@ -653,11 +653,18 @@ fn builtin_cdr(args: &[Value]) -> Result<Value, String> {
     if args.len() != 1 {
         return Err("cdr expects exactly 1 argument".to_string());
     }
-    let list = args[0].as_list().ok_or("cdr expects a list")?;
-    if list.is_empty() {
-        return Err("cdr on empty list".to_string());
+    // Handle cons cells - O(1)
+    if let Some(cons) = args[0].as_cons() {
+        return Ok(cons.cdr.clone());
     }
-    Ok(Value::list(list[1..].to_vec()))
+    // Handle array lists - convert to cons chain for O(1) subsequent CDRs
+    if let Some(list) = args[0].as_list() {
+        if list.is_empty() {
+            return Err("cdr on empty list".to_string());
+        }
+        return Ok(Value::slice_to_cons(&list[1..]));
+    }
+    Err("cdr expects a list or cons cell".to_string())
 }
 
 fn builtin_length(args: &[Value]) -> Result<Value, String> {
@@ -762,7 +769,7 @@ mod tests {
         assert_eq!(eval_str("(if true 1 2)").unwrap(), Value::int(1));
         assert_eq!(eval_str("(if false 1 2)").unwrap(), Value::int(2));
         assert_eq!(eval_str("(if nil 1 2)").unwrap(), Value::int(2));
-        assert_eq!(eval_str("(if 0 1 2)").unwrap(), Value::int(1)); // 0 is truthy!
+        assert_eq!(eval_str("(if 0 1 2)").unwrap(), Value::int(1)); // @TODO: 0 is truthy! Are we keeping this?
         assert_eq!(eval_str("(if false 1)").unwrap(), Value::nil());
     }
 
@@ -833,10 +840,10 @@ mod tests {
             Value::list(vec![Value::int(1), Value::int(2), Value::int(3)])
         );
         assert_eq!(eval_str("(car (list 1 2 3))").unwrap(), Value::int(1));
-        assert_eq!(
-            eval_str("(cdr (list 1 2 3))").unwrap(),
-            Value::list(vec![Value::int(2), Value::int(3)])
-        );
+        // CDR converts array lists to cons chains for O(1) subsequent CDRs
+        let cdr_result = eval_str("(cdr (list 1 2 3))").unwrap();
+        assert!(cdr_result.as_cons().is_some(), "cdr should return cons chain");
+        assert_eq!(format!("{}", cdr_result), "(2 3)");
         assert_eq!(
             eval_str("(cons 0 (list 1 2))").unwrap(),
             Value::list(vec![Value::int(0), Value::int(1), Value::int(2)])

@@ -1,26 +1,72 @@
-use lisp_vm::{clear_arena, expand, parse, parse_all, standard_env, standard_vm, Compiler, MacroRegistry, Value};
+use lisp_vm::{clear_arena, expand, parse, parse_all, set_arena_enabled, standard_env, standard_vm, Compiler, MacroRegistry, Value};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::process;
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
+struct Config {
+    filename: Option<String>,
+    arena_enabled: bool,
+}
 
-    if args.len() > 1 {
-        // Run file mode
-        let filename = &args[1];
-        if let Err(e) = run_file(filename) {
+fn parse_args() -> Config {
+    let args: Vec<String> = env::args().collect();
+    let mut config = Config {
+        filename: None,
+        arena_enabled: false, // Arena is opt-in via --arena flag
+    };
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--arena" => {
+                config.arena_enabled = true;
+            }
+            "--help" | "-h" => {
+                print_usage();
+                process::exit(0);
+            }
+            arg if arg.starts_with('-') => {
+                eprintln!("Unknown option: {}", arg);
+                print_usage();
+                process::exit(1);
+            }
+            _ => {
+                config.filename = Some(args[i].clone());
+            }
+        }
+        i += 1;
+    }
+
+    config
+}
+
+fn print_usage() {
+    eprintln!("Usage: lisp-vm [OPTIONS] [FILE]");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --arena    Enable arena allocation for cons cells (experimental)");
+    eprintln!("  --help     Show this help message");
+    eprintln!();
+    eprintln!("If FILE is provided, execute it. Otherwise, start the REPL.");
+}
+
+fn main() {
+    let config = parse_args();
+
+    set_arena_enabled(config.arena_enabled);
+
+    if let Some(filename) = config.filename {
+        if let Err(e) = run_file(&filename, config.arena_enabled) {
             eprintln!("Error: {}", e);
             process::exit(1);
         }
     } else {
-        // REPL mode
-        run_repl();
+        run_repl(config.arena_enabled);
     }
 }
 
-fn run_file(filename: &str) -> Result<Value, String> {
+fn run_file(filename: &str, arena_enabled: bool) -> Result<Value, String> {
     let contents = fs::read_to_string(filename)
         .map_err(|e| format!("Could not read file '{}': {}", filename, e))?;
 
@@ -41,30 +87,35 @@ fn run_file(filename: &str) -> Result<Value, String> {
     let chunk = Compiler::compile_all(&expanded)?;
 
     // Execute via bytecode VM
-    // Note: Arena allocations accumulate during execution for maximum performance
-    // (free clone/drop). The arena is cleared when the program exits.
     let mut vm = standard_vm();
     let result = vm.run(chunk)?;
 
-    // Promote result if it contains arena values (for returning to caller)
-    let promoted = result.promote();
+    // Arena cleanup
+    let final_result = if arena_enabled {
+        // Promote result if it contains arena values (for returning to caller)
+        let promoted = result.promote();
+        clear_arena();
+        promoted
+    } else {
+        result
+    };
 
-    // Clear arena after execution (frees all temporary allocations at once)
-    clear_arena();
-
-    Ok(promoted)
+    Ok(final_result)
 }
 
-fn run_repl() {
+fn run_repl(arena_enabled: bool) {
     println!("Lisp VM v0.1.0 (bytecode)");
+    if arena_enabled {
+        println!("Arena allocation: enabled");
+    }
     println!("Type :q or :quit to exit.");
     println!();
 
-    // For macro expansion, we still need the tree-walking environment
+    // For macro expansion, we still need the tree-walking
     let env = standard_env();
     let macros = MacroRegistry::new();
 
-    // Create a single VM instance to maintain globals across expressions
+    // Single VM instance to maintain globals across expressions
     let mut vm = standard_vm();
 
     let stdin = io::stdin();
@@ -87,6 +138,7 @@ fn run_repl() {
                     break;
                 }
 
+                // Sorry for this
                 match parse(line) {
                     Ok(expr) => {
                         // First expand macros
@@ -98,17 +150,25 @@ fn run_repl() {
                                         // Execute via VM
                                         match vm.run(chunk) {
                                             Ok(result) => {
-                                                // Promote result before displaying (escapes arena)
-                                                let result = result.promote();
-                                                // Don't display nil results (common REPL behavior)
+                                                // Handle arena
+                                                let result = if arena_enabled {
+                                                    result.promote()
+                                                } else {
+                                                    result
+                                                };
+                                                // Don't display nil results for REPL
                                                 if !result.is_nil() {
                                                     println!("{}", result);
                                                 }
-                                                // Clear arena after each REPL command
-                                                clear_arena();
+                                                // Clear arena after each REPL command if enabled
+                                                if arena_enabled {
+                                                    clear_arena();
+                                                }
                                             }
                                             Err(e) => {
-                                                clear_arena(); // Clear even on error
+                                                if arena_enabled {
+                                                    clear_arena(); // Clear even on error
+                                                }
                                                 eprintln!("Error: {}", e);
                                             }
                                         }
