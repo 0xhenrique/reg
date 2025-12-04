@@ -6,6 +6,125 @@ use std::rc::Rc;
 use crate::bytecode::Chunk;
 
 //=============================================================================
+// Arena Allocator
+//=============================================================================
+//
+// Arena allocation eliminates per-object reference counting overhead by:
+// 1. Allocating objects in a growable Vec using bump allocation
+// 2. Using indices instead of pointers for stable references
+// 3. Cloning is free (just copy the index)
+// 4. Dropping is a no-op (arena is cleared in bulk)
+// 5. Values that escape (returned from top-level) are promoted to Rc
+//
+// Thread-local arena is used so native functions can allocate without
+// explicit arena parameter passing.
+
+/// Arena for heap object allocation without per-object reference counting.
+/// Uses a simple bump allocator with Vec backing storage.
+pub struct Arena {
+    /// Storage for heap objects, indexed by arena index
+    objects: Vec<HeapObject>,
+    /// High water mark for statistics
+    #[allow(dead_code)]
+    max_size: usize,
+}
+
+impl Arena {
+    /// Create a new empty arena
+    pub fn new() -> Self {
+        Arena {
+            objects: Vec::with_capacity(1024), // Pre-allocate for common case
+            max_size: 0,
+        }
+    }
+
+    /// Allocate a heap object in the arena, returning its index
+    #[inline]
+    pub fn alloc(&mut self, obj: HeapObject) -> u32 {
+        let idx = self.objects.len() as u32;
+        self.objects.push(obj);
+        idx
+    }
+
+    /// Get a reference to an object by index
+    #[inline]
+    pub fn get(&self, idx: u32) -> &HeapObject {
+        unsafe { self.objects.get_unchecked(idx as usize) }
+    }
+
+    /// Clear the arena, freeing all objects
+    /// This is called after each top-level expression
+    pub fn clear(&mut self) {
+        if self.objects.len() > self.max_size {
+            // Update high water mark (for future tuning)
+        }
+        self.objects.clear();
+    }
+
+    /// Check if arena is empty (used for testing)
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty()
+    }
+
+    /// Number of objects in arena
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.objects.len()
+    }
+}
+
+impl Default for Arena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Thread-local arena for allocation from native functions
+thread_local! {
+    static ARENA: RefCell<Arena> = RefCell::new(Arena::new());
+    // Flag to enable/disable arena allocation (for testing Rc fallback)
+    static ARENA_ENABLED: RefCell<bool> = const { RefCell::new(true) };
+}
+
+/// Enable or disable arena allocation (for testing)
+pub fn set_arena_enabled(enabled: bool) {
+    ARENA_ENABLED.with(|e| *e.borrow_mut() = enabled);
+}
+
+/// Check if arena allocation is enabled
+#[inline]
+fn arena_enabled() -> bool {
+    ARENA_ENABLED.with(|e| *e.borrow())
+}
+
+/// Clear the thread-local arena
+pub fn clear_arena() {
+    ARENA.with(|a| a.borrow_mut().clear());
+}
+
+/// Get the current arena size (for testing/debugging)
+#[allow(dead_code)]
+pub fn arena_size() -> usize {
+    ARENA.with(|a| a.borrow().len())
+}
+
+/// Allocate a heap object in the thread-local arena
+#[inline]
+fn arena_alloc(obj: HeapObject) -> u32 {
+    ARENA.with(|a| a.borrow_mut().alloc(obj))
+}
+
+/// Get a reference to an arena object (unsafe - caller must ensure index is valid)
+#[inline]
+unsafe fn arena_get(idx: u32) -> *const HeapObject {
+    ARENA.with(|a| {
+        let arena = a.borrow();
+        arena.get(idx) as *const HeapObject
+    })
+}
+
+//=============================================================================
 // Symbol Interner
 //=============================================================================
 //
@@ -78,6 +197,10 @@ const TAG_FALSE: u64 = 0x7FFC_0000_0000_0001;
 const TAG_TRUE: u64 = 0x7FFC_0000_0000_0002;
 const TAG_INT: u64 = 0x7FFD_0000_0000_0000;
 const TAG_PTR: u64 = 0x7FFE_0000_0000_0000;
+// Arena-allocated objects use TAG_ARENA with index in lower 32 bits
+// This distinguishes them from Rc-allocated objects (TAG_PTR)
+// Arena values have free clone (copy bits) and no-op drop
+const TAG_ARENA: u64 = 0x7FFF_0000_0000_0000;
 
 const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
 const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;  // 48 bits
@@ -210,8 +333,23 @@ impl Value {
     /// Create a cons cell - O(1) operation
     /// (cons car cdr) creates a pair where car is the head and cdr is the tail
     ///
-    /// OPTIMIZED: ConsCell is now stored inline in HeapObject
+    /// OPTIMIZED: Uses arena allocation when enabled for zero-refcount cloning.
+    /// When arena is enabled, cons cells are allocated in the thread-local arena.
+    /// When disabled, falls back to Rc allocation for compatibility.
     pub fn cons(car: Value, cdr: Value) -> Value {
+        if arena_enabled() {
+            // Arena allocation - zero overhead clone/drop
+            let idx = arena_alloc(HeapObject::Cons(ConsCell { car, cdr }));
+            Value(TAG_ARENA | idx as u64)
+        } else {
+            // Rc allocation fallback
+            let heap = Rc::new(HeapObject::Cons(ConsCell { car, cdr }));
+            Value::from_heap(heap)
+        }
+    }
+
+    /// Create a cons cell using Rc (for values that need to persist beyond arena lifetime)
+    pub fn cons_rc(car: Value, cdr: Value) -> Value {
         let heap = Rc::new(HeapObject::Cons(ConsCell { car, cdr }));
         Value::from_heap(heap)
     }
@@ -272,6 +410,19 @@ impl Value {
         (self.0 & TAG_MASK) == TAG_PTR
     }
 
+    /// Check if this is an arena-allocated value
+    #[inline]
+    pub fn is_arena(&self) -> bool {
+        (self.0 & TAG_MASK) == TAG_ARENA
+    }
+
+    /// Check if this is any heap value (either Rc or arena)
+    #[inline]
+    pub fn is_heap(&self) -> bool {
+        let tag = self.0 & TAG_MASK;
+        tag == TAG_PTR || tag == TAG_ARENA
+    }
+
     //-------------------------------------------------------------------------
     // Value extraction
     //-------------------------------------------------------------------------
@@ -323,15 +474,21 @@ impl Value {
         }
     }
 
-    /// Get the heap object if this is a heap pointer
+    /// Get the heap object if this is a heap pointer (Rc or arena)
     #[inline]
     fn as_heap(&self) -> Option<&HeapObject> {
-        if !self.is_ptr() {
-            return None;
+        if self.is_ptr() {
+            let ptr = (self.0 & PAYLOAD_MASK) as *const HeapObject;
+            // Safety: we only create these pointers from Rc::into_raw
+            Some(unsafe { &*ptr })
+        } else if self.is_arena() {
+            // Arena allocation - get from thread-local arena
+            let idx = (self.0 & PAYLOAD_MASK) as u32;
+            // Safety: arena values are only created via arena_alloc
+            Some(unsafe { &*arena_get(idx) })
+        } else {
+            None
         }
-        let ptr = (self.0 & PAYLOAD_MASK) as *const HeapObject;
-        // Safety: we only create these pointers from Rc::into_raw
-        Some(unsafe { &*ptr })
     }
 
     /// Get as a symbol string, if this is a symbol
@@ -564,7 +721,8 @@ impl Value {
 
 impl Drop for Value {
     fn drop(&mut self) {
-        // If this is a heap pointer, we need to decrement the Rc refcount
+        // Only Rc-allocated values need refcount management
+        // Arena values are freed in bulk when the arena is cleared
         if self.is_ptr() {
             let ptr = (self.0 & PAYLOAD_MASK) as *const HeapObject;
             // Safety: we only create these from Rc::into_raw
@@ -575,6 +733,7 @@ impl Drop for Value {
             // Mark as nil to prevent double-free
             self.0 = TAG_NIL;
         }
+        // Arena values: no-op drop - the arena will free them all at once
     }
 }
 
@@ -582,7 +741,7 @@ impl Clone for Value {
     #[inline(always)]
     fn clone(&self) -> Self {
         if self.is_ptr() {
-            // Just increment the Rc reference count - no new allocation!
+            // Rc-allocated: increment reference count
             let ptr = (self.0 & PAYLOAD_MASK) as *const HeapObject;
             // Safety: we only create these from Rc::into_raw
             // increment_strong_count increases refcount without creating an Rc
@@ -591,9 +750,80 @@ impl Clone for Value {
             }
             // Return a Value with the same pointer (both now own a reference)
             Value(self.0)
+        } else if self.is_arena() {
+            // Arena-allocated: FREE CLONE - just copy the bits!
+            // No refcount increment, arena owns all objects
+            Value(self.0)
         } else {
             // Primitives: just copy the bits
             Value(self.0)
+        }
+    }
+}
+
+impl Value {
+    /// Promote an arena-allocated value to Rc-allocated for escape from arena scope.
+    /// This is called when a value needs to outlive the arena (e.g., returned from VM).
+    /// Non-arena values are returned unchanged.
+    ///
+    /// This recursively promotes nested values (cons cells) to ensure the entire
+    /// structure is Rc-allocated.
+    pub fn promote(&self) -> Value {
+        if self.is_arena() {
+            // Get the heap object and create an Rc copy
+            match self.as_heap() {
+                Some(HeapObject::Cons(cons)) => {
+                    // Recursively promote car and cdr
+                    let car = cons.car.promote();
+                    let cdr = cons.cdr.promote();
+                    Value::cons_rc(car, cdr)
+                }
+                Some(HeapObject::String(s)) => Value::string(s),
+                Some(HeapObject::Symbol(s)) => {
+                    // Re-intern the symbol
+                    Value::symbol(s)
+                }
+                Some(HeapObject::List(items)) => {
+                    // Recursively promote list elements
+                    let promoted: Vec<Value> = items.iter().map(|v| v.promote()).collect();
+                    Value::list(promoted)
+                }
+                Some(HeapObject::Function(f)) => Value::function((**f).clone()),
+                Some(HeapObject::NativeFunction(f)) => {
+                    let heap = Rc::new(HeapObject::NativeFunction(f.clone()));
+                    Value::from_heap(heap)
+                }
+                Some(HeapObject::CompiledFunction(c)) => {
+                    Value::CompiledFunction(c.clone())
+                }
+                None => Value::nil(),
+            }
+        } else if self.is_ptr() {
+            // Already Rc-allocated, but may contain arena children (cons cells)
+            // Need to check and promote nested arena values
+            match self.as_heap() {
+                Some(HeapObject::Cons(cons)) => {
+                    if cons.car.is_arena() || cons.cdr.is_arena() {
+                        let car = cons.car.promote();
+                        let cdr = cons.cdr.promote();
+                        Value::cons_rc(car, cdr)
+                    } else {
+                        self.clone()
+                    }
+                }
+                Some(HeapObject::List(items)) => {
+                    if items.iter().any(|v| v.is_arena()) {
+                        let promoted: Vec<Value> = items.iter().map(|v| v.promote()).collect();
+                        Value::list(promoted)
+                    } else {
+                        self.clone()
+                    }
+                }
+                _ => self.clone(),
+            }
+        } else {
+            // Primitive values don't need promotion
+            self.clone()
         }
     }
 }
@@ -924,5 +1154,147 @@ mod tests {
             ),
         );
         assert_eq!(format!("{}", list), "(1 2 3)");
+    }
+
+    //=========================================================================
+    // Arena Allocation Tests
+    //=========================================================================
+
+    #[test]
+    fn test_arena_cons_is_arena() {
+        // Ensure arena is enabled for this test
+        super::set_arena_enabled(true);
+        super::clear_arena();
+
+        let cell = Value::cons(Value::int(1), Value::nil());
+        assert!(cell.is_arena(), "cons should be arena-allocated");
+        assert!(!cell.is_ptr(), "cons should not be Rc-allocated");
+
+        // Cleanup
+        super::clear_arena();
+    }
+
+    #[test]
+    fn test_arena_cons_clone_is_free() {
+        super::set_arena_enabled(true);
+        super::clear_arena();
+
+        let cell = Value::cons(Value::int(1), Value::nil());
+        assert!(cell.is_arena());
+
+        // Clone should just copy bits (no refcount increment)
+        let cell2 = cell.clone();
+        assert!(cell2.is_arena());
+        assert_eq!(cell.0, cell2.0); // Same bits
+
+        // Both should access the same cons cell
+        assert_eq!(cell.as_cons().unwrap().car.as_int(), Some(1));
+        assert_eq!(cell2.as_cons().unwrap().car.as_int(), Some(1));
+
+        super::clear_arena();
+    }
+
+    #[test]
+    fn test_arena_promote() {
+        super::set_arena_enabled(true);
+        super::clear_arena();
+
+        // Create arena-allocated cons
+        let cell = Value::cons(Value::int(42), Value::nil());
+        assert!(cell.is_arena());
+
+        // Promote to Rc
+        let promoted = cell.promote();
+        assert!(promoted.is_ptr(), "promoted should be Rc-allocated");
+        assert!(!promoted.is_arena());
+
+        // Contents should be preserved
+        assert_eq!(promoted.as_cons().unwrap().car.as_int(), Some(42));
+
+        super::clear_arena();
+    }
+
+    #[test]
+    fn test_arena_promote_nested() {
+        super::set_arena_enabled(true);
+        super::clear_arena();
+
+        // Create nested arena-allocated cons list: (1 2 3)
+        let list = Value::cons(
+            Value::int(1),
+            Value::cons(
+                Value::int(2),
+                Value::cons(Value::int(3), Value::nil()),
+            ),
+        );
+        assert!(list.is_arena());
+
+        // Promote should recursively promote all nested cons cells
+        let promoted = list.promote();
+        assert!(promoted.is_ptr());
+
+        // All nested cells should now be Rc
+        let cons1 = promoted.as_cons().unwrap();
+        assert!(cons1.cdr.is_ptr() || cons1.cdr.is_nil());
+
+        // Contents should be preserved
+        assert_eq!(format!("{}", promoted), "(1 2 3)");
+
+        super::clear_arena();
+    }
+
+    #[test]
+    fn test_arena_disable_falls_back_to_rc() {
+        super::set_arena_enabled(false);
+
+        let cell = Value::cons(Value::int(1), Value::nil());
+        assert!(cell.is_ptr(), "cons should be Rc-allocated when arena disabled");
+        assert!(!cell.is_arena());
+
+        // Re-enable for other tests
+        super::set_arena_enabled(true);
+    }
+
+    #[test]
+    fn test_arena_clear() {
+        super::set_arena_enabled(true);
+        super::clear_arena();
+
+        // Create some arena-allocated values
+        let _c1 = Value::cons(Value::int(1), Value::nil());
+        let _c2 = Value::cons(Value::int(2), Value::nil());
+        let _c3 = Value::cons(Value::int(3), Value::nil());
+
+        assert!(super::arena_size() >= 3);
+
+        // Clear should reset
+        super::clear_arena();
+        assert_eq!(super::arena_size(), 0);
+    }
+
+    #[test]
+    fn test_arena_many_allocations() {
+        super::set_arena_enabled(true);
+        super::clear_arena();
+
+        // Allocate many cons cells (similar to benchmark workload)
+        let mut list = Value::nil();
+        for i in 0..1000 {
+            list = Value::cons(Value::int(i), list);
+        }
+
+        // All should be arena-allocated
+        assert!(list.is_arena());
+
+        // Traverse to verify structure
+        let mut current = &list;
+        let mut count = 0;
+        while let Some(cons) = current.as_cons() {
+            count += 1;
+            current = &cons.cdr;
+        }
+        assert_eq!(count, 1000);
+
+        super::clear_arena();
     }
 }

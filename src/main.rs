@@ -1,4 +1,4 @@
-use lisp_vm::{expand, parse, parse_all, standard_env, standard_vm, Compiler, MacroRegistry, Value};
+use lisp_vm::{clear_arena, expand, parse, parse_all, standard_env, standard_vm, Compiler, MacroRegistry, Value};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -41,8 +41,18 @@ fn run_file(filename: &str) -> Result<Value, String> {
     let chunk = Compiler::compile_all(&expanded)?;
 
     // Execute via bytecode VM
+    // Note: Arena allocations accumulate during execution for maximum performance
+    // (free clone/drop). The arena is cleared when the program exits.
     let mut vm = standard_vm();
-    vm.run(chunk)
+    let result = vm.run(chunk)?;
+
+    // Promote result if it contains arena values (for returning to caller)
+    let promoted = result.promote();
+
+    // Clear arena after execution (frees all temporary allocations at once)
+    clear_arena();
+
+    Ok(promoted)
 }
 
 fn run_repl() {
@@ -88,12 +98,19 @@ fn run_repl() {
                                         // Execute via VM
                                         match vm.run(chunk) {
                                             Ok(result) => {
+                                                // Promote result before displaying (escapes arena)
+                                                let result = result.promote();
                                                 // Don't display nil results (common REPL behavior)
                                                 if !result.is_nil() {
                                                     println!("{}", result);
                                                 }
+                                                // Clear arena after each REPL command
+                                                clear_arena();
                                             }
-                                            Err(e) => eprintln!("Error: {}", e),
+                                            Err(e) => {
+                                                clear_arena(); // Clear even on error
+                                                eprintln!("Error: {}", e);
+                                            }
                                         }
                                     }
                                     Err(e) => eprintln!("Compile error: {}", e),
