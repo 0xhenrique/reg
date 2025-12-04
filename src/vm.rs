@@ -1688,6 +1688,16 @@ mod tests {
     }
 
     #[test]
+    fn test_mutual_recursion_tail_call() {
+        // Mutual recursion with tail calls - should not stack overflow
+        let result = vm_eval("(do
+            (def is-even (fn (n) (if (= n 0) true (is-odd (- n 1)))))
+            (def is-odd (fn (n) (if (= n 0) false (is-even (- n 1)))))
+            (is-even 100))").unwrap();
+        assert_eq!(result, Value::Bool(true));
+    }
+
+    #[test]
     fn test_specialized_car_cdr() {
         // Test specialized car/cdr opcodes with cons cells
         assert_eq!(vm_eval("(car (cons 1 (cons 2 nil)))").unwrap(), Value::Int(1));

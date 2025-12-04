@@ -63,6 +63,8 @@ pub struct Compiler {
     self_name: Option<String>,
     /// Number of parameters of the current function (for loop optimization)
     self_arity: usize,
+    /// Stack of functions currently being inlined (for mutual recursion detection)
+    inline_stack: Vec<String>,
 }
 
 /// Check if an expression is pure (no side effects)
@@ -199,6 +201,30 @@ fn contains_call_to(expr: &Value, name: &str) -> bool {
             // Recursively check all sub-expressions
             for item in items.iter() {
                 if contains_call_to(item, name) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Check if expression contains a call to any function in the given list (mutual recursion check)
+fn contains_call_to_any(expr: &Value, names: &[String]) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    if let Some(items) = expr.as_list() {
+        if !items.is_empty() {
+            // Check if this is a call to any of the functions
+            if let Some(first) = items[0].as_symbol() {
+                if names.iter().any(|n| n == first) {
+                    return true;
+                }
+            }
+            // Recursively check all sub-expressions
+            for item in items.iter() {
+                if contains_call_to_any(item, names) {
                     return true;
                 }
             }
@@ -443,6 +469,7 @@ impl Compiler {
             inline_candidates: InlineCandidates::new(),
             self_name: None,
             self_arity: 0,
+            inline_stack: Vec::new(),
         }
     }
 
@@ -1094,11 +1121,18 @@ impl Compiler {
                 if args.len() == fn_def.params.len() {
                     // Check: function is small enough to inline
                     if is_small_body(&fn_def.body) {
-                        // Check: function doesn't call itself (non-recursive)
+                        // Check: function doesn't call itself (direct recursion)
                         if !contains_call_to(&fn_def.body, op) {
-                            // Inline: substitute parameters with arguments and compile
-                            let inlined = substitute(&fn_def.body, &fn_def.params, args);
-                            return self.compile_expr(&inlined, dest, tail_pos);
+                            // Check: function doesn't call any function in the inline stack (mutual recursion)
+                            if !contains_call_to_any(&fn_def.body, &self.inline_stack) {
+                                // Inline: substitute parameters with arguments and compile
+                                let inlined = substitute(&fn_def.body, &fn_def.params, args);
+                                // Track that we're inlining this function (for mutual recursion detection)
+                                self.inline_stack.push(op.to_string());
+                                let result = self.compile_expr(&inlined, dest, tail_pos);
+                                self.inline_stack.pop();
+                                return result;
+                            }
                         }
                     }
                 }
