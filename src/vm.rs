@@ -348,13 +348,16 @@ impl VM {
                         .ok_or("CallGlobal: expected symbol")?;
                     let key = SymbolKey(symbol_rc);
 
-                    let func_value = if let Some(cached) = self.global_cache.get(&key) {
-                        cached
-                    } else {
-                        let v = self.globals.borrow().get(&*key.0).cloned()
-                            .ok_or_else(|| format!("Undefined function: {}", &*key.0))?;
-                        self.global_cache.insert(key.clone(), v);
-                        self.global_cache.get(&key).unwrap()
+                    // Use entry API to avoid double HashMap lookup on cache miss
+                    use std::collections::hash_map::Entry;
+                    let func_value = match self.global_cache.entry(key) {
+                        Entry::Occupied(e) => e.into_mut(),
+                        Entry::Vacant(e) => {
+                            let name = &*e.key().0;
+                            let v = self.globals.borrow().get(name).cloned()
+                                .ok_or_else(|| format!("Undefined function: {}", name))?;
+                            e.insert(v)
+                        }
                     };
 
                     if let Some(cf) = func_value.as_compiled_function() {
@@ -420,13 +423,16 @@ impl VM {
                         .ok_or("TailCallGlobal: expected symbol")?;
                     let key = SymbolKey(symbol_rc);
 
-                    let func_value = if let Some(cached) = self.global_cache.get(&key) {
-                        cached
-                    } else {
-                        let v = self.globals.borrow().get(&*key.0).cloned()
-                            .ok_or_else(|| format!("Undefined function: {}", &*key.0))?;
-                        self.global_cache.insert(key.clone(), v);
-                        self.global_cache.get(&key).unwrap()
+                    // Use entry API to avoid double HashMap lookup on cache miss
+                    use std::collections::hash_map::Entry;
+                    let func_value = match self.global_cache.entry(key) {
+                        Entry::Occupied(e) => e.into_mut(),
+                        Entry::Vacant(e) => {
+                            let name = &*e.key().0;
+                            let v = self.globals.borrow().get(name).cloned()
+                                .ok_or_else(|| format!("Undefined function: {}", name))?;
+                            e.insert(v)
+                        }
                     };
 
                     if let Some(cf) = func_value.as_compiled_function() {
@@ -677,23 +683,23 @@ impl VM {
                     let dest = instr.a();
                     let nargs = instr.b();
                     let items: Vec<Value> = (0..nargs)
-                        .map(|i| self.registers[base + dest as usize + 1 + i as usize].clone())
+                        .map(|i| unsafe { self.registers.get_unchecked(base + dest as usize + 1 + i as usize) }.clone())
                         .collect();
-                    self.registers[base + dest as usize] = Value::list(items);
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = Value::list(items) };
                 }
 
                 Op::GET_LIST => {
                     let dest = instr.a();
                     let list = instr.b();
                     let index = instr.c();
-                    let list_val = &self.registers[base + list as usize];
-                    let idx = &self.registers[base + index as usize];
+                    let list_val = unsafe { self.registers.get_unchecked(base + list as usize) };
+                    let idx = unsafe { self.registers.get_unchecked(base + index as usize) };
                     let result = if let (Some(items), Some(i)) = (list_val.as_list(), idx.as_int()) {
                         items.get(i as usize).cloned().unwrap_or(Value::nil())
                     } else {
                         return Err("GetList expects list and int".to_string());
                     };
-                    self.registers[base + dest as usize] = result;
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                 }
 
                 Op::SET_LIST => {
