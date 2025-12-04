@@ -71,6 +71,10 @@ impl std::fmt::Debug for Op {
             Self::JUMP_IF_NIL => write!(f, "JumpIfNil({}, {})", self.a(), self.sbx()),
             Self::JUMP_IF_NOT_NIL => write!(f, "JumpIfNotNil({}, {})", self.a(), self.sbx()),
             Self::CONS => write!(f, "Cons({}, {}, {})", self.a(), self.b(), self.c()),
+            Self::MOVE_LAST => write!(f, "MoveLast({}, {})", self.a(), self.b()),
+            Self::CAR_LAST => write!(f, "CarLast({}, {})", self.a(), self.b()),
+            Self::CDR_LAST => write!(f, "CdrLast({}, {})", self.a(), self.b()),
+            Self::CONS_MOVE => write!(f, "ConsMove({}, {}, {})", self.a(), self.b(), self.c()),
             _ => write!(f, "Unknown(0x{:08x})", self.0),
         }
     }
@@ -132,6 +136,15 @@ impl Op {
     pub const JUMP_IF_NOT_NIL: u8 = 49; // A: src, sBx: offset - jump if src is NOT nil
     // Specialized cons opcode (very common in list construction)
     pub const CONS: u8 = 50;           // ABC: dest, car, cdr - create cons cell
+
+    // Move-semantics variants (last-use optimization)
+    // These opcodes move from source instead of cloning (source becomes nil)
+    pub const MOVE_LAST: u8 = 51;      // AB: dest, src - move (don't clone) from src
+    pub const CAR_LAST: u8 = 52;       // AB: dest, src - move car (don't clone list)
+    pub const CDR_LAST: u8 = 53;       // AB: dest, src - move cdr (don't clone list)
+    // For CONS, we use high bit of car/cdr registers to indicate move
+    // If B & 0x80, move from car register (B & 0x7F); if C & 0x80, move from cdr register (C & 0x7F)
+    pub const CONS_MOVE: u8 = 54;      // ABC: dest, car|0x80?, cdr|0x80? - cons with optional moves
 
     // ========== Constructors ==========
 
@@ -454,6 +467,36 @@ impl Op {
         Self::abc(Self::CONS, dest, car, cdr)
     }
 
+    // ========== Move-semantics variants (last-use optimization) ==========
+
+    /// Move from src to dest (source becomes nil after move)
+    #[inline(always)]
+    pub const fn move_last(dest: Reg, src: Reg) -> Self {
+        Self::abc(Self::MOVE_LAST, dest, src, 0)
+    }
+
+    /// Car with move semantics (source list is consumed)
+    #[inline(always)]
+    pub const fn car_last(dest: Reg, src: Reg) -> Self {
+        Self::abc(Self::CAR_LAST, dest, src, 0)
+    }
+
+    /// Cdr with move semantics (source list is consumed)
+    #[inline(always)]
+    pub const fn cdr_last(dest: Reg, src: Reg) -> Self {
+        Self::abc(Self::CDR_LAST, dest, src, 0)
+    }
+
+    /// Cons with optional move semantics
+    /// move_car: if true, move from car register instead of clone
+    /// move_cdr: if true, move from cdr register instead of clone
+    #[inline(always)]
+    pub const fn cons_move(dest: Reg, car: Reg, cdr: Reg, move_car: bool, move_cdr: bool) -> Self {
+        let car_with_flag = if move_car { car | 0x80 } else { car };
+        let cdr_with_flag = if move_cdr { cdr | 0x80 } else { cdr };
+        Self::abc(Self::CONS_MOVE, dest, car_with_flag, cdr_with_flag)
+    }
+
     // ========== Jump patching helpers ==========
 
     /// Check if this is a jump instruction (for patching)
@@ -511,6 +554,305 @@ impl Chunk {
             protos: Vec::new(),
             int_const_idx: HashMap::new(),
             symbol_const_idx: HashMap::new(),
+        }
+    }
+
+    /// Perform liveness analysis and upgrade opcodes to move variants where profitable.
+    /// This is a backward dataflow analysis that tracks which registers are "live"
+    /// (will be used later). When a register is used for the last time, we can
+    /// use move semantics instead of clone.
+    pub fn optimize_moves(&mut self) {
+        if self.code.is_empty() {
+            return;
+        }
+
+        // First, recursively optimize nested function prototypes
+        for proto in &mut self.protos {
+            proto.optimize_moves();
+        }
+
+        // Step 1: Find all jump targets (instructions that can be jumped to)
+        // At jump targets, we need to be conservative because registers might
+        // be live from a different path
+        let mut jump_targets: Vec<bool> = vec![false; self.code.len()];
+        for (i, op) in self.code.iter().enumerate() {
+            let opcode = op.opcode();
+            // Check if this is a jump instruction and mark the target
+            if opcode == Op::JUMP || opcode == Op::JUMP_IF_FALSE || opcode == Op::JUMP_IF_TRUE
+                || opcode == Op::JUMP_IF_NIL || opcode == Op::JUMP_IF_NOT_NIL
+            {
+                let offset = op.sbx() as isize;
+                let target = (i as isize + 1 + offset) as usize;
+                if target < self.code.len() {
+                    jump_targets[target] = true;
+                }
+            } else if opcode >= Op::JUMP_IF_LT && opcode <= Op::JUMP_IF_GE_IMM {
+                // These use i8 offset in C byte
+                let offset = op.c() as i8 as isize;
+                let target = (i as isize + 1 + offset) as usize;
+                if target < self.code.len() {
+                    jump_targets[target] = true;
+                }
+            }
+        }
+
+        // Step 2: Compute "ever_live" - registers that are ever used in the function
+        // This is needed to be conservative at join points
+        let mut ever_live: u128 = 0;
+        for op in self.code.iter() {
+            let opcode = op.opcode();
+            // Add all registers that are read by any instruction
+            match opcode {
+                Op::MOVE | Op::CAR | Op::CDR | Op::NEG | Op::NOT => {
+                    ever_live |= 1u128 << op.b();
+                }
+                Op::ADD | Op::SUB | Op::MUL | Op::DIV | Op::MOD |
+                Op::LT | Op::LE | Op::GT | Op::GE | Op::EQ | Op::NE |
+                Op::CONS | Op::GET_LIST => {
+                    ever_live |= 1u128 << op.b();
+                    ever_live |= 1u128 << op.c();
+                }
+                Op::ADD_IMM | Op::SUB_IMM |
+                Op::LT_IMM | Op::LE_IMM | Op::GT_IMM | Op::GE_IMM => {
+                    ever_live |= 1u128 << op.b();
+                }
+                Op::SET_GLOBAL | Op::RETURN => {
+                    ever_live |= 1u128 << op.a();
+                }
+                Op::JUMP_IF_FALSE | Op::JUMP_IF_TRUE |
+                Op::JUMP_IF_NIL | Op::JUMP_IF_NOT_NIL => {
+                    ever_live |= 1u128 << op.a();
+                }
+                Op::JUMP_IF_LT | Op::JUMP_IF_LE | Op::JUMP_IF_GT | Op::JUMP_IF_GE => {
+                    ever_live |= 1u128 << op.a();
+                    ever_live |= 1u128 << op.b();
+                }
+                Op::JUMP_IF_LT_IMM | Op::JUMP_IF_LE_IMM |
+                Op::JUMP_IF_GT_IMM | Op::JUMP_IF_GE_IMM => {
+                    ever_live |= 1u128 << op.a();
+                }
+                _ => {}
+            }
+        }
+
+        // Track which registers are live at each point (bitset for efficiency)
+        // We use u128 to support up to 128 registers (more than enough)
+        let mut live: u128 = 0;
+
+        // Walk backward through the code
+        for i in (0..self.code.len()).rev() {
+            // At jump targets, be conservative: all ever-used registers might be live
+            if jump_targets[i] {
+                live |= ever_live;
+            }
+
+            let op = self.code[i];
+            let opcode = op.opcode();
+
+            match opcode {
+                // ===== AB-format instructions that can use move semantics =====
+
+                Op::MOVE => {
+                    let dest = op.a();
+                    let src = op.b();
+                    // If src is not live after this instruction, use move semantics
+                    let src_live_after = (live & (1u128 << src)) != 0;
+                    // Update liveness: dest is now dead (overwritten), src is now live
+                    live &= !(1u128 << dest);
+                    live |= 1u128 << src;
+                    // Upgrade to MOVE_LAST if src was not live (this is its last use)
+                    if !src_live_after && src != dest {
+                        self.code[i] = Op::move_last(dest, src);
+                    }
+                }
+
+                Op::CAR => {
+                    let dest = op.a();
+                    let src = op.b();
+                    let src_live_after = (live & (1u128 << src)) != 0;
+                    live &= !(1u128 << dest);
+                    live |= 1u128 << src;
+                    if !src_live_after && src != dest {
+                        self.code[i] = Op::car_last(dest, src);
+                    }
+                }
+
+                Op::CDR => {
+                    let dest = op.a();
+                    let src = op.b();
+                    let src_live_after = (live & (1u128 << src)) != 0;
+                    live &= !(1u128 << dest);
+                    live |= 1u128 << src;
+                    if !src_live_after && src != dest {
+                        self.code[i] = Op::cdr_last(dest, src);
+                    }
+                }
+
+                Op::CONS => {
+                    let dest = op.a();
+                    let car = op.b();
+                    let cdr = op.c();
+                    let car_live_after = (live & (1u128 << car)) != 0;
+                    let cdr_live_after = (live & (1u128 << cdr)) != 0;
+                    live &= !(1u128 << dest);
+                    live |= 1u128 << car;
+                    live |= 1u128 << cdr;
+                    // Upgrade to CONS_MOVE if either car or cdr is last use
+                    let move_car = !car_live_after && car != dest;
+                    let move_cdr = !cdr_live_after && cdr != dest;
+                    if move_car || move_cdr {
+                        self.code[i] = Op::cons_move(dest, car, cdr, move_car, move_cdr);
+                    }
+                }
+
+                // ===== Other AB-format instructions (read src, write dest) =====
+
+                Op::NEG | Op::NOT => {
+                    let dest = op.a();
+                    let src = op.b();
+                    live &= !(1u128 << dest);
+                    live |= 1u128 << src;
+                }
+
+                // ===== ABC-format arithmetic/comparison (read B, C; write A) =====
+
+                Op::ADD | Op::SUB | Op::MUL | Op::DIV | Op::MOD |
+                Op::LT | Op::LE | Op::GT | Op::GE | Op::EQ | Op::NE => {
+                    let dest = op.a();
+                    let b = op.b();
+                    let c = op.c();
+                    live &= !(1u128 << dest);
+                    live |= 1u128 << b;
+                    live |= 1u128 << c;
+                }
+
+                // ===== Immediate variants (read B only) =====
+
+                Op::ADD_IMM | Op::SUB_IMM |
+                Op::LT_IMM | Op::LE_IMM | Op::GT_IMM | Op::GE_IMM => {
+                    let dest = op.a();
+                    let src = op.b();
+                    live &= !(1u128 << dest);
+                    live |= 1u128 << src;
+                }
+
+                // ===== Load instructions (write only) =====
+
+                Op::LOAD_CONST | Op::LOAD_NIL | Op::LOAD_TRUE | Op::LOAD_FALSE |
+                Op::GET_GLOBAL | Op::CLOSURE => {
+                    let dest = op.a();
+                    live &= !(1u128 << dest);
+                }
+
+                // ===== Store instructions (read only) =====
+
+                Op::SET_GLOBAL | Op::RETURN => {
+                    let src = op.a();
+                    live |= 1u128 << src;
+                }
+
+                // ===== Jump instructions (conditionally read) =====
+
+                Op::JUMP => {
+                    // Unconditional jump reads nothing
+                    // Note: For proper analysis we'd need to handle control flow
+                    // This simplified version treats code as linear (conservative for loops)
+                }
+
+                Op::JUMP_IF_FALSE | Op::JUMP_IF_TRUE |
+                Op::JUMP_IF_NIL | Op::JUMP_IF_NOT_NIL => {
+                    let reg = op.a();
+                    live |= 1u128 << reg;
+                }
+
+                Op::JUMP_IF_LT | Op::JUMP_IF_LE | Op::JUMP_IF_GT | Op::JUMP_IF_GE => {
+                    let left = op.a();
+                    let right = op.b();
+                    live |= 1u128 << left;
+                    live |= 1u128 << right;
+                }
+
+                Op::JUMP_IF_LT_IMM | Op::JUMP_IF_LE_IMM |
+                Op::JUMP_IF_GT_IMM | Op::JUMP_IF_GE_IMM => {
+                    let src = op.a();
+                    live |= 1u128 << src;
+                }
+
+                // ===== Call instructions (complex, treat all args as live) =====
+
+                Op::CALL => {
+                    let dest = op.a();
+                    let func = op.b();
+                    let nargs = op.c();
+                    live &= !(1u128 << dest);
+                    live |= 1u128 << func;
+                    // Args are in consecutive registers after func
+                    for j in 0..nargs {
+                        live |= 1u128 << (func + 1 + j);
+                    }
+                }
+
+                Op::CALL_GLOBAL => {
+                    let dest = op.a();
+                    let nargs = op.c();
+                    live &= !(1u128 << dest);
+                    // Args are in consecutive registers after dest
+                    for j in 0..nargs {
+                        live |= 1u128 << (dest + 1 + j);
+                    }
+                }
+
+                Op::TAIL_CALL => {
+                    let func = op.a();
+                    let nargs = op.b();
+                    live |= 1u128 << func;
+                    for j in 0..nargs {
+                        live |= 1u128 << (func + 1 + j);
+                    }
+                }
+
+                Op::TAIL_CALL_GLOBAL => {
+                    let first_arg = op.b();
+                    let nargs = op.c();
+                    for j in 0..nargs {
+                        live |= 1u128 << (first_arg + j);
+                    }
+                }
+
+                // ===== List operations =====
+
+                Op::NEW_LIST => {
+                    let dest = op.a();
+                    let nargs = op.b();
+                    live &= !(1u128 << dest);
+                    for j in 0..nargs {
+                        live |= 1u128 << (dest + 1 + j);
+                    }
+                }
+
+                Op::GET_LIST => {
+                    let dest = op.a();
+                    let list = op.b();
+                    let index = op.c();
+                    live &= !(1u128 << dest);
+                    live |= 1u128 << list;
+                    live |= 1u128 << index;
+                }
+
+                Op::SET_LIST => {
+                    let list = op.a();
+                    let index = op.b();
+                    let value = op.c();
+                    live |= 1u128 << list;
+                    live |= 1u128 << index;
+                    live |= 1u128 << value;
+                }
+
+                // Already upgraded move variants - shouldn't appear in initial code
+                Op::MOVE_LAST | Op::CAR_LAST | Op::CDR_LAST | Op::CONS_MOVE => {}
+
+                _ => {}
+            }
         }
     }
 

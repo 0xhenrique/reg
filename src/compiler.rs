@@ -372,6 +372,8 @@ impl Compiler {
         compiler.compile_expr(expr, dest, true)?;
         compiler.emit(Op::ret(dest));
         compiler.chunk.num_registers = compiler.locals.len().max(1) as u8 + 16; // extra for temps
+        // Optimize move semantics using liveness analysis
+        compiler.chunk.optimize_moves();
         Ok(compiler.chunk)
     }
 
@@ -394,6 +396,8 @@ impl Compiler {
 
         compiler.emit(Op::ret(dest));
         compiler.chunk.num_registers = compiler.locals.len().max(1) as u8 + 16;
+        // Optimize move semantics using liveness analysis
+        compiler.chunk.optimize_moves();
         Ok(compiler.chunk)
     }
 
@@ -410,6 +414,8 @@ impl Compiler {
         compiler.compile_expr(body, dest, true)?;
         compiler.emit(Op::ret(dest));
         compiler.chunk.num_registers = compiler.locals.len().max(1) as u8 + 16;
+        // Note: Don't call optimize_moves() here - it's called recursively from
+        // parent chunk's optimize_moves() to ensure each proto is only optimized once
         Ok(compiler.chunk)
     }
 

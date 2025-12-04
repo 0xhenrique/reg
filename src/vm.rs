@@ -939,6 +939,65 @@ impl VM {
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = cons };
                 }
 
+                // ========== Move-semantics opcodes (liveness-optimized) ==========
+
+                Op::MOVE_LAST => {
+                    let dest = instr.a();
+                    let src = instr.b();
+                    // Take the value from src (leaving nil), avoiding Rc clone
+                    let value = unsafe { self.registers.get_unchecked_mut(base + src as usize).take() };
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = value };
+                }
+
+                Op::CAR_LAST => {
+                    let dest = instr.a();
+                    let src = instr.b();
+                    // Take the cons cell and extract car
+                    let cell = unsafe { self.registers.get_unchecked_mut(base + src as usize).take() };
+                    let result = cell.take_car()
+                        .ok_or_else(|| "car expects a list or cons cell".to_string())?;
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
+                }
+
+                Op::CDR_LAST => {
+                    let dest = instr.a();
+                    let src = instr.b();
+                    // Take the cons cell and extract cdr
+                    let cell = unsafe { self.registers.get_unchecked_mut(base + src as usize).take() };
+                    let result = cell.take_cdr()
+                        .ok_or_else(|| "cdr expects a list or cons cell".to_string())?;
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
+                }
+
+                Op::CONS_MOVE => {
+                    let dest = instr.a();
+                    let car_with_flag = instr.b();
+                    let cdr_with_flag = instr.c();
+
+                    // Extract move flags from high bit
+                    let move_car = (car_with_flag & 0x80) != 0;
+                    let move_cdr = (cdr_with_flag & 0x80) != 0;
+                    let car_reg = car_with_flag & 0x7F;
+                    let cdr_reg = cdr_with_flag & 0x7F;
+
+                    // Get car value (move or clone based on flag)
+                    let car = if move_car {
+                        unsafe { self.registers.get_unchecked_mut(base + car_reg as usize).take() }
+                    } else {
+                        unsafe { self.registers.get_unchecked(base + car_reg as usize).clone() }
+                    };
+
+                    // Get cdr value (move or clone based on flag)
+                    let cdr = if move_cdr {
+                        unsafe { self.registers.get_unchecked_mut(base + cdr_reg as usize).take() }
+                    } else {
+                        unsafe { self.registers.get_unchecked(base + cdr_reg as usize).clone() }
+                    };
+
+                    let cons = Value::cons(car, cdr);
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = cons };
+                }
+
                 _ => {
                     return Err(format!("Unknown opcode: {}", instr.opcode()));
                 }
@@ -1568,6 +1627,72 @@ mod tests {
                     acc
                     (list-sum (cdr lst) (+ acc (car lst))))))
             (list-sum (cons 1 (cons 2 (cons 3 (cons 4 (cons 5 nil))))) 0))").unwrap();
+        assert_eq!(result, Value::Int(15));
+    }
+
+    #[test]
+    fn test_move_semantics_basic() {
+        // Test that move semantics work correctly for simple cases
+        // (fn (x) x) - x is used exactly once, should use MoveLast
+        let result = vm_eval("(do (def id (fn (x) x)) (id 42))").unwrap();
+        assert_eq!(result, Value::Int(42));
+
+        // (fn (x) (+ x x)) - x is used twice, first should be Move, second MoveLast
+        let result = vm_eval("(do (def double (fn (x) (+ x x))) (double 21))").unwrap();
+        assert_eq!(result, Value::Int(42));
+
+        // Test with cons cells - move semantics for car/cdr
+        let result = vm_eval("(do (def get-car (fn (lst) (car lst))) (get-car (cons 42 nil)))").unwrap();
+        assert_eq!(result, Value::Int(42));
+
+        let result = vm_eval("(do (def get-cdr (fn (lst) (cdr lst))) (get-cdr (cons 1 (cons 2 nil))))").unwrap();
+        let cons = result.as_cons().expect("expected cons");
+        assert_eq!(cons.car.as_int(), Some(2));
+    }
+
+    #[test]
+    fn test_move_semantics_cons() {
+        // Test CONS_MOVE optimization
+        // When building lists, last-use values should be moved into cons cells
+        let result = vm_eval("(do
+            (def build-list (fn (a b c)
+                (cons a (cons b (cons c nil)))))
+            (car (build-list 1 2 3)))").unwrap();
+        assert_eq!(result, Value::Int(1));
+
+        // Verify the full list structure
+        let result = vm_eval("(do
+            (def build-list (fn (a b c)
+                (cons a (cons b (cons c nil)))))
+            (build-list 1 2 3))").unwrap();
+        let cons1 = result.as_cons().expect("expected cons");
+        assert_eq!(cons1.car.as_int(), Some(1));
+        let cons2 = cons1.cdr.as_cons().expect("expected cons");
+        assert_eq!(cons2.car.as_int(), Some(2));
+        let cons3 = cons2.cdr.as_cons().expect("expected cons");
+        assert_eq!(cons3.car.as_int(), Some(3));
+    }
+
+    #[test]
+    fn test_move_semantics_recursion() {
+        // Test move semantics in recursive functions
+        // List reversal - heavily uses car/cdr/cons
+        let result = vm_eval("(do
+            (def reverse-acc (fn (lst acc)
+                (if (nil? lst)
+                    acc
+                    (reverse-acc (cdr lst) (cons (car lst) acc)))))
+            (def reverse (fn (lst) (reverse-acc lst nil)))
+            (car (reverse (cons 1 (cons 2 (cons 3 nil))))))").unwrap();
+        assert_eq!(result, Value::Int(3));
+
+        // List sum - uses car/cdr
+        let result = vm_eval("(do
+            (def sum (fn (lst)
+                (if (nil? lst)
+                    0
+                    (+ (car lst) (sum (cdr lst))))))
+            (sum (cons 1 (cons 2 (cons 3 (cons 4 (cons 5 nil)))))))").unwrap();
         assert_eq!(result, Value::Int(15));
     }
 
