@@ -1280,6 +1280,28 @@ impl VM {
                     }
                 }
 
+                Op::JUMP_IF_LT_INT_IMM => {
+                    let src = instr.a();
+                    let imm = instr.b() as i8 as i64;
+                    let offset = instr.c() as i8;
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
+                    let x = unsafe { v.as_int_unchecked() };
+                    if x < imm {
+                        ip = (ip as isize + offset as isize) as usize;
+                    }
+                }
+
+                Op::JUMP_IF_GE_INT_IMM => {
+                    let src = instr.a();
+                    let imm = instr.b() as i8 as i64;
+                    let offset = instr.c() as i8;
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
+                    let x = unsafe { v.as_int_unchecked() };
+                    if x >= imm {
+                        ip = (ip as isize + offset as isize) as usize;
+                    }
+                }
+
                 _ => {
                     return Err(format!("Unknown opcode: {}", instr.opcode()));
                 }

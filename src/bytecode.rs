@@ -86,6 +86,8 @@ impl std::fmt::Debug for Op {
             Self::GE_INT => write!(f, "GeInt({}, {}, {})", self.a(), self.b(), self.c()),
             Self::JUMP_IF_LE_INT_IMM => write!(f, "JumpIfLeIntImm({}, {}, {})", self.a(), self.b() as i8, self.c() as i8),
             Self::JUMP_IF_GT_INT_IMM => write!(f, "JumpIfGtIntImm({}, {}, {})", self.a(), self.b() as i8, self.c() as i8),
+            Self::JUMP_IF_LT_INT_IMM => write!(f, "JumpIfLtIntImm({}, {}, {})", self.a(), self.b() as i8, self.c() as i8),
+            Self::JUMP_IF_GE_INT_IMM => write!(f, "JumpIfGeIntImm({}, {}, {})", self.a(), self.b() as i8, self.c() as i8),
             _ => write!(f, "Unknown(0x{:08x})", self.0),
         }
     }
@@ -171,6 +173,8 @@ impl Op {
     // Combined compare-and-jump for integers (most common loop pattern)
     pub const JUMP_IF_LE_INT_IMM: u8 = 64; // ABC: src, imm (i8), offset (i8) - jump if src <= imm
     pub const JUMP_IF_GT_INT_IMM: u8 = 65; // ABC: src, imm (i8), offset (i8) - jump if src > imm (for opposite)
+    pub const JUMP_IF_LT_INT_IMM: u8 = 66; // ABC: src, imm (i8), offset (i8) - jump if src < imm
+    pub const JUMP_IF_GE_INT_IMM: u8 = 67; // ABC: src, imm (i8), offset (i8) - jump if src >= imm    
 
     // ========== Constructors ==========
 
@@ -580,6 +584,16 @@ impl Op {
         Self::abc(Self::JUMP_IF_GT_INT_IMM, src, imm as u8, offset as u8)
     }
 
+    #[inline(always)]
+    pub const fn jump_if_lt_int_imm(src: Reg, imm: i8, offset: i8) -> Self {
+        Self::abc(Self::JUMP_IF_LT_INT_IMM, src, imm as u8, offset as u8)
+    }
+
+    #[inline(always)]
+    pub const fn jump_if_ge_int_imm(src: Reg, imm: i8, offset: i8) -> Self {
+        Self::abc(Self::JUMP_IF_GE_INT_IMM, src, imm as u8, offset as u8)
+    }
+
     // ========== Jump patching helpers ==========
 
     /// Check if this is a jump instruction (for patching)
@@ -593,6 +607,7 @@ impl Op {
             || op == Self::JUMP_IF_GT_IMM || op == Self::JUMP_IF_GE_IMM
             || op == Self::JUMP_IF_NIL || op == Self::JUMP_IF_NOT_NIL
             || op == Self::JUMP_IF_LE_INT_IMM || op == Self::JUMP_IF_GT_INT_IMM
+            || op == Self::JUMP_IF_LT_INT_IMM || op == Self::JUMP_IF_GE_INT_IMM            
     }
 
     /// Patch the offset of a jump instruction
@@ -602,7 +617,12 @@ impl Op {
         let a = self.a();
         let b = self.b();
         // Combined compare-and-jump use ABC format with C as 8-bit offset
-        if opcode >= Self::JUMP_IF_LT && opcode <= Self::JUMP_IF_GE_IMM {
+        if (opcode >= Self::JUMP_IF_LT && opcode <= Self::JUMP_IF_GE_IMM)
+            || opcode == Self::JUMP_IF_LE_INT_IMM
+            || opcode == Self::JUMP_IF_GT_INT_IMM
+            || opcode == Self::JUMP_IF_LT_INT_IMM
+            || opcode == Self::JUMP_IF_GE_INT_IMM
+        {            
             // For these opcodes: A=left/src, B=right/imm, C=offset (i8)
             *self = Self::abc(opcode, a, b, new_offset as i8 as u8);
         } else if opcode == Self::JUMP {
@@ -671,7 +691,8 @@ impl Chunk {
                     jump_targets[target] = true;
                 }
             } else if (opcode >= Op::JUMP_IF_LT && opcode <= Op::JUMP_IF_GE_IMM)
-                || opcode == Op::JUMP_IF_LE_INT_IMM || opcode == Op::JUMP_IF_GT_INT_IMM {
+                || opcode == Op::JUMP_IF_LE_INT_IMM || opcode == Op::JUMP_IF_GT_INT_IMM
+                || opcode == Op::JUMP_IF_LT_INT_IMM || opcode == Op::JUMP_IF_GE_INT_IMM {
                 // These use i8 offset in C byte
                 let offset = op.c() as i8 as isize;
                 let target = (i as isize + 1 + offset) as usize;
@@ -720,7 +741,8 @@ impl Chunk {
                 }
                 Op::JUMP_IF_LT_IMM | Op::JUMP_IF_LE_IMM |
                 Op::JUMP_IF_GT_IMM | Op::JUMP_IF_GE_IMM |
-                Op::JUMP_IF_LE_INT_IMM | Op::JUMP_IF_GT_INT_IMM => {
+                Op::JUMP_IF_LE_INT_IMM | Op::JUMP_IF_GT_INT_IMM |
+                Op::JUMP_IF_LT_INT_IMM | Op::JUMP_IF_GE_INT_IMM => {                    
                     ever_live |= 1u128 << op.a();
                 }
                 _ => {}
@@ -869,7 +891,8 @@ impl Chunk {
 
                 Op::JUMP_IF_LT_IMM | Op::JUMP_IF_LE_IMM |
                 Op::JUMP_IF_GT_IMM | Op::JUMP_IF_GE_IMM |
-                Op::JUMP_IF_LE_INT_IMM | Op::JUMP_IF_GT_INT_IMM => {
+                Op::JUMP_IF_LE_INT_IMM | Op::JUMP_IF_GT_INT_IMM |
+                Op::JUMP_IF_LT_INT_IMM | Op::JUMP_IF_GE_INT_IMM => {                
                     let src = op.a();
                     live |= 1u128 << src;
                 }

@@ -540,21 +540,15 @@ impl Compiler {
         }
 
         // Parameters occupy the first registers
-        // For loop-optimized functions (self-recursive), assume numeric parameters are integers
-        // This is a technique that enables integer-specialized opcodes for common patterns
-        // like sum(n, acc) where n and acc are typically integers.
-        let is_loop_optimized = name.is_some();
+        // Note: We don't assume parameter types because:
+        // >self-recursive functions may not be tail-recursive
+        // >even tail-recursive functions might be called with different types
+        // Integer-specialized opcodes will still fire for integer literals and
+        // results of integer operations, which covers most hot paths
         for param in params {
             compiler.locals.push(param.clone());
-            // For loop-optimized functions, assume parameters are Int
-            // This enables integer-specialized opcodes in the hot loop
-            if is_loop_optimized {
-                compiler.reg_types.push(StaticType::Int);
-                compiler.param_types.push(StaticType::Int);
-            } else {
-                compiler.reg_types.push(StaticType::Unknown);
-                compiler.param_types.push(StaticType::Unknown);
-            }
+            compiler.reg_types.push(StaticType::Unknown);
+            compiler.param_types.push(StaticType::Unknown);
         }
 
         let dest = compiler.alloc_reg();
@@ -789,6 +783,9 @@ impl Compiler {
     /// - `<=` → JumpIfGt (jump if a > b)
     /// - `>`  → JumpIfLe (jump if a <= b)
     /// - `>=` → JumpIfLt (jump if a < b)
+    ///
+    /// When the left operand is known to be an integer, we use integer-specialized
+    /// opcodes that skip type checking (faster in tight loops).    
     fn try_compile_compare_jump(&mut self, cond: &Value, dest: Reg) -> Result<Option<usize>, String> {
         let items = match cond.as_list() {
             Some(items) if items.len() == 3 => items,
@@ -803,6 +800,10 @@ impl Compiler {
         let left = &items[1];
         let right = &items[2];
 
+        // Infer type of left operand to determine if we can use integer-specialized opcodes
+        let left_type = self.infer_type(left);
+        let use_int_opcodes = left_type == StaticType::Int;
+
         // Check for immediate optimization: (< x 0), (<= n 10), etc.
         if let Some(imm) = right.as_int() {
             if imm >= i8::MIN as i64 && imm <= i8::MAX as i64 {
@@ -811,12 +812,22 @@ impl Compiler {
 
                 // Emit combined compare-jump with OPPOSITE comparison
                 // placeholder offset 0, will be patched later
-                let jump_pos = match op {
-                    "<"  => self.emit(Op::jump_if_ge_imm(dest, imm as i8, 0)),
-                    "<=" => self.emit(Op::jump_if_gt_imm(dest, imm as i8, 0)),
-                    ">"  => self.emit(Op::jump_if_le_imm(dest, imm as i8, 0)),
-                    ">=" => self.emit(Op::jump_if_lt_imm(dest, imm as i8, 0)),
-                    _ => unreachable!(),
+                let jump_pos = if use_int_opcodes {
+                    match op {
+                        "<"  => self.emit(Op::jump_if_ge_int_imm(dest, imm as i8, 0)),
+                        "<=" => self.emit(Op::jump_if_gt_int_imm(dest, imm as i8, 0)),
+                        ">"  => self.emit(Op::jump_if_le_int_imm(dest, imm as i8, 0)),
+                        ">=" => self.emit(Op::jump_if_lt_int_imm(dest, imm as i8, 0)),
+                        _ => unreachable!(),
+                    }
+                } else {
+                    match op {
+                        "<"  => self.emit(Op::jump_if_ge_imm(dest, imm as i8, 0)),
+                        "<=" => self.emit(Op::jump_if_gt_imm(dest, imm as i8, 0)),
+                        ">"  => self.emit(Op::jump_if_le_imm(dest, imm as i8, 0)),
+                        ">=" => self.emit(Op::jump_if_lt_imm(dest, imm as i8, 0)),
+                        _ => unreachable!(),
+                    }
                 };
                 return Ok(Some(jump_pos));
             }
