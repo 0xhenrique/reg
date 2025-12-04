@@ -48,6 +48,11 @@ pub struct VM {
     // Cache for global lookups: SymbolKey -> Value
     // Uses pointer-based hashing for O(1) lookup instead of string hashing
     global_cache: HashMap<SymbolKey, Value>,
+    // Inline caches for function calls - store typed function pointers directly
+    // This eliminates the as_compiled_function()/as_native_function() type checks
+    compiled_fn_cache: HashMap<SymbolKey, Rc<Chunk>>,
+    // For native functions, we only need the function pointer
+    native_fn_cache: HashMap<SymbolKey, fn(&[Value]) -> Result<Value, String>>,
 }
 
 impl VM {
@@ -57,6 +62,8 @@ impl VM {
             frames: Vec::with_capacity(MAX_FRAMES),
             globals: Rc::new(RefCell::new(HashMap::new())),
             global_cache: HashMap::new(),
+            compiled_fn_cache: HashMap::new(),
+            native_fn_cache: HashMap::new(),
         }
     }
 
@@ -66,6 +73,8 @@ impl VM {
             frames: Vec::with_capacity(MAX_FRAMES),
             globals,
             global_cache: HashMap::new(),
+            compiled_fn_cache: HashMap::new(),
+            native_fn_cache: HashMap::new(),
         }
     }
 
@@ -81,6 +90,21 @@ impl VM {
         }
         // Update cache using interned symbol key for O(1) lookup
         let key = SymbolKey(intern_symbol(name));
+
+        // Populate inline caches for functions - this allows us to skip
+        // the type check in CALL_GLOBAL/TAIL_CALL_GLOBAL
+        if let Some(cf) = value.as_compiled_function() {
+            self.compiled_fn_cache.insert(key.clone(), cf.clone());
+            self.native_fn_cache.remove(&key);
+        } else if let Some(nf) = value.as_native_function() {
+            self.native_fn_cache.insert(key.clone(), nf.func);
+            self.compiled_fn_cache.remove(&key);
+        } else {
+            // Not a function, clear both inline caches
+            self.compiled_fn_cache.remove(&key);
+            self.native_fn_cache.remove(&key);
+        }
+
         self.global_cache.insert(key, value);
     }
 
@@ -190,6 +214,19 @@ impl VM {
                         }
                     }
                     let key = SymbolKey(symbol_rc);
+
+                    // Update inline caches on global redefinition
+                    if let Some(cf) = value.as_compiled_function() {
+                        self.compiled_fn_cache.insert(key.clone(), cf.clone());
+                        self.native_fn_cache.remove(&key);
+                    } else if let Some(nf) = value.as_native_function() {
+                        self.native_fn_cache.insert(key.clone(), nf.func);
+                        self.compiled_fn_cache.remove(&key);
+                    } else {
+                        self.compiled_fn_cache.remove(&key);
+                        self.native_fn_cache.remove(&key);
+                    }
+
                     self.global_cache.insert(key, value);
                 }
 
@@ -348,19 +385,9 @@ impl VM {
                         .ok_or("CallGlobal: expected symbol")?;
                     let key = SymbolKey(symbol_rc);
 
-                    // Use entry API to avoid double HashMap lookup on cache miss
-                    use std::collections::hash_map::Entry;
-                    let func_value = match self.global_cache.entry(key) {
-                        Entry::Occupied(e) => e.into_mut(),
-                        Entry::Vacant(e) => {
-                            let name = &*e.key().0;
-                            let v = self.globals.borrow().get(name).cloned()
-                                .ok_or_else(|| format!("Undefined function: {}", name))?;
-                            e.insert(v)
-                        }
-                    };
-
-                    if let Some(cf) = func_value.as_compiled_function() {
+                    // INLINE CACHE: Check typed caches first (no type check needed)
+                    if let Some(cf) = self.compiled_fn_cache.get(&key) {
+                        // Fast path: compiled function from inline cache
                         if cf.num_params != nargs {
                             return Err(format!(
                                 "Expected {} arguments, got {}",
@@ -401,15 +428,79 @@ impl VM {
                         constants_ptr = frame.chunk.constants.as_ptr();
                         ip = 0;
                         base = new_base;
-                    } else if let Some(nf) = func_value.as_native_function() {
-                        let func_ptr = nf.func;
+                    } else if let Some(&func_ptr) = self.native_fn_cache.get(&key) {
+                        // Fast path: native function from inline cache
                         let arg_start = base + dest as usize + 1;
                         let arg_end = arg_start + nargs as usize;
-                        // Native function calls need slice - keep safe access for now
                         let result = func_ptr(&self.registers[arg_start..arg_end])?;
                         unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
                     } else {
-                        return Err(format!("Not a function: {}", func_value));
+                        // Slow path: fall back to global cache with type check
+                        use std::collections::hash_map::Entry;
+                        let func_value = match self.global_cache.entry(key.clone()) {
+                            Entry::Occupied(e) => e.into_mut(),
+                            Entry::Vacant(e) => {
+                                let name = &*e.key().0;
+                                let v = self.globals.borrow().get(name).cloned()
+                                    .ok_or_else(|| format!("Undefined function: {}", name))?;
+                                e.insert(v)
+                            }
+                        };
+
+                        if let Some(cf) = func_value.as_compiled_function() {
+                            // Populate inline cache for next time
+                            self.compiled_fn_cache.insert(key, cf.clone());
+
+                            if cf.num_params != nargs {
+                                return Err(format!(
+                                    "Expected {} arguments, got {}",
+                                    cf.num_params, nargs
+                                ));
+                            }
+
+                            let num_registers = frame.chunk.num_registers;
+                            let new_base = base + num_registers as usize;
+
+                            if new_base + cf.num_registers as usize > MAX_REGISTERS {
+                                return Err("Stack overflow".to_string());
+                            }
+
+                            unsafe { self.frames.last_mut().unwrap_unchecked() }.ip = ip;
+
+                            let cf_chunk = cf.clone();
+
+                            let arg_start = base + dest as usize + 1;
+                            for i in 0..nargs as usize {
+                                unsafe {
+                                    *self.registers.get_unchecked_mut(new_base + i) =
+                                        self.registers.get_unchecked(arg_start + i).clone();
+                                }
+                            }
+
+                            self.frames.push(CallFrame {
+                                chunk: cf_chunk,
+                                ip: 0,
+                                base: new_base,
+                                return_reg: base + dest as usize,
+                            });
+
+                            let frame = unsafe { self.frames.last().unwrap_unchecked() };
+                            code_ptr = frame.chunk.code.as_ptr();
+                            constants_ptr = frame.chunk.constants.as_ptr();
+                            ip = 0;
+                            base = new_base;
+                        } else if let Some(nf) = func_value.as_native_function() {
+                            // Populate inline cache for next time
+                            self.native_fn_cache.insert(key, nf.func);
+
+                            let func_ptr = nf.func;
+                            let arg_start = base + dest as usize + 1;
+                            let arg_end = arg_start + nargs as usize;
+                            let result = func_ptr(&self.registers[arg_start..arg_end])?;
+                            unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
+                        } else {
+                            return Err(format!("Not a function: {}", func_value));
+                        }
                     }
                 }
 
@@ -423,19 +514,9 @@ impl VM {
                         .ok_or("TailCallGlobal: expected symbol")?;
                     let key = SymbolKey(symbol_rc);
 
-                    // Use entry API to avoid double HashMap lookup on cache miss
-                    use std::collections::hash_map::Entry;
-                    let func_value = match self.global_cache.entry(key) {
-                        Entry::Occupied(e) => e.into_mut(),
-                        Entry::Vacant(e) => {
-                            let name = &*e.key().0;
-                            let v = self.globals.borrow().get(name).cloned()
-                                .ok_or_else(|| format!("Undefined function: {}", name))?;
-                            e.insert(v)
-                        }
-                    };
-
-                    if let Some(cf) = func_value.as_compiled_function() {
+                    // INLINE CACHE: Check typed caches first (no type check needed)
+                    if let Some(cf) = self.compiled_fn_cache.get(&key) {
+                        // Fast path: compiled function from inline cache
                         if cf.num_params != nargs {
                             return Err(format!(
                                 "Expected {} arguments, got {}",
@@ -458,12 +539,11 @@ impl VM {
                             }
                         }
                         ip = 0;
-                    } else if let Some(nf) = func_value.as_native_function() {
-                        let func_ptr = nf.func;
+                    } else if let Some(&func_ptr) = self.native_fn_cache.get(&key) {
+                        // Fast path: native function from inline cache
                         let return_reg = unsafe { self.frames.last().unwrap_unchecked() }.return_reg;
                         let src_start = base + first_arg as usize;
                         let src_end = src_start + nargs as usize;
-                        // Native function calls need slice - keep safe access for now
                         let result = func_ptr(&self.registers[src_start..src_end])?;
                         self.frames.pop();
                         if self.frames.is_empty() {
@@ -478,7 +558,68 @@ impl VM {
                         ip = frame.ip;
                         base = frame.base;
                     } else {
-                        return Err(format!("Not a function: {}", func_value));
+                        // Slow path: fall back to global cache with type check
+                        use std::collections::hash_map::Entry;
+                        let func_value = match self.global_cache.entry(key.clone()) {
+                            Entry::Occupied(e) => e.into_mut(),
+                            Entry::Vacant(e) => {
+                                let name = &*e.key().0;
+                                let v = self.globals.borrow().get(name).cloned()
+                                    .ok_or_else(|| format!("Undefined function: {}", name))?;
+                                e.insert(v)
+                            }
+                        };
+
+                        if let Some(cf) = func_value.as_compiled_function() {
+                            // Populate inline cache for next time
+                            self.compiled_fn_cache.insert(key, cf.clone());
+
+                            if cf.num_params != nargs {
+                                return Err(format!(
+                                    "Expected {} arguments, got {}",
+                                    cf.num_params, nargs
+                                ));
+                            }
+
+                            let frame = unsafe { self.frames.last_mut().unwrap_unchecked() };
+                            if !Rc::ptr_eq(&frame.chunk, cf) {
+                                frame.chunk = cf.clone();
+                                code_ptr = frame.chunk.code.as_ptr();
+                                constants_ptr = frame.chunk.constants.as_ptr();
+                            }
+
+                            let src_start = base + first_arg as usize;
+                            for i in 0..nargs as usize {
+                                unsafe {
+                                    *self.registers.get_unchecked_mut(base + i) =
+                                        self.registers.get_unchecked(src_start + i).clone();
+                                }
+                            }
+                            ip = 0;
+                        } else if let Some(nf) = func_value.as_native_function() {
+                            // Populate inline cache for next time
+                            self.native_fn_cache.insert(key, nf.func);
+
+                            let func_ptr = nf.func;
+                            let return_reg = unsafe { self.frames.last().unwrap_unchecked() }.return_reg;
+                            let src_start = base + first_arg as usize;
+                            let src_end = src_start + nargs as usize;
+                            let result = func_ptr(&self.registers[src_start..src_end])?;
+                            self.frames.pop();
+                            if self.frames.is_empty() {
+                                return Ok(result);
+                            }
+                            unsafe { *self.registers.get_unchecked_mut(return_reg) = result };
+
+                            // Update cached frame values
+                            let frame = unsafe { self.frames.last().unwrap_unchecked() };
+                            code_ptr = frame.chunk.code.as_ptr();
+                            constants_ptr = frame.chunk.constants.as_ptr();
+                            ip = frame.ip;
+                            base = frame.base;
+                        } else {
+                            return Err(format!("Not a function: {}", func_value));
+                        }
                     }
                 }
 
