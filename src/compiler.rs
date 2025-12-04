@@ -2,6 +2,15 @@ use crate::bytecode::{Chunk, ConstIdx, Op, Reg};
 use crate::value::Value;
 use std::collections::HashMap;
 
+/// Static type information for type-specialized code generation
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StaticType {
+    Unknown,
+    Int,
+    Float,
+    Bool,
+}
+
 /// A function definition (for compile-time evaluation and inlining)
 #[derive(Clone)]
 struct FunctionDef {
@@ -56,6 +65,8 @@ impl InlineCandidates {
 pub struct Compiler {
     chunk: Chunk,
     locals: Vec<String>,
+    /// Static type information for each register (for type-specialized opcodes)
+    reg_types: Vec<StaticType>,
     scope_depth: usize,
     pure_fns: PureFunctions,
     inline_candidates: InlineCandidates,
@@ -65,6 +76,8 @@ pub struct Compiler {
     self_arity: usize,
     /// Stack of functions currently being inlined (for mutual recursion detection)
     inline_stack: Vec<String>,
+    /// Parameter types (for type specialization in recursive functions)
+    param_types: Vec<StaticType>,
 }
 
 /// Check if an expression is pure (no side effects)
@@ -464,12 +477,14 @@ impl Compiler {
         Compiler {
             chunk: Chunk::new(),
             locals: Vec::new(),
+            reg_types: Vec::new(),
             scope_depth: 0,
             pure_fns: PureFunctions::new(),
             inline_candidates: InlineCandidates::new(),
             self_name: None,
             self_arity: 0,
             inline_stack: Vec::new(),
+            param_types: Vec::new(),
         }
     }
 
@@ -525,8 +540,21 @@ impl Compiler {
         }
 
         // Parameters occupy the first registers
+        // For loop-optimized functions (self-recursive), assume numeric parameters are integers.
+        // This is a heuristic that enables integer-specialized opcodes for common patterns
+        // like sum(n, acc) where n and acc are typically integers.
+        let is_loop_optimized = name.is_some();
         for param in params {
             compiler.locals.push(param.clone());
+            // For loop-optimized functions, assume parameters are Int
+            // This enables integer-specialized opcodes in the hot loop
+            if is_loop_optimized {
+                compiler.reg_types.push(StaticType::Int);
+                compiler.param_types.push(StaticType::Int);
+            } else {
+                compiler.reg_types.push(StaticType::Unknown);
+                compiler.param_types.push(StaticType::Unknown);
+            }
         }
 
         let dest = compiler.alloc_reg();
@@ -541,13 +569,70 @@ impl Compiler {
     fn alloc_reg(&mut self) -> Reg {
         let reg = self.locals.len() as Reg;
         self.locals.push(String::new()); // placeholder
+        self.reg_types.push(StaticType::Unknown);
         reg
     }
 
     fn free_reg(&mut self) {
         if !self.locals.is_empty() && self.locals.last().map(|s| s.is_empty()).unwrap_or(false) {
             self.locals.pop();
+            self.reg_types.pop();
         }
+    }
+
+    /// Set the known static type for a register
+    fn set_reg_type(&mut self, reg: Reg, typ: StaticType) {
+        if (reg as usize) < self.reg_types.len() {
+            self.reg_types[reg as usize] = typ;
+        }
+    }
+
+    /// Get the known static type for a register
+    fn get_reg_type(&self, reg: Reg) -> StaticType {
+        self.reg_types.get(reg as usize).copied().unwrap_or(StaticType::Unknown)
+    }
+
+    /// Infer the static type of an expression without compiling it
+    fn infer_type(&self, expr: &Value) -> StaticType {
+        // Integer literals are Int
+        if expr.is_int() {
+            return StaticType::Int;
+        }
+        // Float literals are Float
+        if expr.is_float() {
+            return StaticType::Float;
+        }
+        // Bool literals are Bool
+        if expr.is_bool() {
+            return StaticType::Bool;
+        }
+        // Variables: check if it's a parameter with known type
+        if let Some(name) = expr.as_symbol() {
+            if let Some(reg) = self.resolve_local(name) {
+                return self.get_reg_type(reg);
+            }
+        }
+        // Arithmetic operations on ints produce ints (+ - * mod)
+        if let Some(items) = expr.as_list() {
+            if !items.is_empty() {
+                if let Some(op) = items[0].as_symbol() {
+                    match op {
+                        "+" | "-" | "*" | "mod" => {
+                            // If all operands are Int, result is Int
+                            let all_int = items[1..].iter().all(|e| self.infer_type(e) == StaticType::Int);
+                            if all_int {
+                                return StaticType::Int;
+                            }
+                        }
+                        "<" | "<=" | ">" | ">=" | "=" | "!=" | "not" => {
+                            return StaticType::Bool;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        StaticType::Unknown
     }
 
     fn emit(&mut self, op: Op) -> usize {
@@ -576,7 +661,16 @@ impl Compiler {
             } else {
                 self.emit(Op::load_false(dest));
             }
-        } else if expr.is_int() || expr.is_float() || expr.as_string().is_some() {
+            self.set_reg_type(dest, StaticType::Bool);
+        } else if expr.is_int() {
+            let idx = self.add_constant(expr.clone());
+            self.emit(Op::load_const(dest, idx));
+            self.set_reg_type(dest, StaticType::Int);
+        } else if expr.is_float() {
+            let idx = self.add_constant(expr.clone());
+            self.emit(Op::load_const(dest, idx));
+            self.set_reg_type(dest, StaticType::Float);
+        } else if expr.as_string().is_some() {
             let idx = self.add_constant(expr.clone());
             self.emit(Op::load_const(dest, idx));
         } else if let Some(name) = expr.as_symbol() {
@@ -584,6 +678,8 @@ impl Compiler {
                 if reg != dest {
                     self.emit(Op::mov(dest, reg));
                 }
+                // Propagate the type from source register
+                self.set_reg_type(dest, self.get_reg_type(reg));
             } else {
                 let idx = self.add_constant(Value::symbol(name));
                 self.emit(Op::get_global(dest, idx));
@@ -962,6 +1058,11 @@ impl Compiler {
     fn try_compile_binary_op(&mut self, op: &str, args: &[Value], dest: Reg) -> Result<Option<bool>, String> {
         // Binary arithmetic/comparison operators
         if args.len() == 2 {
+            // Check if both operands are known integers for type-specialized opcodes
+            let left_type = self.infer_type(&args[0]);
+            let right_type = self.infer_type(&args[1]);
+            let both_int = left_type == StaticType::Int && right_type == StaticType::Int;
+
             // Check for immediate value optimization (+ n 1) or (- n 1)
             // Only applies to + and - where one operand is a small constant
             if op == "+" || op == "-" {
@@ -970,10 +1071,20 @@ impl Compiler {
                     if imm >= i8::MIN as i64 && imm <= i8::MAX as i64 {
                         // Optimization: compile first arg directly into dest
                         self.compile_expr(&args[0], dest, false)?;
-                        if op == "+" {
-                            self.emit(Op::add_imm(dest, dest, imm as i8));
+                        // Use integer-specialized opcodes if first operand is known int
+                        if left_type == StaticType::Int {
+                            if op == "+" {
+                                self.emit(Op::add_int_imm(dest, dest, imm as i8));
+                            } else {
+                                self.emit(Op::sub_int_imm(dest, dest, imm as i8));
+                            }
+                            self.set_reg_type(dest, StaticType::Int);
                         } else {
-                            self.emit(Op::sub_imm(dest, dest, imm as i8));
+                            if op == "+" {
+                                self.emit(Op::add_imm(dest, dest, imm as i8));
+                            } else {
+                                self.emit(Op::sub_imm(dest, dest, imm as i8));
+                            }
                         }
                         return Ok(Some(true));
                     }
@@ -984,7 +1095,13 @@ impl Compiler {
                         if imm >= i8::MIN as i64 && imm <= i8::MAX as i64 {
                             // Optimization: compile second arg directly into dest
                             self.compile_expr(&args[1], dest, false)?;
-                            self.emit(Op::add_imm(dest, dest, imm as i8));
+                            // Use integer-specialized opcode if second operand is known int
+                            if right_type == StaticType::Int {
+                                self.emit(Op::add_int_imm(dest, dest, imm as i8));
+                                self.set_reg_type(dest, StaticType::Int);
+                            } else {
+                                self.emit(Op::add_imm(dest, dest, imm as i8));
+                            }
                             return Ok(Some(true));
                         }
                     }
@@ -1005,11 +1122,47 @@ impl Compiler {
                             ">=" => self.emit(Op::ge_imm(dest, dest, imm as i8)),
                             _ => unreachable!(),
                         };
+                        self.set_reg_type(dest, StaticType::Bool);
                         return Ok(Some(true));
                     }
                 }
             }
 
+            // Integer-specialized register-register operations
+            if both_int {
+                let make_int_op: Option<fn(Reg, Reg, Reg) -> Op> = match op {
+                    "+" => Some(Op::add_int),
+                    "-" => Some(Op::sub_int),
+                    "*" => Some(Op::mul_int),
+                    "<" => Some(Op::lt_int),
+                    "<=" => Some(Op::le_int),
+                    ">" => Some(Op::gt_int),
+                    ">=" => Some(Op::ge_int),
+                    _ => None,
+                };
+
+                if let Some(make_op) = make_int_op {
+                    // Compile operands
+                    self.compile_expr(&args[0], dest, false)?;
+                    let b_reg = self.alloc_reg();
+                    self.compile_expr(&args[1], b_reg, false)?;
+
+                    // Emit the integer-specialized operation
+                    self.emit(make_op(dest, dest, b_reg));
+
+                    // Set result type
+                    match op {
+                        "+" | "-" | "*" => self.set_reg_type(dest, StaticType::Int),
+                        "<" | "<=" | ">" | ">=" => self.set_reg_type(dest, StaticType::Bool),
+                        _ => {}
+                    }
+
+                    self.free_reg();
+                    return Ok(Some(true));
+                }
+            }
+
+            // Generic binary operations (fallback for unknown types)
             let make_binary_op: Option<fn(Reg, Reg, Reg) -> Op> = match op {
                 "+" => Some(Op::add),
                 "-" => Some(Op::sub),
@@ -1047,6 +1200,7 @@ impl Compiler {
                 // Optimization: compile arg directly into dest
                 self.compile_expr(&args[0], dest, false)?;
                 self.emit(Op::not(dest, dest));
+                self.set_reg_type(dest, StaticType::Bool);
                 return Ok(Some(true));
             }
 

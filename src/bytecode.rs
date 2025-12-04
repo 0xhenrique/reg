@@ -75,6 +75,17 @@ impl std::fmt::Debug for Op {
             Self::CAR_LAST => write!(f, "CarLast({}, {})", self.a(), self.b()),
             Self::CDR_LAST => write!(f, "CdrLast({}, {})", self.a(), self.b()),
             Self::CONS_MOVE => write!(f, "ConsMove({}, {}, {})", self.a(), self.b(), self.c()),
+            Self::ADD_INT => write!(f, "AddInt({}, {}, {})", self.a(), self.b(), self.c()),
+            Self::SUB_INT => write!(f, "SubInt({}, {}, {})", self.a(), self.b(), self.c()),
+            Self::MUL_INT => write!(f, "MulInt({}, {}, {})", self.a(), self.b(), self.c()),
+            Self::ADD_INT_IMM => write!(f, "AddIntImm({}, {}, {})", self.a(), self.b(), self.c() as i8),
+            Self::SUB_INT_IMM => write!(f, "SubIntImm({}, {}, {})", self.a(), self.b(), self.c() as i8),
+            Self::LT_INT => write!(f, "LtInt({}, {}, {})", self.a(), self.b(), self.c()),
+            Self::LE_INT => write!(f, "LeInt({}, {}, {})", self.a(), self.b(), self.c()),
+            Self::GT_INT => write!(f, "GtInt({}, {}, {})", self.a(), self.b(), self.c()),
+            Self::GE_INT => write!(f, "GeInt({}, {}, {})", self.a(), self.b(), self.c()),
+            Self::JUMP_IF_LE_INT_IMM => write!(f, "JumpIfLeIntImm({}, {}, {})", self.a(), self.b() as i8, self.c() as i8),
+            Self::JUMP_IF_GT_INT_IMM => write!(f, "JumpIfGtIntImm({}, {}, {})", self.a(), self.b() as i8, self.c() as i8),
             _ => write!(f, "Unknown(0x{:08x})", self.0),
         }
     }
@@ -145,6 +156,21 @@ impl Op {
     // For CONS, we use high bit of car/cdr registers to indicate move
     // If B & 0x80, move from car register (B & 0x7F); if C & 0x80, move from cdr register (C & 0x7F)
     pub const CONS_MOVE: u8 = 54;      // ABC: dest, car|0x80?, cdr|0x80? - cons with optional moves
+
+    // Unboxed integer opcodes - skip type checking for known integer operands
+    // These are emitted when the compiler can prove both operands are integers
+    pub const ADD_INT: u8 = 55;        // ABC: dest, left, right - integer add (no type check)
+    pub const SUB_INT: u8 = 56;        // ABC: dest, left, right - integer sub (no type check)
+    pub const MUL_INT: u8 = 57;        // ABC: dest, left, right - integer mul (no type check)
+    pub const ADD_INT_IMM: u8 = 58;    // ABC: dest, src, imm (C is i8) - integer add immediate
+    pub const SUB_INT_IMM: u8 = 59;    // ABC: dest, src, imm (C is i8) - integer sub immediate
+    pub const LT_INT: u8 = 60;         // ABC: dest, left, right - integer less than
+    pub const LE_INT: u8 = 61;         // ABC: dest, left, right - integer less or equal
+    pub const GT_INT: u8 = 62;         // ABC: dest, left, right - integer greater than
+    pub const GE_INT: u8 = 63;         // ABC: dest, left, right - integer greater or equal
+    // Combined compare-and-jump for integers (most common loop pattern)
+    pub const JUMP_IF_LE_INT_IMM: u8 = 64; // ABC: src, imm (i8), offset (i8) - jump if src <= imm
+    pub const JUMP_IF_GT_INT_IMM: u8 = 65; // ABC: src, imm (i8), offset (i8) - jump if src > imm (for opposite)
 
     // ========== Constructors ==========
 
@@ -497,6 +523,63 @@ impl Op {
         Self::abc(Self::CONS_MOVE, dest, car_with_flag, cdr_with_flag)
     }
 
+    // ========== Unboxed integer opcodes ==========
+
+    #[inline(always)]
+    pub const fn add_int(dest: Reg, left: Reg, right: Reg) -> Self {
+        Self::abc(Self::ADD_INT, dest, left, right)
+    }
+
+    #[inline(always)]
+    pub const fn sub_int(dest: Reg, left: Reg, right: Reg) -> Self {
+        Self::abc(Self::SUB_INT, dest, left, right)
+    }
+
+    #[inline(always)]
+    pub const fn mul_int(dest: Reg, left: Reg, right: Reg) -> Self {
+        Self::abc(Self::MUL_INT, dest, left, right)
+    }
+
+    #[inline(always)]
+    pub const fn add_int_imm(dest: Reg, src: Reg, imm: i8) -> Self {
+        Self::abc(Self::ADD_INT_IMM, dest, src, imm as u8)
+    }
+
+    #[inline(always)]
+    pub const fn sub_int_imm(dest: Reg, src: Reg, imm: i8) -> Self {
+        Self::abc(Self::SUB_INT_IMM, dest, src, imm as u8)
+    }
+
+    #[inline(always)]
+    pub const fn lt_int(dest: Reg, left: Reg, right: Reg) -> Self {
+        Self::abc(Self::LT_INT, dest, left, right)
+    }
+
+    #[inline(always)]
+    pub const fn le_int(dest: Reg, left: Reg, right: Reg) -> Self {
+        Self::abc(Self::LE_INT, dest, left, right)
+    }
+
+    #[inline(always)]
+    pub const fn gt_int(dest: Reg, left: Reg, right: Reg) -> Self {
+        Self::abc(Self::GT_INT, dest, left, right)
+    }
+
+    #[inline(always)]
+    pub const fn ge_int(dest: Reg, left: Reg, right: Reg) -> Self {
+        Self::abc(Self::GE_INT, dest, left, right)
+    }
+
+    #[inline(always)]
+    pub const fn jump_if_le_int_imm(src: Reg, imm: i8, offset: i8) -> Self {
+        Self::abc(Self::JUMP_IF_LE_INT_IMM, src, imm as u8, offset as u8)
+    }
+
+    #[inline(always)]
+    pub const fn jump_if_gt_int_imm(src: Reg, imm: i8, offset: i8) -> Self {
+        Self::abc(Self::JUMP_IF_GT_INT_IMM, src, imm as u8, offset as u8)
+    }
+
     // ========== Jump patching helpers ==========
 
     /// Check if this is a jump instruction (for patching)
@@ -509,6 +592,7 @@ impl Op {
             || op == Self::JUMP_IF_LT_IMM || op == Self::JUMP_IF_LE_IMM
             || op == Self::JUMP_IF_GT_IMM || op == Self::JUMP_IF_GE_IMM
             || op == Self::JUMP_IF_NIL || op == Self::JUMP_IF_NOT_NIL
+            || op == Self::JUMP_IF_LE_INT_IMM || op == Self::JUMP_IF_GT_INT_IMM
     }
 
     /// Patch the offset of a jump instruction
@@ -586,7 +670,8 @@ impl Chunk {
                 if target < self.code.len() {
                     jump_targets[target] = true;
                 }
-            } else if opcode >= Op::JUMP_IF_LT && opcode <= Op::JUMP_IF_GE_IMM {
+            } else if (opcode >= Op::JUMP_IF_LT && opcode <= Op::JUMP_IF_GE_IMM)
+                || opcode == Op::JUMP_IF_LE_INT_IMM || opcode == Op::JUMP_IF_GT_INT_IMM {
                 // These use i8 offset in C byte
                 let offset = op.c() as i8 as isize;
                 let target = (i as isize + 1 + offset) as usize;
@@ -613,8 +698,14 @@ impl Chunk {
                     ever_live |= 1u128 << op.c();
                 }
                 Op::ADD_IMM | Op::SUB_IMM |
-                Op::LT_IMM | Op::LE_IMM | Op::GT_IMM | Op::GE_IMM => {
+                Op::LT_IMM | Op::LE_IMM | Op::GT_IMM | Op::GE_IMM |
+                Op::ADD_INT_IMM | Op::SUB_INT_IMM => {
                     ever_live |= 1u128 << op.b();
+                }
+                Op::ADD_INT | Op::SUB_INT | Op::MUL_INT |
+                Op::LT_INT | Op::LE_INT | Op::GT_INT | Op::GE_INT => {
+                    ever_live |= 1u128 << op.b();
+                    ever_live |= 1u128 << op.c();
                 }
                 Op::SET_GLOBAL | Op::RETURN => {
                     ever_live |= 1u128 << op.a();
@@ -628,7 +719,8 @@ impl Chunk {
                     ever_live |= 1u128 << op.b();
                 }
                 Op::JUMP_IF_LT_IMM | Op::JUMP_IF_LE_IMM |
-                Op::JUMP_IF_GT_IMM | Op::JUMP_IF_GE_IMM => {
+                Op::JUMP_IF_GT_IMM | Op::JUMP_IF_GE_IMM |
+                Op::JUMP_IF_LE_INT_IMM | Op::JUMP_IF_GT_INT_IMM => {
                     ever_live |= 1u128 << op.a();
                 }
                 _ => {}
@@ -717,7 +809,9 @@ impl Chunk {
                 // ===== ABC-format arithmetic/comparison (read B, C; write A) =====
 
                 Op::ADD | Op::SUB | Op::MUL | Op::DIV | Op::MOD |
-                Op::LT | Op::LE | Op::GT | Op::GE | Op::EQ | Op::NE => {
+                Op::LT | Op::LE | Op::GT | Op::GE | Op::EQ | Op::NE |
+                Op::ADD_INT | Op::SUB_INT | Op::MUL_INT |
+                Op::LT_INT | Op::LE_INT | Op::GT_INT | Op::GE_INT => {
                     let dest = op.a();
                     let b = op.b();
                     let c = op.c();
@@ -729,7 +823,8 @@ impl Chunk {
                 // ===== Immediate variants (read B only) =====
 
                 Op::ADD_IMM | Op::SUB_IMM |
-                Op::LT_IMM | Op::LE_IMM | Op::GT_IMM | Op::GE_IMM => {
+                Op::LT_IMM | Op::LE_IMM | Op::GT_IMM | Op::GE_IMM |
+                Op::ADD_INT_IMM | Op::SUB_INT_IMM => {
                     let dest = op.a();
                     let src = op.b();
                     live &= !(1u128 << dest);
@@ -773,7 +868,8 @@ impl Chunk {
                 }
 
                 Op::JUMP_IF_LT_IMM | Op::JUMP_IF_LE_IMM |
-                Op::JUMP_IF_GT_IMM | Op::JUMP_IF_GE_IMM => {
+                Op::JUMP_IF_GT_IMM | Op::JUMP_IF_GE_IMM |
+                Op::JUMP_IF_LE_INT_IMM | Op::JUMP_IF_GT_INT_IMM => {
                     let src = op.a();
                     live |= 1u128 << src;
                 }

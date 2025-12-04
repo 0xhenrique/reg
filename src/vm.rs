@@ -1151,6 +1151,134 @@ impl VM {
                     unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = cons };
                 }
 
+                // ========== Unboxed integer opcodes (skip type checking) ==========
+                // These are emitted when the compiler can prove operands are integers.
+                // They use as_int_unchecked() which skips the is_int() branch.
+
+                Op::ADD_INT => {
+                    let dest = instr.a();
+                    let a = instr.b();
+                    let b = instr.c();
+                    let va = unsafe { self.registers.get_unchecked(base + a as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
+                    // SAFETY: Compiler guarantees both operands are integers
+                    let x = unsafe { va.as_int_unchecked() };
+                    let y = unsafe { vb.as_int_unchecked() };
+                    let result = Value::int(x.wrapping_add(y));
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
+                }
+
+                Op::SUB_INT => {
+                    let dest = instr.a();
+                    let a = instr.b();
+                    let b = instr.c();
+                    let va = unsafe { self.registers.get_unchecked(base + a as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
+                    let x = unsafe { va.as_int_unchecked() };
+                    let y = unsafe { vb.as_int_unchecked() };
+                    let result = Value::int(x.wrapping_sub(y));
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
+                }
+
+                Op::MUL_INT => {
+                    let dest = instr.a();
+                    let a = instr.b();
+                    let b = instr.c();
+                    let va = unsafe { self.registers.get_unchecked(base + a as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
+                    let x = unsafe { va.as_int_unchecked() };
+                    let y = unsafe { vb.as_int_unchecked() };
+                    let result = Value::int(x.wrapping_mul(y));
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
+                }
+
+                Op::ADD_INT_IMM => {
+                    let dest = instr.a();
+                    let src = instr.b();
+                    let imm = instr.c() as i8 as i64;
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
+                    let x = unsafe { v.as_int_unchecked() };
+                    let result = Value::int(x.wrapping_add(imm));
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
+                }
+
+                Op::SUB_INT_IMM => {
+                    let dest = instr.a();
+                    let src = instr.b();
+                    let imm = instr.c() as i8 as i64;
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
+                    let x = unsafe { v.as_int_unchecked() };
+                    let result = Value::int(x.wrapping_sub(imm));
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
+                }
+
+                Op::LT_INT => {
+                    let dest = instr.a();
+                    let a = instr.b();
+                    let b = instr.c();
+                    let va = unsafe { self.registers.get_unchecked(base + a as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
+                    let x = unsafe { va.as_int_unchecked() };
+                    let y = unsafe { vb.as_int_unchecked() };
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = Value::bool(x < y) };
+                }
+
+                Op::LE_INT => {
+                    let dest = instr.a();
+                    let a = instr.b();
+                    let b = instr.c();
+                    let va = unsafe { self.registers.get_unchecked(base + a as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
+                    let x = unsafe { va.as_int_unchecked() };
+                    let y = unsafe { vb.as_int_unchecked() };
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = Value::bool(x <= y) };
+                }
+
+                Op::GT_INT => {
+                    let dest = instr.a();
+                    let a = instr.b();
+                    let b = instr.c();
+                    let va = unsafe { self.registers.get_unchecked(base + a as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
+                    let x = unsafe { va.as_int_unchecked() };
+                    let y = unsafe { vb.as_int_unchecked() };
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = Value::bool(x > y) };
+                }
+
+                Op::GE_INT => {
+                    let dest = instr.a();
+                    let a = instr.b();
+                    let b = instr.c();
+                    let va = unsafe { self.registers.get_unchecked(base + a as usize) };
+                    let vb = unsafe { self.registers.get_unchecked(base + b as usize) };
+                    let x = unsafe { va.as_int_unchecked() };
+                    let y = unsafe { vb.as_int_unchecked() };
+                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = Value::bool(x >= y) };
+                }
+
+                // Combined compare-and-jump for integers (most common loop pattern)
+                Op::JUMP_IF_LE_INT_IMM => {
+                    let src = instr.a();
+                    let imm = instr.b() as i8 as i64;
+                    let offset = instr.c() as i8;
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
+                    let x = unsafe { v.as_int_unchecked() };
+                    if x <= imm {
+                        ip = (ip as isize + offset as isize) as usize;
+                    }
+                }
+
+                Op::JUMP_IF_GT_INT_IMM => {
+                    let src = instr.a();
+                    let imm = instr.b() as i8 as i64;
+                    let offset = instr.c() as i8;
+                    let v = unsafe { self.registers.get_unchecked(base + src as usize) };
+                    let x = unsafe { v.as_int_unchecked() };
+                    if x > imm {
+                        ip = (ip as isize + offset as isize) as usize;
+                    }
+                }
+
                 _ => {
                     return Err(format!("Unknown opcode: {}", instr.opcode()));
                 }
@@ -1891,5 +2019,39 @@ mod tests {
                     (cons (* 2 (car lst)) (map-double (cdr lst))))))
             (car (map-double (cons 5 (cons 10 nil)))))").unwrap();
         assert_eq!(result, Value::Int(10)); // first element 5 * 2 = 10
+    }
+
+    #[test]
+    fn test_integer_specialized_opcodes() {
+        // Test that integer-specialized opcodes produce correct results
+        // These are used in loop-optimized functions where types are known
+
+        // Test sum function - should use ADD_INT_IMM, SUB_INT_IMM, ADD_INT
+        let result = vm_eval("(do
+            (def sum (fn (n acc)
+                (if (<= n 0) acc (sum (- n 1) (+ acc n)))))
+            (sum 100 0))").unwrap();
+        assert_eq!(result, Value::Int(5050));
+
+        // Test with larger numbers to verify integer arithmetic
+        let result = vm_eval("(do
+            (def sum (fn (n acc)
+                (if (<= n 0) acc (sum (- n 1) (+ acc n)))))
+            (sum 1000 0))").unwrap();
+        assert_eq!(result, Value::Int(500500));
+
+        // Test multiplication in loops - should use MUL_INT
+        let result = vm_eval("(do
+            (def factorial (fn (n acc)
+                (if (<= n 1) acc (factorial (- n 1) (* acc n)))))
+            (factorial 10 1))").unwrap();
+        assert_eq!(result, Value::Int(3628800));
+
+        // Test integer comparisons with both operands as integers
+        let result = vm_eval("(do
+            (def count-down (fn (n acc)
+                (if (< n 1) acc (count-down (- n 1) (+ acc 1)))))
+            (count-down 50 0))").unwrap();
+        assert_eq!(result, Value::Int(50));
     }
 }

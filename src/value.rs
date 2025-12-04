@@ -300,6 +300,20 @@ impl Value {
         }
     }
 
+    /// Unchecked integer extraction - ONLY call when you're certain this is an integer.
+    /// Skips the is_int() check for performance in specialized opcodes.
+    /// Safety: Caller must ensure this Value is an integer (is_int() == true).
+    #[inline(always)]
+    pub unsafe fn as_int_unchecked(&self) -> i64 {
+        let payload = self.0 & PAYLOAD_MASK;
+        // Sign-extend from 48 bits to 64 bits
+        if payload & INT_SIGN_BIT != 0 {
+            (payload | !PAYLOAD_MASK) as i64
+        } else {
+            payload as i64
+        }
+    }
+
     #[inline]
     pub fn as_float(&self) -> Option<f64> {
         if self.is_float() {
