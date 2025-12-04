@@ -1,4 +1,5 @@
 use crate::bytecode::{Chunk, Op};
+use crate::jit::{is_jit_compatible, JitCompiler};
 use crate::value::{intern_symbol, Value};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -41,6 +42,9 @@ struct CallFrame {
     return_reg: usize, // where to store return value in caller's frame
 }
 
+/// JIT compilation threshold (number of calls before compiling)
+const JIT_THRESHOLD: u32 = 100;
+
 pub struct VM {
     registers: Vec<Value>,
     frames: Vec<CallFrame>,
@@ -53,6 +57,10 @@ pub struct VM {
     compiled_fn_cache: HashMap<SymbolKey, Rc<Chunk>>,
     // For native functions, we only need the function pointer
     native_fn_cache: HashMap<SymbolKey, fn(&[Value]) -> Result<Value, String>>,
+    // JIT compiler (lazily initialized)
+    jit: Option<JitCompiler>,
+    // Call counts for JIT compilation triggering (chunk pointer -> count)
+    call_counts: HashMap<usize, u32>,
 }
 
 impl VM {
@@ -64,6 +72,8 @@ impl VM {
             global_cache: HashMap::new(),
             compiled_fn_cache: HashMap::new(),
             native_fn_cache: HashMap::new(),
+            jit: None,
+            call_counts: HashMap::new(),
         }
     }
 
@@ -75,6 +85,8 @@ impl VM {
             global_cache: HashMap::new(),
             compiled_fn_cache: HashMap::new(),
             native_fn_cache: HashMap::new(),
+            jit: None,
+            call_counts: HashMap::new(),
         }
     }
 
@@ -400,16 +412,17 @@ impl VM {
 
                         let num_registers = frame.chunk.num_registers;
                         let new_base = base + num_registers as usize;
+                        let cf_num_registers = cf.num_registers as usize;
 
-                        if new_base + cf.num_registers as usize > MAX_REGISTERS {
+                        if new_base + cf_num_registers > MAX_REGISTERS {
                             return Err("Stack overflow".to_string());
                         }
 
-                        // Save current IP
-                        unsafe { self.frames.last_mut().unwrap_unchecked() }.ip = ip;
-
+                        // Clone chunk and get pointer before releasing borrow
                         let cf_chunk = cf.clone();
+                        let chunk_ptr = Rc::as_ptr(&cf_chunk) as usize;
 
+                        // Copy arguments to new frame's registers
                         let arg_start = base + dest as usize + 1;
                         for i in 0..nargs as usize {
                             unsafe {
@@ -417,6 +430,40 @@ impl VM {
                                     self.registers.get_unchecked(arg_start + i).clone();
                             }
                         }
+
+                        // Try JIT execution first (fast path)
+                        if let Some(jit) = &self.jit {
+                            if let Some(jit_code) = jit.get_compiled(chunk_ptr) {
+                                let result = unsafe {
+                                    jit_code.execute(&mut self.registers[new_base..new_base + cf_num_registers])
+                                };
+                                if let Ok(value) = result {
+                                    // JIT succeeded - store result and continue
+                                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = value };
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // JIT not available or failed - fall back to interpreter
+                        // Update call count for potential future JIT compilation
+                        {
+                            let count = self.call_counts.entry(chunk_ptr).or_insert(0);
+                            *count += 1;
+                            if *count == JIT_THRESHOLD && is_jit_compatible(&cf_chunk) {
+                                // Trigger JIT compilation (lazily, will be used on next call)
+                                if self.jit.is_none() {
+                                    self.jit = JitCompiler::new().ok();
+                                }
+                                if let Some(jit) = &mut self.jit {
+                                    let name = format!("jit_func_{:x}", chunk_ptr);
+                                    let _ = jit.compile_function(&cf_chunk, &name);
+                                }
+                            }
+                        }
+
+                        // Save current IP
+                        unsafe { self.frames.last_mut().unwrap_unchecked() }.ip = ip;
 
                         self.frames.push(CallFrame {
                             chunk: cf_chunk,
