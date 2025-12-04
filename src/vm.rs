@@ -6,8 +6,10 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
-const MAX_REGISTERS: usize = 8192;  // @TODO: Increased for deep recursion (fib needs ~30 depth)
-const MAX_FRAMES: usize = 1024;
+// Register file size - each function call uses ~(locals + 16) registers
+// For 10000 deep recursion with ~20 registers per call = 200000 registers
+const MAX_REGISTERS: usize = 262144;  // 256K registers (~2MB) for deep recursion
+const MAX_FRAMES: usize = 16384;      // 16K frames for deep recursion
 
 /// A wrapper for interned symbol Rc<str> that hashes/compares by pointer
 /// Since symbols are interned, equal symbols share the same Rc, so pointer
