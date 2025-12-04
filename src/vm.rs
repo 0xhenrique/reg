@@ -344,8 +344,10 @@ impl VM {
                         let arg_start = base + func_reg as usize + 1;
                         for i in 0..nargs as usize {
                             unsafe {
+                                // Use take() instead of clone() - the source registers
+                                // won't be accessed again after this tail call
                                 *self.registers.get_unchecked_mut(base + i) =
-                                    self.registers.get_unchecked(arg_start + i).clone();
+                                    self.registers.get_unchecked_mut(arg_start + i).take();
                             }
                         }
                         ip = 0;
@@ -534,8 +536,10 @@ impl VM {
                         let src_start = base + first_arg as usize;
                         for i in 0..nargs as usize {
                             unsafe {
+                                // Use take() instead of clone() - the source registers
+                                // won't be accessed again after this tail call
                                 *self.registers.get_unchecked_mut(base + i) =
-                                    self.registers.get_unchecked(src_start + i).clone();
+                                    self.registers.get_unchecked_mut(src_start + i).take();
                             }
                         }
                         ip = 0;
@@ -591,8 +595,10 @@ impl VM {
                             let src_start = base + first_arg as usize;
                             for i in 0..nargs as usize {
                                 unsafe {
+                                    // Use take() instead of clone() - the source registers
+                                    // won't be accessed again after this tail call
                                     *self.registers.get_unchecked_mut(base + i) =
-                                        self.registers.get_unchecked(src_start + i).clone();
+                                        self.registers.get_unchecked_mut(src_start + i).take();
                                 }
                             }
                             ip = 0;
