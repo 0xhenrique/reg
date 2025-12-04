@@ -59,6 +59,10 @@ pub struct Compiler {
     scope_depth: usize,
     pure_fns: PureFunctions,
     inline_candidates: InlineCandidates,
+    /// Name of the current function being compiled (for self-recursion detection)
+    self_name: Option<String>,
+    /// Number of parameters of the current function (for loop optimization)
+    self_arity: usize,
 }
 
 /// Check if an expression is pure (no side effects)
@@ -437,6 +441,8 @@ impl Compiler {
             scope_depth: 0,
             pure_fns: PureFunctions::new(),
             inline_candidates: InlineCandidates::new(),
+            self_name: None,
+            self_arity: 0,
         }
     }
 
@@ -476,8 +482,20 @@ impl Compiler {
     }
 
     pub fn compile_function(params: &[String], body: &Value) -> Result<Chunk, String> {
+        Self::compile_function_named(params, body, None)
+    }
+
+    /// Compile a function with an optional name for self-recursion loop optimization.
+    /// When `name` is provided, tail-recursive calls to that name are compiled as loops.
+    pub fn compile_function_named(params: &[String], body: &Value, name: Option<&str>) -> Result<Chunk, String> {
         let mut compiler = Compiler::new();
         compiler.chunk.num_params = params.len() as u8;
+
+        // Enable loop optimization for self-recursive functions
+        if let Some(n) = name {
+            compiler.self_name = Some(n.to_string());
+            compiler.self_arity = params.len();
+        }
 
         // Parameters occupy the first registers
         for param in params {
@@ -770,8 +788,29 @@ impl Compiler {
 
                                 // Also register pure functions for constant folding
                                 if is_pure_expr_with_fns(&body, &self.pure_fns) {
-                                    self.pure_fns.register(name, params, body);
+                                    self.pure_fns.register(name, params.clone(), body.clone());
                                 }
+
+                                // Check if this function is self-recursive (calls itself)
+                                // If so, compile with the name for loop optimization
+                                let is_self_recursive = contains_call_to(&body, name);
+
+                                // Compile the function with name for self-recursion loop optimization
+                                let proto = if is_self_recursive {
+                                    Compiler::compile_function_named(&params, &body, Some(name))?
+                                } else {
+                                    Compiler::compile_function(&params, &body)?
+                                };
+
+                                let proto_idx = self.chunk.protos.len() as ConstIdx;
+                                self.chunk.protos.push(proto);
+                                self.emit(Op::closure(dest, proto_idx));
+
+                                // Store to global
+                                let name_idx = self.add_constant(Value::symbol(name));
+                                self.emit(Op::set_global(name_idx, dest));
+
+                                return Ok(());
                             }
                         }
                     }
@@ -779,7 +818,7 @@ impl Compiler {
             }
         }
 
-        // Compile value
+        // Compile value (non-function or anonymous function)
         self.compile_expr(&args[1], dest, false)?;
 
         // Store to global
@@ -1076,9 +1115,47 @@ impl Compiler {
 
         if is_global_call {
             let name = items[0].as_symbol().unwrap();
-            let name_idx = self.add_constant(Value::symbol(name));
             let args = &items[1..];
             let nargs = args.len() as u8;
+
+            // LOOP OPTIMIZATION: Detect self-recursive tail calls and compile as loops
+            // This eliminates function call overhead for tail-recursive functions
+            if tail_pos {
+                if let Some(ref self_name) = self.self_name {
+                    if name == self_name && args.len() == self.self_arity {
+                        // Self-recursive tail call detected!
+                        // Compile arguments to temporary registers
+                        let first_temp = self.locals.len() as Reg;
+                        for arg in args.iter() {
+                            let arg_reg = self.alloc_reg();
+                            self.compile_expr(arg, arg_reg, false)?;
+                        }
+
+                        // Copy temporaries back to parameter registers (0, 1, 2, ...)
+                        for i in 0..nargs as usize {
+                            self.emit(Op::mov(i as Reg, first_temp + i as Reg));
+                        }
+
+                        // Free the temp registers
+                        for _ in 0..nargs {
+                            self.free_reg();
+                        }
+
+                        // Jump back to the start of the function (instruction 0)
+                        // Current position is chunk.code.len(), target is 0
+                        // offset = target - (current + 1) = 0 - (current + 1) = -(current + 1)
+                        let current_pos = self.chunk.current_pos() as i16;
+                        let offset = -(current_pos + 1);
+                        self.emit(Op::jump(offset));
+
+                        // The LoadNil is unreachable but keeps the dest semantics consistent
+                        self.emit(Op::load_nil(dest));
+                        return Ok(());
+                    }
+                }
+            }
+
+            let name_idx = self.add_constant(Value::symbol(name));
 
             // CallGlobal and TailCallGlobal use 8-bit constant index
             // If name_idx > 255, fall back to regular GetGlobal + Call
@@ -1365,5 +1442,58 @@ mod tests {
             opc == Op::CALL || opc == Op::TAIL_CALL || opc == Op::CALL_GLOBAL || opc == Op::TAIL_CALL_GLOBAL
         });
         assert!(has_call, "Impure function should not be folded");
+    }
+
+    #[test]
+    fn test_loop_optimization_self_recursive() {
+        use crate::parser::parse_all;
+
+        // Define a self-recursive tail-call function (sum)
+        let exprs = parse_all("(def sum (fn (n acc) (if (<= n 0) acc (sum (- n 1) (+ acc n)))))").unwrap();
+        let chunk = Compiler::compile_all(&exprs).unwrap();
+
+        // The function body should be in the first proto
+        let sum_proto = &chunk.protos[0];
+
+        // Should have a JUMP instruction (for the loop-back)
+        let has_jump = sum_proto.code.iter().any(|op| op.opcode() == Op::JUMP);
+        assert!(has_jump, "Self-recursive tail call should be compiled as JUMP (loop)");
+
+        // Should NOT have TAIL_CALL_GLOBAL (that would mean no loop optimization)
+        let has_tail_call = sum_proto.code.iter().any(|op| op.opcode() == Op::TAIL_CALL_GLOBAL);
+        assert!(!has_tail_call, "Self-recursive function should not use TAIL_CALL_GLOBAL");
+    }
+
+    #[test]
+    fn test_loop_optimization_non_recursive_unchanged() {
+        use crate::parser::parse_all;
+
+        // A non-recursive function should not get loop optimization
+        let exprs = parse_all("(def square (fn (n) (* n n)))").unwrap();
+        let chunk = Compiler::compile_all(&exprs).unwrap();
+
+        let square_proto = &chunk.protos[0];
+
+        // Should NOT have a JUMP (no loop needed)
+        let has_jump_backward = square_proto.code.iter().any(|op| {
+            op.opcode() == Op::JUMP && op.sbx() < 0
+        });
+        assert!(!has_jump_backward, "Non-recursive function should not have backward JUMP");
+    }
+
+    #[test]
+    fn test_loop_optimization_mutual_recursion_unchanged() {
+        use crate::parser::parse_all;
+
+        // Mutual recursion (even/odd) should NOT get loop optimization
+        // because the tail call is to a different function
+        let exprs = parse_all("(def is-even (fn (n) (if (<= n 0) true (is-odd (- n 1))))) (def is-odd (fn (n) (if (<= n 0) false (is-even (- n 1)))))").unwrap();
+        let chunk = Compiler::compile_all(&exprs).unwrap();
+
+        let is_even_proto = &chunk.protos[0];
+
+        // Should have TAIL_CALL_GLOBAL (no self-recursion loop optimization)
+        let has_tail_call = is_even_proto.code.iter().any(|op| op.opcode() == Op::TAIL_CALL_GLOBAL);
+        assert!(has_tail_call, "Mutual recursion should use TAIL_CALL_GLOBAL, not JUMP");
     }
 }
