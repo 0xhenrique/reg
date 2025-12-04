@@ -3,6 +3,8 @@
        "rust"
        "python"
        "ruby"
+       "gcc-toolchain"
+       "go"
        "node"
        "lua"
        "bash"
