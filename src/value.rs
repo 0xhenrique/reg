@@ -18,6 +18,16 @@ use crate::bytecode::Chunk;
 //
 // Thread-local arena is used so native functions can allocate without
 // explicit arena parameter passing.
+//
+// IMPORTANT: Arena has a size limit to prevent unbounded memory growth in
+// long-running programs. When the limit is reached, new allocations fall
+// back to Rc allocation. This provides fast allocation for short-lived
+// programs while preventing memory exhaustion.
+
+/// Maximum number of objects in arena before falling back to Rc allocation.
+/// This prevents unbounded memory growth in long-running programs.
+/// 64K objects * ~40 bytes/cons = ~2.5MB max arena size
+const ARENA_SIZE_LIMIT: usize = 64 * 1024;
 
 /// Arena for heap object allocation without per-object reference counting.
 /// Uses a simple bump allocator with Vec backing storage.
@@ -38,7 +48,20 @@ impl Arena {
         }
     }
 
+    /// Try to allocate a heap object in the arena.
+    /// Returns Some(index) if successful, None if arena is full.
+    #[inline]
+    pub fn try_alloc(&mut self, obj: HeapObject) -> Option<u32> {
+        if self.objects.len() >= ARENA_SIZE_LIMIT {
+            return None; // Arena full, caller should use Rc
+        }
+        let idx = self.objects.len() as u32;
+        self.objects.push(obj);
+        Some(idx)
+    }
+
     /// Allocate a heap object in the arena, returning its index
+    /// Note: Use try_alloc() for size-limited allocation
     #[inline]
     pub fn alloc(&mut self, obj: HeapObject) -> u32 {
         let idx = self.objects.len() as u32;
@@ -59,6 +82,12 @@ impl Arena {
             // Update high water mark (for future tuning)
         }
         self.objects.clear();
+    }
+
+    /// Check if arena is full (at size limit)
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.objects.len() >= ARENA_SIZE_LIMIT
     }
 
     /// Check if arena is empty (used for testing)
@@ -107,12 +136,6 @@ pub fn clear_arena() {
 #[allow(dead_code)]
 pub fn arena_size() -> usize {
     ARENA.with(|a| a.borrow().len())
-}
-
-/// Allocate a heap object in the thread-local arena
-#[inline]
-fn arena_alloc(obj: HeapObject) -> u32 {
-    ARENA.with(|a| a.borrow_mut().alloc(obj))
 }
 
 /// Get a reference to an arena object (unsafe - caller must ensure index is valid)
@@ -335,14 +358,16 @@ impl Value {
     ///
     /// OPTIMIZED: Uses arena allocation when enabled for zero-refcount cloning.
     /// When arena is enabled, cons cells are allocated in the thread-local arena.
-    /// When disabled, falls back to Rc allocation for compatibility.
+    /// When arena is full or disabled, falls back to Rc allocation.
     pub fn cons(car: Value, cdr: Value) -> Value {
-        if arena_enabled() {
+        if arena_enabled() && !ARENA.with(|a| a.borrow().is_full()) {
             // Arena allocation - zero overhead clone/drop
-            let idx = arena_alloc(HeapObject::Cons(ConsCell { car, cdr }));
+            let idx = ARENA.with(|a| {
+                a.borrow_mut().alloc(HeapObject::Cons(ConsCell { car, cdr }))
+            });
             Value(TAG_ARENA | idx as u64)
         } else {
-            // Rc allocation fallback
+            // Rc allocation fallback (arena disabled or full)
             let heap = Rc::new(HeapObject::Cons(ConsCell { car, cdr }));
             Value::from_heap(heap)
         }
@@ -1294,6 +1319,57 @@ mod tests {
             current = &cons.cdr;
         }
         assert_eq!(count, 1000);
+
+        super::clear_arena();
+    }
+
+    #[test]
+    fn test_arena_size_limit_fallback() {
+        super::set_arena_enabled(true);
+        super::clear_arena();
+
+        // Fill the arena to the limit
+        let limit = super::ARENA_SIZE_LIMIT;
+        for i in 0..limit {
+            let cell = Value::cons(Value::int(i as i64), Value::nil());
+            if i < limit {
+                // Should be arena-allocated until we hit the limit
+                assert!(cell.is_arena() || cell.is_ptr());
+            }
+        }
+
+        // Arena should now be full
+        assert!(super::ARENA.with(|a| a.borrow().is_full()));
+
+        // Next allocation should fall back to Rc
+        let overflow = Value::cons(Value::int(999999), Value::nil());
+        assert!(overflow.is_ptr(), "should fall back to Rc when arena is full");
+        assert!(!overflow.is_arena());
+
+        // Verify the Rc-allocated value still works
+        assert_eq!(overflow.as_cons().unwrap().car.as_int(), Some(999999));
+
+        super::clear_arena();
+    }
+
+    #[test]
+    fn test_arena_clear_allows_reuse() {
+        super::set_arena_enabled(true);
+        super::clear_arena();
+
+        // Fill the arena
+        for i in 0..super::ARENA_SIZE_LIMIT {
+            let _ = Value::cons(Value::int(i as i64), Value::nil());
+        }
+        assert!(super::ARENA.with(|a| a.borrow().is_full()));
+
+        // Clear arena
+        super::clear_arena();
+        assert_eq!(super::arena_size(), 0);
+
+        // Should be able to allocate in arena again
+        let cell = Value::cons(Value::int(42), Value::nil());
+        assert!(cell.is_arena(), "should be arena-allocated after clear");
 
         super::clear_arena();
     }
