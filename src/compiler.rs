@@ -2,9 +2,9 @@ use crate::bytecode::{Chunk, ConstIdx, Op, Reg};
 use crate::value::Value;
 use std::collections::HashMap;
 
-/// A function definition (for compile-time evaluation and inlining)
+/// A pure function definition (for compile-time evaluation)
 #[derive(Clone)]
-struct FunctionDef {
+struct PureFunction {
     params: Vec<String>,
     body: Value,
 }
@@ -12,7 +12,7 @@ struct FunctionDef {
 /// Registry of pure functions for compile-time evaluation
 #[derive(Clone, Default)]
 struct PureFunctions {
-    funcs: HashMap<String, FunctionDef>,
+    funcs: HashMap<String, PureFunction>,
 }
 
 impl PureFunctions {
@@ -23,32 +23,10 @@ impl PureFunctions {
     }
 
     fn register(&mut self, name: &str, params: Vec<String>, body: Value) {
-        self.funcs.insert(name.to_string(), FunctionDef { params, body });
+        self.funcs.insert(name.to_string(), PureFunction { params, body });
     }
 
-    fn get(&self, name: &str) -> Option<&FunctionDef> {
-        self.funcs.get(name)
-    }
-}
-
-/// Registry of ALL function definitions for inlining (regardless of purity)
-#[derive(Clone, Default)]
-struct InlineCandidates {
-    funcs: HashMap<String, FunctionDef>,
-}
-
-impl InlineCandidates {
-    fn new() -> Self {
-        InlineCandidates {
-            funcs: HashMap::new(),
-        }
-    }
-
-    fn register(&mut self, name: &str, params: Vec<String>, body: Value) {
-        self.funcs.insert(name.to_string(), FunctionDef { params, body });
-    }
-
-    fn get(&self, name: &str) -> Option<&FunctionDef> {
+    fn get(&self, name: &str) -> Option<&PureFunction> {
         self.funcs.get(name)
     }
 }
@@ -58,7 +36,6 @@ pub struct Compiler {
     locals: Vec<String>,
     scope_depth: usize,
     pure_fns: PureFunctions,
-    inline_candidates: InlineCandidates,
 }
 
 /// Check if an expression is pure (no side effects)
@@ -180,56 +157,6 @@ fn substitute(expr: &Value, params: &[String], args: &[Value]) -> Value {
         return Value::list(new_items);
     }
     expr.clone()
-}
-
-/// Check if expression contains a call to the given function name (recursion check)
-fn contains_call_to(expr: &Value, name: &str) -> bool {
-    if let Some(items) = expr.as_list() {
-        if !items.is_empty() {
-            // Check if this is a call to the function
-            if let Some(first) = items[0].as_symbol() {
-                if first == name {
-                    return true;
-                }
-            }
-            // Recursively check all sub-expressions
-            for item in items.iter() {
-                if contains_call_to(item, name) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-/// Check if a function body is small enough to inline.
-/// We inline if the body is a single expression that is:
-/// - A simple call to another function (thin wrapper)
-/// - A simple arithmetic/comparison expression
-/// - A small if expression
-fn is_small_body(body: &Value) -> bool {
-    if let Some(items) = body.as_list() {
-        // Body is a list (an expression)
-        if items.is_empty() {
-            return true;
-        }
-        if let Some(first) = items[0].as_symbol() {
-            match first {
-                // Simple operations are always small
-                "+" | "-" | "*" | "/" | "mod" | "<" | "<=" | ">" | ">=" | "=" | "!=" | "not" => {
-                    return items.len() <= 4; // op + up to 3 args
-                }
-                // A call to another function (thin wrapper pattern)
-                _ => {
-                    // Consider it small if it's just a function call with up to 4 args
-                    return items.len() <= 5;
-                }
-            }
-        }
-    }
-    // Non-list values (symbols, literals) are trivially small
-    true
 }
 
 /// Try to fold an operation with constant arguments
@@ -436,7 +363,6 @@ impl Compiler {
             locals: Vec::new(),
             scope_depth: 0,
             pure_fns: PureFunctions::new(),
-            inline_candidates: InlineCandidates::new(),
         }
     }
 
@@ -742,7 +668,7 @@ impl Compiler {
             .as_symbol()
             .ok_or("def expects a symbol as first argument")?;
 
-        // Check if we're defining a function: (def name (fn (params) body))
+        // Check if we're defining a pure function: (def name (fn (params) body))
         if let Some(fn_expr) = args[1].as_list() {
             if fn_expr.len() >= 3 {
                 if let Some(fn_sym) = fn_expr[0].as_symbol() {
@@ -764,11 +690,7 @@ impl Compiler {
                                     Value::list(do_list)
                                 };
 
-                                // Register ALL functions as inline candidates
-                                // (inlining decision made at call site based on size/recursion)
-                                self.inline_candidates.register(name, params.clone(), body.clone());
-
-                                // Also register pure functions for constant folding
+                                // Check if body is pure (with knowledge of already-registered pure fns)
                                 if is_pure_expr_with_fns(&body, &self.pure_fns) {
                                     self.pure_fns.register(name, params, body);
                                 }
@@ -1045,24 +967,6 @@ impl Compiler {
                 self.emit(Op::cons(dest, dest, cdr_reg));
                 self.free_reg(); // free cdr_reg
                 return Ok(());
-            }
-
-            // Try inlining small non-recursive functions
-            // This eliminates call overhead for thin wrappers like:
-            //   (def reverse (fn (lst) (reverse-acc lst (list))))
-            if let Some(fn_def) = self.inline_candidates.get(op).cloned() {
-                // Check: correct number of arguments
-                if args.len() == fn_def.params.len() {
-                    // Check: function is small enough to inline
-                    if is_small_body(&fn_def.body) {
-                        // Check: function doesn't call itself (non-recursive)
-                        if !contains_call_to(&fn_def.body, op) {
-                            // Inline: substitute parameters with arguments and compile
-                            let inlined = substitute(&fn_def.body, &fn_def.params, args);
-                            return self.compile_expr(&inlined, dest, tail_pos);
-                        }
-                    }
-                }
             }
         }
 
