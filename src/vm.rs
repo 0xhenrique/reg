@@ -57,10 +57,12 @@ pub struct VM {
     compiled_fn_cache: HashMap<SymbolKey, Rc<Chunk>>,
     // For native functions, we only need the function pointer
     native_fn_cache: HashMap<SymbolKey, fn(&[Value]) -> Result<Value, String>>,
-    // JIT compiler (lazily initialized)
+    // JIT compiler (lazily initialized when jit_enabled is true)
     jit: Option<JitCompiler>,
     // Call counts for JIT compilation triggering (chunk pointer -> count)
     call_counts: HashMap<usize, u32>,
+    // JIT enabled flag (opt-in via --jit flag)
+    jit_enabled: bool,
 }
 
 impl VM {
@@ -74,6 +76,7 @@ impl VM {
             native_fn_cache: HashMap::new(),
             jit: None,
             call_counts: HashMap::new(),
+            jit_enabled: false,
         }
     }
 
@@ -87,7 +90,13 @@ impl VM {
             native_fn_cache: HashMap::new(),
             jit: None,
             call_counts: HashMap::new(),
+            jit_enabled: false,
         }
+    }
+
+    /// Enable JIT compilation (opt-in via --jit flag)
+    pub fn enable_jit(&mut self) {
+        self.jit_enabled = true;
     }
 
     pub fn define_global(&mut self, name: &str, value: Value) {
@@ -431,33 +440,35 @@ impl VM {
                             }
                         }
 
-                        // Try JIT execution first (fast path)
-                        if let Some(jit) = &self.jit {
-                            if let Some(jit_code) = jit.get_compiled(chunk_ptr) {
-                                let result = unsafe {
-                                    jit_code.execute(&mut self.registers[new_base..new_base + cf_num_registers])
-                                };
-                                if let Ok(value) = result {
-                                    // JIT succeeded - store result and continue
-                                    unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = value };
-                                    continue;
+                        // Try JIT execution first (fast path) - only if JIT is enabled
+                        if self.jit_enabled {
+                            if let Some(jit) = &self.jit {
+                                if let Some(jit_code) = jit.get_compiled(chunk_ptr) {
+                                    let result = unsafe {
+                                        jit_code.execute(&mut self.registers[new_base..new_base + cf_num_registers])
+                                    };
+                                    if let Ok(value) = result {
+                                        // JIT succeeded - store result and continue
+                                        unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = value };
+                                        continue;
+                                    }
                                 }
                             }
-                        }
 
-                        // JIT not available or failed - fall back to interpreter
-                        // Update call count for potential future JIT compilation
-                        {
-                            let count = self.call_counts.entry(chunk_ptr).or_insert(0);
-                            *count += 1;
-                            if *count == JIT_THRESHOLD && is_jit_compatible(&cf_chunk) {
-                                // Trigger JIT compilation (lazily, will be used on next call)
-                                if self.jit.is_none() {
-                                    self.jit = JitCompiler::new().ok();
-                                }
-                                if let Some(jit) = &mut self.jit {
-                                    let name = format!("jit_func_{:x}", chunk_ptr);
-                                    let _ = jit.compile_function(&cf_chunk, &name);
+                            // JIT not available or failed - fall back to interpreter
+                            // Update call count for potential future JIT compilation
+                            {
+                                let count = self.call_counts.entry(chunk_ptr).or_insert(0);
+                                *count += 1;
+                                if *count == JIT_THRESHOLD && is_jit_compatible(&cf_chunk) {
+                                    // Trigger JIT compilation (lazily, will be used on next call)
+                                    if self.jit.is_none() {
+                                        self.jit = JitCompiler::new().ok();
+                                    }
+                                    if let Some(jit) = &mut self.jit {
+                                        let name = format!("jit_func_{:x}", chunk_ptr);
+                                        let _ = jit.compile_function(&cf_chunk, &name);
+                                    }
                                 }
                             }
                         }

@@ -7,6 +7,7 @@ use std::process;
 struct Config {
     filename: Option<String>,
     arena_enabled: bool,
+    jit_enabled: bool,
 }
 
 fn parse_args() -> Config {
@@ -14,6 +15,7 @@ fn parse_args() -> Config {
     let mut config = Config {
         filename: None,
         arena_enabled: false, // Arena is opt-in via --arena flag
+        jit_enabled: false,   // JIT is opt-in via --jit flag
     };
 
     let mut i = 1;
@@ -21,6 +23,9 @@ fn parse_args() -> Config {
         match args[i].as_str() {
             "--arena" => {
                 config.arena_enabled = true;
+            }
+            "--jit" => {
+                config.jit_enabled = true;
             }
             "--help" | "-h" => {
                 print_usage();
@@ -46,6 +51,7 @@ fn print_usage() {
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --arena    Enable arena allocation for cons cells (experimental)");
+    eprintln!("  --jit      Enable JIT compilation for hot functions (experimental)");
     eprintln!("  --help     Show this help message");
     eprintln!();
     eprintln!("If FILE is provided, execute it. Otherwise, start the REPL.");
@@ -57,16 +63,16 @@ fn main() {
     set_arena_enabled(config.arena_enabled);
 
     if let Some(filename) = config.filename {
-        if let Err(e) = run_file(&filename, config.arena_enabled) {
+        if let Err(e) = run_file(&filename, config.arena_enabled, config.jit_enabled) {
             eprintln!("Error: {}", e);
             process::exit(1);
         }
     } else {
-        run_repl(config.arena_enabled);
+        run_repl(config.arena_enabled, config.jit_enabled);
     }
 }
 
-fn run_file(filename: &str, arena_enabled: bool) -> Result<Value, String> {
+fn run_file(filename: &str, arena_enabled: bool, jit_enabled: bool) -> Result<Value, String> {
     let contents = fs::read_to_string(filename)
         .map_err(|e| format!("Could not read file '{}': {}", filename, e))?;
 
@@ -88,6 +94,9 @@ fn run_file(filename: &str, arena_enabled: bool) -> Result<Value, String> {
 
     // Execute via bytecode VM
     let mut vm = standard_vm();
+    if jit_enabled {
+        vm.enable_jit();
+    }
     let result = vm.run(chunk)?;
 
     // Arena cleanup
@@ -103,10 +112,13 @@ fn run_file(filename: &str, arena_enabled: bool) -> Result<Value, String> {
     Ok(final_result)
 }
 
-fn run_repl(arena_enabled: bool) {
+fn run_repl(arena_enabled: bool, jit_enabled: bool) {
     println!("Lisp VM v0.1.0 (bytecode)");
     if arena_enabled {
         println!("Arena allocation: enabled");
+    }
+    if jit_enabled {
+        println!("JIT compilation: enabled");
     }
     println!("Type :q or :quit to exit.");
     println!();
@@ -117,6 +129,9 @@ fn run_repl(arena_enabled: bool) {
 
     // Single VM instance to maintain globals across expressions
     let mut vm = standard_vm();
+    if jit_enabled {
+        vm.enable_jit();
+    }
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
