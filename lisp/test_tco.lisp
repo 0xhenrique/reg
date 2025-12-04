@@ -1,3 +1,5 @@
+; Test tail call optimization
+
 (println "Testing tail call optimization...")
 
 ; Sum function with accumulator (tail recursive)

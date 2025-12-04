@@ -1,6 +1,8 @@
+; Test pure function detection and compile-time evaluation
+
 (println "Testing pure function detection...")
 
-; Defining a pure function
+; Define a pure function
 (def square (fn (n) (* n n)))
 
 ; This should work (pure function with constant arg could be folded)

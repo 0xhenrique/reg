@@ -1,3 +1,5 @@
+; Test basic functionality
+
 ; Arithmetic
 (println "Testing arithmetic...")
 (def result (+ 1 2 3))

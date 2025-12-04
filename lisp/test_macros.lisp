@@ -1,6 +1,8 @@
+; Test macro functionality
+
 (println "Testing macros...")
 
-; Defining an 'unless' macro
+; Define an 'unless' macro
 (defmacro unless (cond body)
     (list 'if cond nil body))
 
@@ -8,7 +10,7 @@
     (println "  unless macro: passed")
     (println "  unless macro: FAILED"))
 
-; Defining an 'inc' macro
+; Define an 'inc' macro
 (defmacro inc (x)
     (list '+ x 1))
 
@@ -16,7 +18,7 @@
     (println "  inc macro: passed")
     (println "  inc macro: FAILED"))
 
-; Defining a 'double' macro
+; Define a 'double' macro
 (defmacro double (x)
     (list '* x 2))
 

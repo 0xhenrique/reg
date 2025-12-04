@@ -1683,6 +1683,278 @@ pub fn standard_vm() -> VM {
         Ok(Value::float(secs))
     }));
 
+    // Additional list functions
+    vm.define_global("nth", native("nth", |args| {
+        if args.len() != 2 { return Err("nth expects 2 arguments".to_string()); }
+
+        let index = args[1].as_int().ok_or_else(|| "nth expects integer index".to_string())?;
+        if index < 0 { return Err("nth expects non-negative index".to_string()); }
+        let idx = index as usize;
+
+        // Handle array lists
+        if let Some(items) = args[0].as_list() {
+            return items.get(idx).cloned().ok_or_else(|| format!("nth: index {} out of bounds", index));
+        }
+
+        // Handle cons cells (traverse the chain)
+        if args[0].as_cons().is_some() {
+            let mut current = &args[0];
+            let mut i = 0usize;
+            while let Some(cons) = current.as_cons() {
+                if i == idx {
+                    return Ok(cons.car.clone());
+                }
+                i += 1;
+                current = &cons.cdr;
+            }
+            // If we ended on an array list, check there
+            if let Some(items) = current.as_list() {
+                if idx >= i {
+                    let remaining_idx = idx - i;
+                    return items.get(remaining_idx).cloned().ok_or_else(|| format!("nth: index {} out of bounds", index));
+                }
+            }
+            return Err(format!("nth: index {} out of bounds", index));
+        }
+
+        Err("nth expects a list or cons cell".to_string())
+    }));
+
+    vm.define_global("append", native("append", |args| {
+        let mut result = Vec::new();
+        for arg in args {
+            if arg.is_nil() {
+                continue;
+            }
+            if let Some(items) = arg.as_list() {
+                result.extend_from_slice(items);
+            } else if arg.as_cons().is_some() {
+                // Convert cons chain to vec
+                let mut current = arg;
+                while let Some(cons) = current.as_cons() {
+                    result.push(cons.car.clone());
+                    current = &cons.cdr;
+                }
+                // If ended on array list, append it
+                if let Some(items) = current.as_list() {
+                    result.extend_from_slice(items);
+                }
+            } else {
+                return Err("append expects lists or cons cells".to_string());
+            }
+        }
+        Ok(Value::list(result))
+    }));
+
+    vm.define_global("reverse", native("reverse", |args| {
+        if args.len() != 1 { return Err("reverse expects 1 argument".to_string()); }
+
+        let mut result = Vec::new();
+
+        if let Some(items) = args[0].as_list() {
+            result.extend_from_slice(items);
+        } else if args[0].as_cons().is_some() {
+            // Convert cons chain to vec
+            let mut current = &args[0];
+            while let Some(cons) = current.as_cons() {
+                result.push(cons.car.clone());
+                current = &cons.cdr;
+            }
+            // If ended on array list, append it
+            if let Some(items) = current.as_list() {
+                result.extend_from_slice(items);
+            }
+        } else if args[0].is_nil() {
+            return Ok(Value::nil());
+        } else {
+            return Err("reverse expects a list or cons cell".to_string());
+        }
+
+        result.reverse();
+        Ok(Value::list(result))
+    }));
+
+    // String functions
+    vm.define_global("string-length", native("string-length", |args| {
+        if args.len() != 1 { return Err("string-length expects 1 argument".to_string()); }
+        if let Some(s) = args[0].as_string() {
+            Ok(Value::int(s.len() as i64))
+        } else {
+            Err("string-length expects a string".to_string())
+        }
+    }));
+
+    vm.define_global("string-append", native("string-append", |args| {
+        let mut result = String::new();
+        for arg in args {
+            if let Some(s) = arg.as_string() {
+                result.push_str(s);
+            } else {
+                return Err("string-append expects strings".to_string());
+            }
+        }
+        Ok(Value::string(&result))
+    }));
+
+    vm.define_global("substring", native("substring", |args| {
+        if args.len() != 3 { return Err("substring expects 3 arguments (string, start, end)".to_string()); }
+
+        let s = args[0].as_string().ok_or_else(|| "substring expects a string as first argument".to_string())?;
+        let start = args[1].as_int().ok_or_else(|| "substring expects integer start".to_string())?;
+        let end = args[2].as_int().ok_or_else(|| "substring expects integer end".to_string())?;
+
+        if start < 0 || end < 0 {
+            return Err("substring expects non-negative indices".to_string());
+        }
+
+        let start = start as usize;
+        let end = end as usize;
+
+        if start > s.len() || end > s.len() || start > end {
+            return Err(format!("substring: invalid range [{}, {}] for string of length {}", start, end, s.len()));
+        }
+
+        Ok(Value::string(&s[start..end]))
+    }));
+
+    vm.define_global("string->list", native("string->list", |args| {
+        if args.len() != 1 { return Err("string->list expects 1 argument".to_string()); }
+
+        let s = args[0].as_string().ok_or_else(|| "string->list expects a string".to_string())?;
+        let chars: Vec<Value> = s.chars().map(|c| {
+            let ch_str = c.to_string();
+            Value::string(&ch_str)
+        }).collect();
+        Ok(Value::list(chars))
+    }));
+
+    vm.define_global("list->string", native("list->string", |args| {
+        if args.len() != 1 { return Err("list->string expects 1 argument".to_string()); }
+
+        let mut result = String::new();
+
+        // Handle array lists
+        if let Some(items) = args[0].as_list() {
+            for item in items.iter() {
+                if let Some(s) = item.as_string() {
+                    result.push_str(s);
+                } else {
+                    return Err("list->string expects a list of strings".to_string());
+                }
+            }
+            return Ok(Value::string(&result));
+        }
+
+        // Handle cons cells
+        if args[0].as_cons().is_some() {
+            let mut current = &args[0];
+            while let Some(cons) = current.as_cons() {
+                if let Some(s) = cons.car.as_string() {
+                    result.push_str(s);
+                } else {
+                    return Err("list->string expects a list of strings".to_string());
+                }
+                current = &cons.cdr;
+            }
+            if let Some(items) = current.as_list() {
+                for item in items.iter() {
+                    if let Some(s) = item.as_string() {
+                        result.push_str(s);
+                    } else {
+                        return Err("list->string expects a list of strings".to_string());
+                    }
+                }
+            }
+            return Ok(Value::string(&result));
+        }
+
+        if args[0].is_nil() {
+            return Ok(Value::string(""));
+        }
+
+        Err("list->string expects a list or cons cell".to_string())
+    }));
+
+    vm.define_global("format", native("format", |args| {
+        if args.is_empty() { return Err("format expects at least 1 argument".to_string()); }
+
+        let fmt = args[0].as_string().ok_or_else(|| "format expects a string as first argument".to_string())?;
+        let mut result = String::new();
+        let mut arg_idx = 1;
+        let mut chars = fmt.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if ch == '~' {
+                if let Some(&next) = chars.peek() {
+                    chars.next(); // consume the format specifier
+                    match next {
+                        'a' | 'A' => {
+                            // Display value
+                            if arg_idx < args.len() {
+                                if let Some(s) = args[arg_idx].as_string() {
+                                    result.push_str(s);
+                                } else {
+                                    result.push_str(&format!("{}", args[arg_idx]));
+                                }
+                                arg_idx += 1;
+                            } else {
+                                return Err("format: not enough arguments".to_string());
+                            }
+                        }
+                        '~' => result.push('~'),
+                        _ => {
+                            result.push('~');
+                            result.push(next);
+                        }
+                    }
+                } else {
+                    result.push('~');
+                }
+            } else {
+                result.push(ch);
+            }
+        }
+
+        Ok(Value::string(&result))
+    }));
+
+    // I/O functions
+    vm.define_global("read-line", native("read-line", |_args| {
+        use std::io::{self, BufRead};
+        let stdin = io::stdin();
+        let mut line = String::new();
+        stdin.lock().read_line(&mut line)
+            .map_err(|e| format!("read-line error: {}", e))?;
+        // Remove trailing newline if present
+        if line.ends_with('\n') {
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+        }
+        Ok(Value::string(&line))
+    }));
+
+    vm.define_global("read-file", native("read-file", |args| {
+        if args.len() != 1 { return Err("read-file expects 1 argument".to_string()); }
+
+        let path = args[0].as_string().ok_or_else(|| "read-file expects a string path".to_string())?;
+        std::fs::read_to_string(path)
+            .map(|s| Value::string(&s))
+            .map_err(|e| format!("read-file error: {}", e))
+    }));
+
+    vm.define_global("write-file", native("write-file", |args| {
+        if args.len() != 2 { return Err("write-file expects 2 arguments (path, content)".to_string()); }
+
+        let path = args[0].as_string().ok_or_else(|| "write-file expects a string path".to_string())?;
+        let content = args[1].as_string().ok_or_else(|| "write-file expects a string content".to_string())?;
+
+        std::fs::write(path, content)
+            .map(|_| Value::nil())
+            .map_err(|e| format!("write-file error: {}", e))
+    }));
+
     vm
 }
 

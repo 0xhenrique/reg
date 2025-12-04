@@ -690,6 +690,8 @@ impl Compiler {
                 match sym {
                     "quote" => return self.compile_quote(&items[1..], dest),
                     "if" => return self.compile_if(&items[1..], dest, tail_pos),
+                    "and" => return self.compile_and(&items[1..], dest),
+                    "or" => return self.compile_or(&items[1..], dest),
                     "def" => return self.compile_def(&items[1..], dest),
                     "let" => return self.compile_let(&items[1..], dest, tail_pos),
                     "fn" => return self.compile_fn(&items[1..], dest),
@@ -769,6 +771,76 @@ impl Compiler {
 
             let end = self.chunk.current_pos();
             self.chunk.patch_jump(jump_over_nil, end);
+        }
+
+        Ok(())
+    }
+
+    fn compile_and(&mut self, args: &[Value], dest: Reg) -> Result<(), String> {
+        // (and) => true
+        if args.is_empty() {
+            self.emit(Op::load_true(dest));
+            return Ok(());
+        }
+
+        // (and x) => x
+        if args.len() == 1 {
+            return self.compile_expr(&args[0], dest, false);
+        }
+
+        // (and x y z ...) => short-circuit evaluation
+        // Evaluate each expression, if any is false, jump to end with false
+        let mut jump_to_end = Vec::new();
+
+        for (i, arg) in args.iter().enumerate() {
+            self.compile_expr(arg, dest, false)?;
+
+            // For all but the last, check if false and jump to end
+            if i < args.len() - 1 {
+                let jump = self.emit(Op::jump_if_false(dest, 0));
+                jump_to_end.push(jump);
+            }
+        }
+
+        // Patch all jumps to end (dest already has the last value or the false value)
+        let end = self.chunk.current_pos();
+        for jump in jump_to_end {
+            self.chunk.patch_jump(jump, end);
+        }
+
+        Ok(())
+    }
+
+    fn compile_or(&mut self, args: &[Value], dest: Reg) -> Result<(), String> {
+        // (or) => false
+        if args.is_empty() {
+            self.emit(Op::load_false(dest));
+            return Ok(());
+        }
+
+        // (or x) => x
+        if args.len() == 1 {
+            return self.compile_expr(&args[0], dest, false);
+        }
+
+        // (or x y z ...) => short-circuit evaluation
+        // Evaluate each expression, if any is true, jump to end with that value
+        let mut jump_to_end = Vec::new();
+
+        for (i, arg) in args.iter().enumerate() {
+            self.compile_expr(arg, dest, false)?;
+
+            // For all but the last, check if true and jump to end
+            if i < args.len() - 1 {
+                let jump = self.emit(Op::jump_if_true(dest, 0));
+                jump_to_end.push(jump);
+            }
+        }
+
+        // Patch all jumps to end (dest already has the last value or the true value)
+        let end = self.chunk.current_pos();
+        for jump in jump_to_end {
+            self.chunk.patch_jump(jump, end);
         }
 
         Ok(())
