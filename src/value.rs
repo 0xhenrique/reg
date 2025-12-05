@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::bytecode::Chunk;
 
@@ -271,6 +272,111 @@ impl Clone for HeapObject {
             HeapObject::Function(f) => HeapObject::Function(f.clone()),
             HeapObject::NativeFunction(f) => HeapObject::NativeFunction(f.clone()),
             HeapObject::CompiledFunction(c) => HeapObject::CompiledFunction(c.clone()),
+        }
+    }
+}
+
+//=============================================================================
+// Thread-Safe Shared Values (Arc-based)
+//=============================================================================
+//
+// SharedValue and SharedHeapObject provide Arc-based alternatives to the
+// Rc-based Value and HeapObject types. These are used when values need to
+// be shared across thread boundaries.
+//
+// Conversion:
+//   Value (Rc) -> SharedValue (Arc) via make_shared()
+//   SharedValue (Arc) -> Value (Rc) via from_shared()
+
+/// Thread-safe cons cell using SharedValue instead of Value
+#[derive(Debug, Clone)]
+pub struct SharedConsCell {
+    pub car: SharedValue,
+    pub cdr: SharedValue,
+}
+
+/// Thread-safe heap objects using Arc instead of Rc
+/// Mirrors HeapObject but is safe to send across threads
+#[derive(Debug, Clone)]
+pub enum SharedHeapObject {
+    /// String data
+    String(Box<str>),
+    /// Symbol - shared across threads
+    Symbol(Arc<str>),
+    /// List of shared values
+    List(Box<[SharedValue]>),
+    /// Cons cell with shared values
+    Cons(SharedConsCell),
+    /// Functions cannot be shared across threads (closures capture environment)
+    /// Use channels or other communication primitives instead
+    /// We keep this variant for completeness but it will error if attempted
+    Function(Box<Function>),
+    /// Native functions are just function pointers, safe to share
+    NativeFunction(NativeFunction),
+    /// Compiled functions share their chunk via Arc
+    CompiledFunction(Arc<Chunk>),
+}
+
+/// A thread-safe value that can be sent across thread boundaries
+/// Uses Arc internally instead of Rc
+#[derive(Clone)]
+pub struct SharedValue {
+    /// The underlying Arc-allocated heap object
+    /// For primitives (int, float, bool, nil), we just clone the Value bits
+    inner: Arc<SharedHeapObject>,
+}
+
+impl fmt::Debug for SharedValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SharedValue({:?})", self.inner)
+    }
+}
+
+impl fmt::Display for SharedValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &*self.inner {
+            SharedHeapObject::String(s) => write!(f, "\"{}\"", s),
+            SharedHeapObject::Symbol(s) => write!(f, "{}", s),
+            SharedHeapObject::List(items) => {
+                write!(f, "(")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
+                    }
+                    write!(f, "{}", item)?;
+                }
+                write!(f, ")")
+            }
+            SharedHeapObject::Cons(_) => {
+                // Print cons cells as lists
+                write!(f, "(")?;
+                let mut current = self.clone();
+                let mut first = true;
+                loop {
+                    if let SharedHeapObject::Cons(cons) = &*current.inner {
+                        if !first {
+                            write!(f, " ")?;
+                        }
+                        first = false;
+                        write!(f, "{}", cons.car)?;
+                        current = cons.cdr.clone();
+                    } else if matches!(&*current.inner, SharedHeapObject::List(items) if items.is_empty()) {
+                        break;
+                    } else if let SharedHeapObject::List(items) = &*current.inner {
+                        for item in items.iter() {
+                            write!(f, " {}", item)?;
+                        }
+                        break;
+                    } else {
+                        write!(f, " . {}", current)?;
+                        break;
+                    }
+                }
+                write!(f, ")")
+            }
+            SharedHeapObject::Function(_) => write!(f, "<function>"),
+            SharedHeapObject::NativeFunction(nf) => write!(f, "<native fn {}>", nf.name),
+            SharedHeapObject::CompiledFunction(_) => write!(f, "<function>"),
         }
     }
 }
@@ -881,6 +987,150 @@ impl Value {
         } else {
             // Primitive values don't need promotion
             self.clone()
+        }
+    }
+
+    /// Convert an Rc-based Value to an Arc-based SharedValue for thread sharing
+    /// This deep-converts the entire value tree, recursively converting all nested values
+    ///
+    /// # Example
+    /// ```ignore
+    /// let value = Value::list(vec![Value::int(1), Value::int(2)]);
+    /// let shared = value.make_shared().unwrap();
+    /// // shared can now be sent across thread boundaries
+    /// ```
+    pub fn make_shared(&self) -> Result<SharedValue, String> {
+        // First promote arena values to Rc (if any)
+        let promoted = self.promote();
+
+        // Then convert Rc to Arc
+        if promoted.is_nil() {
+            // Nil is represented as an empty list
+            return Ok(SharedValue {
+                inner: Arc::new(SharedHeapObject::List(Box::new([]))),
+            });
+        }
+
+        if let Some(b) = promoted.as_bool() {
+            // Bools need to be wrapped
+            let bool_str = if b { "true" } else { "false" };
+            return Ok(SharedValue {
+                inner: Arc::new(SharedHeapObject::Symbol(Arc::from(bool_str))),
+            });
+        }
+
+        if let Some(i) = promoted.as_int() {
+            // Integers as symbols for now (could be optimized later)
+            return Ok(SharedValue {
+                inner: Arc::new(SharedHeapObject::Symbol(Arc::from(i.to_string().as_str()))),
+            });
+        }
+
+        if let Some(f) = promoted.as_float() {
+            // Floats as symbols for now (could be optimized later)
+            return Ok(SharedValue {
+                inner: Arc::new(SharedHeapObject::Symbol(Arc::from(f.to_string().as_str()))),
+            });
+        }
+
+        // Handle heap objects
+        match promoted.as_heap() {
+            Some(HeapObject::String(s)) => Ok(SharedValue {
+                inner: Arc::new(SharedHeapObject::String(s.to_string().into_boxed_str())),
+            }),
+            Some(HeapObject::Symbol(s)) => Ok(SharedValue {
+                inner: Arc::new(SharedHeapObject::Symbol(Arc::from(&**s))),
+            }),
+            Some(HeapObject::List(items)) => {
+                let shared_items: Result<Vec<SharedValue>, String> =
+                    items.iter().map(|v| v.make_shared()).collect();
+                Ok(SharedValue {
+                    inner: Arc::new(SharedHeapObject::List(
+                        shared_items?.into_boxed_slice(),
+                    )),
+                })
+            }
+            Some(HeapObject::Cons(cons)) => {
+                let shared_car = cons.car.make_shared()?;
+                let shared_cdr = cons.cdr.make_shared()?;
+                Ok(SharedValue {
+                    inner: Arc::new(SharedHeapObject::Cons(SharedConsCell {
+                        car: shared_car,
+                        cdr: shared_cdr,
+                    })),
+                })
+            }
+            Some(HeapObject::Function(_)) => {
+                Err("Functions cannot be shared across threads".to_string())
+            }
+            Some(HeapObject::NativeFunction(nf)) => Ok(SharedValue {
+                inner: Arc::new(SharedHeapObject::NativeFunction(nf.clone())),
+            }),
+            Some(HeapObject::CompiledFunction(chunk)) => {
+                // Convert Rc<Chunk> to Arc<Chunk>
+                let arc_chunk = Arc::new((**chunk).clone());
+                Ok(SharedValue {
+                    inner: Arc::new(SharedHeapObject::CompiledFunction(arc_chunk)),
+                })
+            }
+            None => Err("Cannot convert unknown value to SharedValue".to_string()),
+        }
+    }
+
+    /// Convert an Arc-based SharedValue back to an Rc-based Value
+    /// This is used when bringing values back from threads into single-threaded context
+    ///
+    /// # Example
+    /// ```ignore
+    /// let shared = value.make_shared().unwrap();
+    /// // ... pass to thread ...
+    /// let value_back = Value::from_shared(&shared);
+    /// ```
+    pub fn from_shared(shared: &SharedValue) -> Value {
+        match &*shared.inner {
+            SharedHeapObject::String(s) => Value::string(s),
+            SharedHeapObject::Symbol(s) => {
+                // Try to parse as primitives first
+                if s.as_ref() == "true" {
+                    return Value::bool(true);
+                }
+                if s.as_ref() == "false" {
+                    return Value::bool(false);
+                }
+                if s.as_ref() == "nil" {
+                    return Value::nil();
+                }
+                // Try parsing as number
+                if let Ok(i) = s.parse::<i64>() {
+                    return Value::int(i);
+                }
+                if let Ok(f) = s.parse::<f64>() {
+                    return Value::float(f);
+                }
+                // Otherwise treat as symbol
+                Value::symbol(s)
+            }
+            SharedHeapObject::List(items) => {
+                if items.is_empty() {
+                    return Value::nil();
+                }
+                let values: Vec<Value> = items.iter().map(Value::from_shared).collect();
+                Value::list(values)
+            }
+            SharedHeapObject::Cons(cons) => {
+                let car = Value::from_shared(&cons.car);
+                let cdr = Value::from_shared(&cons.cdr);
+                Value::cons_rc(car, cdr)
+            }
+            SharedHeapObject::Function(f) => Value::function((**f).clone()),
+            SharedHeapObject::NativeFunction(nf) => {
+                Value::native_function(&nf.name, nf.func)
+            }
+            SharedHeapObject::CompiledFunction(chunk) => {
+                // Convert Arc<Chunk> back to Rc<Chunk>
+                let rc_chunk = Rc::new((**chunk).clone());
+                Value::CompiledFunction(rc_chunk)
+            }
         }
     }
 }
@@ -1775,5 +2025,173 @@ mod tests {
             got: "string".to_string(),
         };
         assert_eq!(format!("{}", err), "expected int, got string");
+    }
+
+    // Arc/Rc Conversion Tests
+
+    #[test]
+    fn test_make_shared_primitives() {
+        // Test nil
+        let v = Value::nil();
+        let shared = v.make_shared().unwrap();
+        let back = Value::from_shared(&shared);
+        assert!(back.is_nil());
+
+        // Test bool
+        let v = Value::bool(true);
+        let shared = v.make_shared().unwrap();
+        let back = Value::from_shared(&shared);
+        assert_eq!(back.as_bool(), Some(true));
+
+        let v = Value::bool(false);
+        let shared = v.make_shared().unwrap();
+        let back = Value::from_shared(&shared);
+        assert_eq!(back.as_bool(), Some(false));
+
+        // Test int
+        let v = Value::int(42);
+        let shared = v.make_shared().unwrap();
+        let back = Value::from_shared(&shared);
+        assert_eq!(back.as_int(), Some(42));
+
+        // Test float
+        let v = Value::float(3.14);
+        let shared = v.make_shared().unwrap();
+        let back = Value::from_shared(&shared);
+        assert_eq!(back.as_float(), Some(3.14));
+    }
+
+    #[test]
+    fn test_make_shared_string() {
+        let v = Value::string("hello world");
+        let shared = v.make_shared().unwrap();
+        let back = Value::from_shared(&shared);
+        assert_eq!(back.as_string(), Some("hello world"));
+    }
+
+    #[test]
+    fn test_make_shared_symbol() {
+        let v = Value::symbol("foo");
+        let shared = v.make_shared().unwrap();
+        let back = Value::from_shared(&shared);
+        assert_eq!(back.as_symbol(), Some("foo"));
+    }
+
+    #[test]
+    fn test_make_shared_list() {
+        let v = Value::list(vec![
+            Value::int(1),
+            Value::int(2),
+            Value::int(3),
+        ]);
+        let shared = v.make_shared().unwrap();
+        let back = Value::from_shared(&shared);
+
+        let items = back.as_list().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].as_int(), Some(1));
+        assert_eq!(items[1].as_int(), Some(2));
+        assert_eq!(items[2].as_int(), Some(3));
+    }
+
+    #[test]
+    fn test_make_shared_cons() {
+        let v = Value::cons_rc(
+            Value::int(1),
+            Value::cons_rc(Value::int(2), Value::nil()),
+        );
+        let shared = v.make_shared().unwrap();
+        let back = Value::from_shared(&shared);
+
+        let cons1 = back.as_cons().unwrap();
+        assert_eq!(cons1.car.as_int(), Some(1));
+
+        let cons2 = cons1.cdr.as_cons().unwrap();
+        assert_eq!(cons2.car.as_int(), Some(2));
+        assert!(cons2.cdr.is_nil());
+    }
+
+    #[test]
+    fn test_make_shared_nested_list() {
+        let v = Value::list(vec![
+            Value::int(1),
+            Value::list(vec![Value::int(2), Value::int(3)]),
+            Value::int(4),
+        ]);
+        let shared = v.make_shared().unwrap();
+        let back = Value::from_shared(&shared);
+
+        let items = back.as_list().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].as_int(), Some(1));
+
+        let nested = items[1].as_list().unwrap();
+        assert_eq!(nested.len(), 2);
+        assert_eq!(nested[0].as_int(), Some(2));
+        assert_eq!(nested[1].as_int(), Some(3));
+
+        assert_eq!(items[2].as_int(), Some(4));
+    }
+
+    #[test]
+    fn test_make_shared_mixed_types() {
+        let v = Value::list(vec![
+            Value::int(42),
+            Value::string("hello"),
+            Value::symbol("foo"),
+            Value::bool(true),
+        ]);
+        let shared = v.make_shared().unwrap();
+        let back = Value::from_shared(&shared);
+
+        let items = back.as_list().unwrap();
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].as_int(), Some(42));
+        assert_eq!(items[1].as_string(), Some("hello"));
+        assert_eq!(items[2].as_symbol(), Some("foo"));
+        assert_eq!(items[3].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_make_shared_function_errors() {
+        use crate::eval::Env;
+
+        let env = Env::new();
+        let func = Function {
+            params: vec!["x".to_string()],
+            body: Value::symbol("x"),
+            env: env.clone(),
+        };
+        let v = Value::function(func);
+
+        // Functions cannot be shared across threads
+        let result = v.make_shared();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cannot be shared"));
+    }
+
+    #[test]
+    fn test_shared_value_display() {
+        let v = Value::list(vec![Value::int(1), Value::int(2), Value::int(3)]);
+        let shared = v.make_shared().unwrap();
+        let display = format!("{}", shared);
+
+        // Should display as a list
+        assert!(display.contains("1"));
+        assert!(display.contains("2"));
+        assert!(display.contains("3"));
+    }
+
+    #[test]
+    fn test_shared_value_clone() {
+        let v = Value::int(42);
+        let shared1 = v.make_shared().unwrap();
+        let shared2 = shared1.clone();
+
+        // Both should convert back to the same value
+        let back1 = Value::from_shared(&shared1);
+        let back2 = Value::from_shared(&shared2);
+        assert_eq!(back1.as_int(), Some(42));
+        assert_eq!(back2.as_int(), Some(42));
     }
 }
