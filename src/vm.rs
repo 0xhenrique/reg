@@ -1516,6 +1516,58 @@ pub fn standard_vm() -> VM {
         Ok(Value::bool(!args[0].is_truthy()))
     }));
 
+    // Math helper functions
+    vm.define_global("abs", native("abs", |args| {
+        if args.len() != 1 { return Err("abs expects 1 argument".to_string()); }
+        if let Some(i) = args[0].as_int() {
+            Ok(Value::int(i.abs()))
+        } else if let Some(f) = args[0].as_float() {
+            Ok(Value::float(f.abs()))
+        } else {
+            Err("abs expects a number".to_string())
+        }
+    }));
+
+    vm.define_global("even?", native("even?", |args| {
+        if args.len() != 1 { return Err("even? expects 1 argument".to_string()); }
+        if let Some(i) = args[0].as_int() {
+            Ok(Value::bool(i % 2 == 0))
+        } else {
+            Err("even? expects an integer".to_string())
+        }
+    }));
+
+    vm.define_global("odd?", native("odd?", |args| {
+        if args.len() != 1 { return Err("odd? expects 1 argument".to_string()); }
+        if let Some(i) = args[0].as_int() {
+            Ok(Value::bool(i % 2 != 0))
+        } else {
+            Err("odd? expects an integer".to_string())
+        }
+    }));
+
+    vm.define_global("positive?", native("positive?", |args| {
+        if args.len() != 1 { return Err("positive? expects 1 argument".to_string()); }
+        if let Some(i) = args[0].as_int() {
+            Ok(Value::bool(i > 0))
+        } else if let Some(f) = args[0].as_float() {
+            Ok(Value::bool(f > 0.0))
+        } else {
+            Err("positive? expects a number".to_string())
+        }
+    }));
+
+    vm.define_global("negative?", native("negative?", |args| {
+        if args.len() != 1 { return Err("negative? expects 1 argument".to_string()); }
+        if let Some(i) = args[0].as_int() {
+            Ok(Value::bool(i < 0))
+        } else if let Some(f) = args[0].as_float() {
+            Ok(Value::bool(f < 0.0))
+        } else {
+            Err("negative? expects a number".to_string())
+        }
+    }));
+
     // List operations
     vm.define_global("list", native("list", |args| Ok(Value::list(args.to_vec()))));
 
@@ -2240,6 +2292,100 @@ pub fn standard_vm() -> VM {
         } else {
             Err("swap! expects an atom as first argument".to_string())
         }
+    }));
+
+    vm.define_global("pmap", native("pmap", |args| {
+        use rayon::prelude::*;
+
+        if args.len() != 2 {
+            return Err("pmap expects 2 arguments (function list)".to_string());
+        }
+
+        // Get the function
+        let func = &args[0];
+
+        // Get the list
+        let items = args[1].as_list()
+            .ok_or_else(|| "pmap expects a list as second argument".to_string())?;
+
+        // Check if function is a native function
+        let native_func = func.as_native_function()
+            .ok_or_else(|| "pmap currently only supports native functions".to_string())?;
+
+        // Convert items to SharedValue for thread-safe processing
+        let shared_items: Result<Vec<_>, String> = items.iter()
+            .map(|v| v.make_shared())
+            .collect();
+        let shared_items = shared_items?;
+
+        // Process in parallel using Rayon
+        let results: Result<Vec<_>, String> = shared_items
+            .par_iter()
+            .map(|shared_val| {
+                // Convert back to Rc-based Value for function call
+                let val = Value::from_shared(shared_val);
+
+                // Apply function
+                (native_func.func)(&[val])
+            })
+            .collect();
+
+        let results = results?;
+
+        // Return as list
+        Ok(Value::list(results))
+    }));
+
+    vm.define_global("pfilter", native("pfilter", |args| {
+        use rayon::prelude::*;
+
+        if args.len() != 2 {
+            return Err("pfilter expects 2 arguments (predicate list)".to_string());
+        }
+
+        // Get the predicate function
+        let pred = &args[0];
+
+        // Get the list
+        let items = args[1].as_list()
+            .ok_or_else(|| "pfilter expects a list as second argument".to_string())?;
+
+        // Check if predicate is a native function
+        let native_pred = pred.as_native_function()
+            .ok_or_else(|| "pfilter currently only supports native functions".to_string())?;
+
+        // Convert items to SharedValue for thread-safe processing
+        let shared_items: Result<Vec<_>, String> = items.iter()
+            .map(|v| v.make_shared())
+            .collect();
+        let shared_items = shared_items?;
+
+        // Filter in parallel using Rayon
+        let results: Result<Vec<_>, String> = shared_items
+            .par_iter()
+            .filter_map(|shared_val| {
+                // Convert back to Rc-based Value for function call
+                let val = Value::from_shared(shared_val);
+
+                // Apply predicate
+                match (native_pred.func)(&[val.clone()]) {
+                    Ok(result) => {
+                        // Check if result is truthy (not nil and not false)
+                        if result.is_nil() || (result.as_bool() == Some(false)) {
+                            None
+                        } else {
+                            Some(Ok(val))
+                        }
+                    }
+                    Err(e) => Some(Err(e)),
+                }
+            })
+            .collect();
+
+        let results = results?;
+
+        // Return as list
+        Ok(Value::list(results))
     }));
 
     vm

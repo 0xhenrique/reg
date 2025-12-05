@@ -4,12 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Cranelift JIT compilation
 cranelift = "0.116"
 cranelift-jit = "0.116"
 cranelift-module = "0.116"
 cranelift-native = "0.116"
 cranelift-codegen = "0.116"
+rayon = "1.10"
 
 [dev-dependencies]
 
