@@ -1,5 +1,3 @@
-;; Test spawn and join - Phase 9 Concurrency
-
 (println "Testing spawn and join...")
 
 ;; Test 1: Simple spawn/join - just return a value

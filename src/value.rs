@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -264,6 +265,12 @@ pub enum HeapObject {
     /// Thread handle for spawned threads - wrapped in Mutex because JoinHandle can only be joined once
     /// The Option allows us to take the handle when joining (join consumes the handle)
     ThreadHandle(Arc<Mutex<Option<JoinHandle<Result<SharedValue, String>>>>>),
+    /// Channel sender for inter-thread communication
+    /// Wrapped in Arc<Mutex<>> to allow cloning and thread-safe access
+    ChannelSender(Arc<Mutex<Sender<SharedValue>>>),
+    /// Channel receiver for inter-thread communication
+    /// Wrapped in Arc<Mutex<>> to allow thread-safe access
+    ChannelReceiver(Arc<Mutex<Receiver<SharedValue>>>),
 }
 
 impl Clone for HeapObject {
@@ -277,6 +284,8 @@ impl Clone for HeapObject {
             HeapObject::NativeFunction(f) => HeapObject::NativeFunction(f.clone()),
             HeapObject::CompiledFunction(c) => HeapObject::CompiledFunction(c.clone()),
             HeapObject::ThreadHandle(h) => HeapObject::ThreadHandle(h.clone()),
+            HeapObject::ChannelSender(s) => HeapObject::ChannelSender(s.clone()),
+            HeapObject::ChannelReceiver(r) => HeapObject::ChannelReceiver(r.clone()),
         }
     }
 }
@@ -779,6 +788,8 @@ impl Value {
                 HeapObject::NativeFunction(_) => "native-function",
                 HeapObject::CompiledFunction(_) => "function",
                 HeapObject::ThreadHandle(_) => "thread-handle",
+                HeapObject::ChannelSender(_) => "channel-sender",
+                HeapObject::ChannelReceiver(_) => "channel-receiver",
             }
         } else {
             "unknown"
@@ -967,6 +978,16 @@ impl Value {
                     let heap = Rc::new(HeapObject::ThreadHandle(h.clone()));
                     Value::from_heap(heap)
                 }
+                Some(HeapObject::ChannelSender(s)) => {
+                    // ChannelSenders are already Arc-based, just clone the Value
+                    let heap = Rc::new(HeapObject::ChannelSender(s.clone()));
+                    Value::from_heap(heap)
+                }
+                Some(HeapObject::ChannelReceiver(r)) => {
+                    // ChannelReceivers are already Arc-based, just clone the Value
+                    let heap = Rc::new(HeapObject::ChannelReceiver(r.clone()));
+                    Value::from_heap(heap)
+                }
                 None => Value::nil(),
             }
         } else if self.is_ptr() {
@@ -1083,6 +1104,12 @@ impl Value {
             }
             Some(HeapObject::ThreadHandle(_)) => {
                 Err("Thread handles cannot be shared across threads".to_string())
+            }
+            Some(HeapObject::ChannelSender(_)) => {
+                Err("Channel senders cannot be converted to SharedValue (they are already thread-safe)".to_string())
+            }
+            Some(HeapObject::ChannelReceiver(_)) => {
+                Err("Channel receivers cannot be converted to SharedValue (they are already thread-safe)".to_string())
             }
             None => Err("Cannot convert unknown value to SharedValue".to_string()),
         }
@@ -1223,6 +1250,8 @@ impl fmt::Display for Value {
                 HeapObject::NativeFunction(nf) => write!(f, "<native fn {}>", nf.name),
                 HeapObject::CompiledFunction(_) => write!(f, "<function>"),
                 HeapObject::ThreadHandle(_) => write!(f, "<thread-handle>"),
+                HeapObject::ChannelSender(_) => write!(f, "<channel-sender>"),
+                HeapObject::ChannelReceiver(_) => write!(f, "<channel-receiver>"),
             }
         } else {
             write!(f, "<unknown>")

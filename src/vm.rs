@@ -2038,6 +2038,89 @@ pub fn standard_vm() -> VM {
         }
     }));
 
+    vm.define_global("channel", native("channel", |args| {
+        use std::sync::mpsc;
+        use std::sync::{Arc, Mutex};
+        use crate::value::HeapObject;
+
+        if !args.is_empty() {
+            return Err("channel expects 0 arguments".to_string());
+        }
+
+        // Create an unbounded channel
+        let (sender, receiver) = mpsc::channel();
+
+        // Wrap sender and receiver in Arc<Mutex<>> for thread-safety
+        let sender_arc = Arc::new(Mutex::new(sender));
+        let receiver_arc = Arc::new(Mutex::new(receiver));
+
+        // Create HeapObject values
+        let sender_heap = Rc::new(HeapObject::ChannelSender(sender_arc));
+        let receiver_heap = Rc::new(HeapObject::ChannelReceiver(receiver_arc));
+
+        // Return a list [sender receiver]
+        Ok(Value::list(vec![
+            Value::from_heap(sender_heap),
+            Value::from_heap(receiver_heap),
+        ]))
+    }));
+
+    vm.define_global("send!", native("send!", |args| {
+        use crate::value::HeapObject;
+
+        if args.len() != 2 {
+            return Err("send! expects 2 arguments (sender value)".to_string());
+        }
+
+        // Get the sender
+        let sender_obj = args[0].as_heap()
+            .ok_or_else(|| "send! expects a channel-sender as first argument".to_string())?;
+
+        if let HeapObject::ChannelSender(sender_mutex) = sender_obj {
+            // Convert the value to SharedValue for thread-safe sending
+            let shared_value = args[1].make_shared()
+                .map_err(|e| format!("send! failed to convert value: {}", e))?;
+
+            // Send the value
+            let sender = sender_mutex.lock()
+                .map_err(|_| "Failed to lock channel sender".to_string())?;
+
+            sender.send(shared_value)
+                .map_err(|_| "send! failed: receiver has been dropped".to_string())?;
+
+            // Return nil
+            Ok(Value::nil())
+        } else {
+            Err("send! expects a channel-sender as first argument".to_string())
+        }
+    }));
+
+    vm.define_global("recv", native("recv", |args| {
+        use crate::value::HeapObject;
+
+        if args.len() != 1 {
+            return Err("recv expects 1 argument (receiver)".to_string());
+        }
+
+        // Get the receiver
+        let receiver_obj = args[0].as_heap()
+            .ok_or_else(|| "recv expects a channel-receiver".to_string())?;
+
+        if let HeapObject::ChannelReceiver(receiver_mutex) = receiver_obj {
+            // Receive a value (blocking)
+            let receiver = receiver_mutex.lock()
+                .map_err(|_| "Failed to lock channel receiver".to_string())?;
+
+            let shared_value = receiver.recv()
+                .map_err(|_| "recv failed: sender has been dropped".to_string())?;
+
+            // Convert back to Rc-based Value
+            Ok(Value::from_shared(&shared_value))
+        } else {
+            Err("recv expects a channel-receiver".to_string())
+        }
+    }));
+
     vm
 }
 
