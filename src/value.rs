@@ -271,6 +271,9 @@ pub enum HeapObject {
     /// Channel receiver for inter-thread communication
     /// Wrapped in Arc<Mutex<>> to allow thread-safe access
     ChannelReceiver(Arc<Mutex<Receiver<SharedValue>>>),
+    /// Atomic reference for shared mutable state
+    /// Wrapped in Arc<Mutex<>> to allow thread-safe mutation
+    Atom(Arc<Mutex<SharedValue>>),
 }
 
 impl Clone for HeapObject {
@@ -286,6 +289,7 @@ impl Clone for HeapObject {
             HeapObject::ThreadHandle(h) => HeapObject::ThreadHandle(h.clone()),
             HeapObject::ChannelSender(s) => HeapObject::ChannelSender(s.clone()),
             HeapObject::ChannelReceiver(r) => HeapObject::ChannelReceiver(r.clone()),
+            HeapObject::Atom(a) => HeapObject::Atom(a.clone()),
         }
     }
 }
@@ -790,6 +794,7 @@ impl Value {
                 HeapObject::ThreadHandle(_) => "thread-handle",
                 HeapObject::ChannelSender(_) => "channel-sender",
                 HeapObject::ChannelReceiver(_) => "channel-receiver",
+                HeapObject::Atom(_) => "atom",
             }
         } else {
             "unknown"
@@ -988,6 +993,11 @@ impl Value {
                     let heap = Rc::new(HeapObject::ChannelReceiver(r.clone()));
                     Value::from_heap(heap)
                 }
+                Some(HeapObject::Atom(a)) => {
+                    // Atoms are already Arc-based, just clone the Value
+                    let heap = Rc::new(HeapObject::Atom(a.clone()));
+                    Value::from_heap(heap)
+                }
                 None => Value::nil(),
             }
         } else if self.is_ptr() {
@@ -1110,6 +1120,9 @@ impl Value {
             }
             Some(HeapObject::ChannelReceiver(_)) => {
                 Err("Channel receivers cannot be converted to SharedValue (they are already thread-safe)".to_string())
+            }
+            Some(HeapObject::Atom(_)) => {
+                Err("Atoms cannot be converted to SharedValue (they are already thread-safe)".to_string())
             }
             None => Err("Cannot convert unknown value to SharedValue".to_string()),
         }
@@ -1252,6 +1265,11 @@ impl fmt::Display for Value {
                 HeapObject::ThreadHandle(_) => write!(f, "<thread-handle>"),
                 HeapObject::ChannelSender(_) => write!(f, "<channel-sender>"),
                 HeapObject::ChannelReceiver(_) => write!(f, "<channel-receiver>"),
+                HeapObject::Atom(a) => {
+                    // Display the current value inside the atom
+                    let value = a.lock().unwrap();
+                    write!(f, "(atom {})", value)
+                }
             }
         } else {
             write!(f, "<unknown>")

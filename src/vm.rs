@@ -2121,6 +2121,127 @@ pub fn standard_vm() -> VM {
         }
     }));
 
+    vm.define_global("atom", native("atom", |args| {
+        use std::sync::{Arc, Mutex};
+        use crate::value::HeapObject;
+
+        if args.len() != 1 {
+            return Err("atom expects 1 argument (initial value)".to_string());
+        }
+
+        // Convert initial value to SharedValue
+        let shared_value = args[0].make_shared()
+            .map_err(|e| format!("atom failed to convert initial value: {}", e))?;
+
+        // Create atom with Arc<Mutex<SharedValue>>
+        let atom_arc = Arc::new(Mutex::new(shared_value));
+        let atom_heap = Rc::new(HeapObject::Atom(atom_arc));
+
+        Ok(Value::from_heap(atom_heap))
+    }));
+
+    vm.define_global("deref", native("deref", |args| {
+        use crate::value::HeapObject;
+
+        if args.len() != 1 {
+            return Err("deref expects 1 argument (atom)".to_string());
+        }
+
+        // Get the atom
+        let atom_obj = args[0].as_heap()
+            .ok_or_else(|| "deref expects an atom".to_string())?;
+
+        if let HeapObject::Atom(atom_mutex) = atom_obj {
+            // Read the current value
+            let shared_value = atom_mutex.lock()
+                .map_err(|_| "Failed to lock atom".to_string())?;
+
+            // Convert back to Rc-based Value
+            Ok(Value::from_shared(&shared_value))
+        } else {
+            Err("deref expects an atom".to_string())
+        }
+    }));
+
+    vm.define_global("reset!", native("reset!", |args| {
+        use crate::value::HeapObject;
+
+        if args.len() != 2 {
+            return Err("reset! expects 2 arguments (atom new-value)".to_string());
+        }
+
+        // Get the atom
+        let atom_obj = args[0].as_heap()
+            .ok_or_else(|| "reset! expects an atom as first argument".to_string())?;
+
+        if let HeapObject::Atom(atom_mutex) = atom_obj {
+            // Convert new value to SharedValue
+            let new_shared = args[1].make_shared()
+                .map_err(|e| format!("reset! failed to convert new value: {}", e))?;
+
+            // Replace the value
+            let mut current = atom_mutex.lock()
+                .map_err(|_| "Failed to lock atom".to_string())?;
+            *current = new_shared.clone();
+
+            // Return the new value
+            Ok(Value::from_shared(&new_shared))
+        } else {
+            Err("reset! expects an atom as first argument".to_string())
+        }
+    }));
+
+    vm.define_global("swap!", native("swap!", |args| {
+        use crate::value::HeapObject;
+
+        if args.len() < 2 {
+            return Err("swap! expects at least 2 arguments (atom function [args...])".to_string());
+        }
+
+        // Get the atom
+        let atom_obj = args[0].as_heap()
+            .ok_or_else(|| "swap! expects an atom as first argument".to_string())?;
+
+        if let HeapObject::Atom(atom_mutex) = atom_obj {
+            // Get the function
+            let func = &args[1];
+
+            // Lock the atom
+            let mut current = atom_mutex.lock()
+                .map_err(|_| "Failed to lock atom".to_string())?;
+
+            // Convert current value back to Rc-based for function call
+            let current_value = Value::from_shared(&current);
+
+            // Build function call arguments: current value + any extra args
+            let mut func_args = vec![current_value];
+            if args.len() > 2 {
+                func_args.extend_from_slice(&args[2..]);
+            }
+
+            // Apply the function
+            let new_value = if let Some(nf) = func.as_native_function() {
+                (nf.func)(&func_args)?
+            } else if let Some(_chunk) = func.as_compiled_function() {
+                // For compiled functions, we need to create a VM and run the chunk
+                // For now, we'll only support native functions in swap!
+                return Err("swap! currently only supports native functions".to_string());
+            } else {
+                return Err("swap! expects a function as second argument".to_string());
+            };
+
+            // Convert result to SharedValue and update atom
+            let new_shared = new_value.make_shared()
+                .map_err(|e| format!("swap! failed to convert result: {}", e))?;
+            *current = new_shared.clone();
+
+            // Return the new value
+            Ok(Value::from_shared(&new_shared))
+        } else {
+            Err("swap! expects an atom as first argument".to_string())
+        }
+    }));
+
     vm
 }
 
