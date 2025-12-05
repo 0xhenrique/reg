@@ -11,7 +11,7 @@ pub use compiler::Compiler;
 pub use eval::{eval, standard_env, Env};
 pub use macros::{expand, MacroRegistry};
 pub use parser::{parse, parse_all};
-pub use value::{clear_arena, set_arena_enabled, Value};
+pub use value::{clear_arena, set_arena_enabled, ConversionError, Value};
 pub use vm::{standard_vm, VM};
 
 /// Debugging function to evaluate a string using the bytecode VM

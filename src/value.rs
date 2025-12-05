@@ -1012,6 +1012,216 @@ impl PartialEq for Value {
     }
 }
 
+//=============================================================================
+// Value Conversion Traits - FFI Support
+//=============================================================================
+// These traits enable ergonomic conversion between Rust types and Values,
+// making FFI and native function implementation more convenient.
+
+// From<T> for Value - infallible conversions (always succeed)
+
+impl From<()> for Value {
+    fn from(_: ()) -> Self {
+        Value::nil()
+    }
+}
+
+impl From<bool> for Value {
+    fn from(b: bool) -> Self {
+        Value::bool(b)
+    }
+}
+
+impl From<i64> for Value {
+    fn from(n: i64) -> Self {
+        Value::int(n)
+    }
+}
+
+impl From<i32> for Value {
+    fn from(n: i32) -> Self {
+        Value::int(n as i64)
+    }
+}
+
+impl From<usize> for Value {
+    fn from(n: usize) -> Self {
+        Value::int(n as i64)
+    }
+}
+
+impl From<f64> for Value {
+    fn from(n: f64) -> Self {
+        Value::float(n)
+}
+}
+
+impl From<&str> for Value {
+    fn from(s: &str) -> Self {
+        Value::string(s)
+    }
+}
+
+impl From<String> for Value {
+    fn from(s: String) -> Self {
+        Value::string(&s)
+    }
+}
+
+impl<T: Into<Value>> From<Vec<T>> for Value {
+    fn from(v: Vec<T>) -> Self {
+        let items: Vec<Value> = v.into_iter().map(|x| x.into()).collect();
+        Value::list(items)
+    }
+}
+
+impl<T: Into<Value>> From<Option<T>> for Value {
+    fn from(opt: Option<T>) -> Self {
+        match opt {
+            Some(v) => v.into(),
+            None => Value::nil(),
+        }
+    }
+}
+
+// TryFrom<Value> for T - fallible conversions (can fail)
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversionError {
+    pub expected: &'static str,
+    pub got: String,
+}
+
+impl fmt::Display for ConversionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "expected {}, got {}", self.expected, self.got)
+    }
+}
+
+impl std::error::Error for ConversionError {}
+
+impl TryFrom<Value> for bool {
+    type Error = ConversionError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        value.as_bool().ok_or_else(|| ConversionError {
+            expected: "bool",
+            got: value.type_name().to_string(),
+        })
+    }
+}
+
+impl TryFrom<Value> for i64 {
+    type Error = ConversionError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        value.as_int().ok_or_else(|| ConversionError {
+            expected: "int",
+            got: value.type_name().to_string(),
+        })
+    }
+}
+
+impl TryFrom<Value> for i32 {
+    type Error = ConversionError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        let n = value.as_int().ok_or_else(|| ConversionError {
+            expected: "int",
+            got: value.type_name().to_string(),
+        })?;
+        i32::try_from(n).map_err(|_| ConversionError {
+            expected: "int32",
+            got: format!("int64 out of range: {}", n),
+        })
+    }
+}
+
+impl TryFrom<Value> for usize {
+    type Error = ConversionError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        let n = value.as_int().ok_or_else(|| ConversionError {
+            expected: "int",
+            got: value.type_name().to_string(),
+        })?;
+        if n < 0 {
+            return Err(ConversionError {
+                expected: "non-negative int",
+                got: format!("{}", n),
+            });
+        }
+        Ok(n as usize)
+    }
+}
+
+impl TryFrom<Value> for f64 {
+    type Error = ConversionError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        // Allow both float and int -> float conversion
+        if let Some(f) = value.as_float() {
+            Ok(f)
+        } else if let Some(i) = value.as_int() {
+            Ok(i as f64)
+        } else {
+            Err(ConversionError {
+                expected: "float or int",
+                got: value.type_name().to_string(),
+            })
+        }
+    }
+}
+
+impl TryFrom<Value> for String {
+    type Error = ConversionError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        value
+            .as_string()
+            .map(|s| s.to_string())
+            .ok_or_else(|| ConversionError {
+                expected: "string",
+                got: value.type_name().to_string(),
+            })
+    }
+}
+
+impl TryFrom<Value> for Vec<Value> {
+    type Error = ConversionError;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        if value.is_nil() {
+            return Ok(Vec::new());
+        }
+
+        // Handle array lists
+        if let Some(items) = value.as_list() {
+            return Ok(items.to_vec());
+        }
+
+        // Handle cons cells - traverse and collect
+        if value.as_cons().is_some() {
+            let mut result = Vec::new();
+            let mut current = value;
+            while let Some(cons) = current.as_cons() {
+                result.push(cons.car.clone());
+                current = cons.cdr.clone();
+            }
+            // If ended on array list, append it
+            if let Some(items) = current.as_list() {
+                result.extend_from_slice(items);
+            }
+            return Ok(result);
+        }
+
+        Err(ConversionError {
+            expected: "list",
+            got: value.type_name().to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1398,5 +1608,172 @@ mod tests {
         assert!(cell.is_arena(), "should be arena-allocated after clear");
 
         super::clear_arena();
+    }
+
+    // Conversion trait tests
+    #[test]
+    fn test_from_bool() {
+        let v: Value = true.into();
+        assert_eq!(v.as_bool(), Some(true));
+        let v: Value = false.into();
+        assert_eq!(v.as_bool(), Some(false));
+    }
+
+    #[test]
+    fn test_from_integers() {
+        let v: Value = 42i64.into();
+        assert_eq!(v.as_int(), Some(42));
+
+        let v: Value = 42i32.into();
+        assert_eq!(v.as_int(), Some(42));
+
+        let v: Value = 42usize.into();
+        assert_eq!(v.as_int(), Some(42));
+    }
+
+    #[test]
+    fn test_from_float() {
+        let v: Value = 3.14f64.into();
+        assert_eq!(v.as_float(), Some(3.14));
+    }
+
+    #[test]
+    fn test_from_string() {
+        let v: Value = "hello".into();
+        assert_eq!(v.as_string(), Some("hello"));
+
+        let v: Value = String::from("world").into();
+        assert_eq!(v.as_string(), Some("world"));
+    }
+
+    #[test]
+    fn test_from_vec() {
+        let v: Value = vec![1i64, 2i64, 3i64].into();
+        let list = v.as_list().unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].as_int(), Some(1));
+        assert_eq!(list[2].as_int(), Some(3));
+    }
+
+    #[test]
+    fn test_from_option() {
+        let v: Value = Some(42i64).into();
+        assert_eq!(v.as_int(), Some(42));
+
+        let v: Value = None::<i64>.into();
+        assert!(v.is_nil());
+    }
+
+    #[test]
+    fn test_from_unit() {
+        let v: Value = ().into();
+        assert!(v.is_nil());
+    }
+
+    #[test]
+    fn test_try_from_bool() {
+        use std::convert::TryFrom;
+
+        let v = Value::bool(true);
+        assert_eq!(bool::try_from(v), Ok(true));
+
+        let v = Value::int(42);
+        assert!(bool::try_from(v).is_err());
+    }
+
+    #[test]
+    fn test_try_from_i64() {
+        use std::convert::TryFrom;
+
+        let v = Value::int(42);
+        assert_eq!(i64::try_from(v), Ok(42));
+
+        let v = Value::bool(true);
+        assert!(i64::try_from(v).is_err());
+    }
+
+    #[test]
+    fn test_try_from_i32() {
+        use std::convert::TryFrom;
+
+        let v = Value::int(42);
+        assert_eq!(i32::try_from(v), Ok(42));
+
+        // Test overflow - use value definitely outside i32 range
+        let v = Value::int(i32::MAX as i64 + 1);
+        assert!(i32::try_from(v).is_err());
+    }
+
+    #[test]
+    fn test_try_from_usize() {
+        use std::convert::TryFrom;
+
+        let v = Value::int(42);
+        assert_eq!(usize::try_from(v), Ok(42));
+
+        // Test negative
+        let v = Value::int(-1);
+        assert!(usize::try_from(v).is_err());
+    }
+
+    #[test]
+    fn test_try_from_f64() {
+        use std::convert::TryFrom;
+
+        let v = Value::float(3.14);
+        assert_eq!(f64::try_from(v), Ok(3.14));
+
+        // Should also work for int -> float
+        let v = Value::int(42);
+        assert_eq!(f64::try_from(v), Ok(42.0));
+
+        let v = Value::bool(true);
+        assert!(f64::try_from(v).is_err());
+    }
+
+    #[test]
+    fn test_try_from_string() {
+        use std::convert::TryFrom;
+
+        let v = Value::string("hello");
+        assert_eq!(String::try_from(v), Ok("hello".to_string()));
+
+        let v = Value::int(42);
+        assert!(String::try_from(v).is_err());
+    }
+
+    #[test]
+    fn test_try_from_vec() {
+        use std::convert::TryFrom;
+
+        let v = Value::list(vec![Value::int(1), Value::int(2), Value::int(3)]);
+        let vec = Vec::<Value>::try_from(v).unwrap();
+        assert_eq!(vec.len(), 3);
+        assert_eq!(vec[0].as_int(), Some(1));
+
+        // Test nil -> empty vec
+        let v = Value::nil();
+        let vec = Vec::<Value>::try_from(v).unwrap();
+        assert_eq!(vec.len(), 0);
+
+        // Test cons cells
+        let v = Value::cons(Value::int(1), Value::cons(Value::int(2), Value::nil()));
+        let vec = Vec::<Value>::try_from(v).unwrap();
+        assert_eq!(vec.len(), 2);
+        assert_eq!(vec[0].as_int(), Some(1));
+        assert_eq!(vec[1].as_int(), Some(2));
+
+        // Test error case
+        let v = Value::int(42);
+        assert!(Vec::<Value>::try_from(v).is_err());
+    }
+
+    #[test]
+    fn test_conversion_error_display() {
+        let err = super::ConversionError {
+            expected: "int",
+            got: "string".to_string(),
+        };
+        assert_eq!(format!("{}", err), "expected int, got string");
     }
 }
