@@ -1960,6 +1960,84 @@ pub fn standard_vm() -> VM {
             .map_err(|e| format!("write-file error: {}", e))
     }));
 
+    vm.define_global("spawn", native("spawn", |args| {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        if args.len() != 1 {
+            return Err("spawn expects 1 argument (function)".to_string());
+        }
+
+        // Get the function to spawn
+        let func = &args[0];
+
+        // Only compiled functions can be spawned (not closures with captured environments)
+        let chunk = if let Some(chunk) = func.as_compiled_function() {
+            chunk.clone()
+        } else {
+            return Err("spawn expects a compiled function (not a closure)".to_string());
+        };
+
+        // Convert Rc<Chunk> to Arc<Chunk> for thread safety
+        let arc_chunk = Arc::new((*chunk).clone());
+
+        // Spawn the thread
+        let handle = thread::spawn(move || {
+            // Create a new VM for this thread
+            let mut thread_vm = standard_vm();
+
+            // Execute the function (it should be zero-argument)
+            match thread_vm.run((*arc_chunk).clone()) {
+                Ok(result) => {
+                    // Convert result to SharedValue
+                    result.make_shared()
+                }
+                Err(e) => Err(format!("Thread execution error: {}", e)),
+            }
+        });
+
+        // Wrap the JoinHandle in Arc<Mutex<Option<>>> so it can be joined once
+        let thread_handle = Arc::new(Mutex::new(Some(handle)));
+
+        // Create a HeapObject::ThreadHandle and wrap it in a Value
+        let heap = Rc::new(crate::value::HeapObject::ThreadHandle(thread_handle));
+        Ok(Value::from_heap(heap))
+    }));
+
+    vm.define_global("join", native("join", |args| {
+        use crate::value::HeapObject;
+
+        if args.len() != 1 {
+            return Err("join expects 1 argument (thread-handle)".to_string());
+        }
+
+        // Get the thread handle
+        let handle_obj = args[0].as_heap()
+            .ok_or_else(|| "join expects a thread-handle".to_string())?;
+
+        if let HeapObject::ThreadHandle(handle_mutex) = handle_obj {
+            // Take the handle from the mutex (can only join once)
+            let handle_opt = handle_mutex.lock()
+                .map_err(|_| "Failed to lock thread handle".to_string())?
+                .take();
+
+            let handle = handle_opt
+                .ok_or_else(|| "Thread already joined".to_string())?;
+
+            // Wait for the thread to complete
+            let result = handle.join()
+                .map_err(|_| "Thread panicked".to_string())?;
+
+            // Convert the result back from Result<SharedValue, String> to Value
+            match result {
+                Ok(shared_value) => Ok(Value::from_shared(&shared_value)),
+                Err(e) => Err(format!("Thread error: {}", e)),
+            }
+        } else {
+            Err("join expects a thread-handle".to_string())
+        }
+    }));
+
     vm
 }
 

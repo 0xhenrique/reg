@@ -12,16 +12,6 @@ A Lisp interpreter with a register-based bytecode virtual machine.
 - **Immutable by default** - Values are immutable, inspired by FP
 - **Fast startup** - Minimal overhead, just feed the VM with code
 
-## Installation
-
-### Building from Source
-
-```bash
-~$ git clone https://github.com/0xhenrique/code-reg.git
-~$ cd reg
-~$ cargo build --release
-```
-
 ## How to use
 
 ### Running a Lisp File
@@ -109,7 +99,7 @@ Options:
 
 ### Recursion
 
-The VM supports kinda recursion with TCO. This is not battle tested:
+The VM kinda supports recursion with TCO. This is not battle tested:
 
 ```lisp
 ; Regular recursion
@@ -261,13 +251,14 @@ Macros enable compile-time code generation:
 
 The VM uses some common optimization techniques:
 
-- **Compile-time constant folding**: Expressions like `(+ 1 2 3)` compile directly to `6`
-- **Pure function inlining**: Pure functions with constant arguments are evaluated at compile time
+- **Constant folding**: Expressions like `(+ 1 2 3)` compile directly to `6`
+- **Function inlining**: Pure functions with constant arguments are evaluated at compile time
 - **Register-based bytecode**: Reduced memory traffic
 - **Specialized opcodes**: Direct arithmetic operations bypass function call overhead
 - **Tail call optimization**: Recursive tail calls reuse stack frames
 
-This is a rabbit hole by itself. I'm not expecting to beat something like Lua.
+Optimization is a rabbit hole by itself. I'm not expecting to beat something like Lua.
+For now, I will keep as is. Just don't try any memory intensive tests and it should work fine.
 
 ## Acknowledgments
 

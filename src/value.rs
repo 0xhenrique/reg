@@ -2,7 +2,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use crate::bytecode::Chunk;
 
@@ -260,6 +261,9 @@ pub enum HeapObject {
     NativeFunction(NativeFunction),
     /// Compiled function - keeps Rc<Chunk> for sharing in tail calls
     CompiledFunction(Rc<Chunk>),
+    /// Thread handle for spawned threads - wrapped in Mutex because JoinHandle can only be joined once
+    /// The Option allows us to take the handle when joining (join consumes the handle)
+    ThreadHandle(Arc<Mutex<Option<JoinHandle<Result<SharedValue, String>>>>>),
 }
 
 impl Clone for HeapObject {
@@ -272,6 +276,7 @@ impl Clone for HeapObject {
             HeapObject::Function(f) => HeapObject::Function(f.clone()),
             HeapObject::NativeFunction(f) => HeapObject::NativeFunction(f.clone()),
             HeapObject::CompiledFunction(c) => HeapObject::CompiledFunction(c.clone()),
+            HeapObject::ThreadHandle(h) => HeapObject::ThreadHandle(h.clone()),
         }
     }
 }
@@ -297,6 +302,8 @@ pub struct SharedConsCell {
 
 /// Thread-safe heap objects using Arc instead of Rc
 /// Mirrors HeapObject but is safe to send across threads
+/// Note: Functions are NOT included because closures capture environments with Rc
+/// and cannot be shared across threads. Use compiled functions or native functions instead.
 #[derive(Debug, Clone)]
 pub enum SharedHeapObject {
     /// String data
@@ -307,10 +314,6 @@ pub enum SharedHeapObject {
     List(Box<[SharedValue]>),
     /// Cons cell with shared values
     Cons(SharedConsCell),
-    /// Functions cannot be shared across threads (closures capture environment)
-    /// Use channels or other communication primitives instead
-    /// We keep this variant for completeness but it will error if attempted
-    Function(Box<Function>),
     /// Native functions are just function pointers, safe to share
     NativeFunction(NativeFunction),
     /// Compiled functions share their chunk via Arc
@@ -374,7 +377,6 @@ impl fmt::Display for SharedValue {
                 }
                 write!(f, ")")
             }
-            SharedHeapObject::Function(_) => write!(f, "<function>"),
             SharedHeapObject::NativeFunction(nf) => write!(f, "<native fn {}>", nf.name),
             SharedHeapObject::CompiledFunction(_) => write!(f, "<function>"),
         }
@@ -496,7 +498,7 @@ impl Value {
 
     /// Create a heap-allocated value from an Rc<HeapObject>
     /// Uses Rc::into_raw to store the pointer - refcount is NOT decremented
-    fn from_heap(heap: Rc<HeapObject>) -> Value {
+    pub fn from_heap(heap: Rc<HeapObject>) -> Value {
         let ptr = Rc::into_raw(heap) as u64;
         debug_assert!(ptr & TAG_MASK == 0, "Pointer uses more than 48 bits");
         Value(TAG_PTR | ptr)
@@ -597,7 +599,7 @@ impl Value {
 
     /// Get the heap object if this is a heap pointer (Rc or arena)
     #[inline]
-    fn as_heap(&self) -> Option<&HeapObject> {
+    pub fn as_heap(&self) -> Option<&HeapObject> {
         if self.is_ptr() {
             let ptr = (self.0 & PAYLOAD_MASK) as *const HeapObject;
             // Safety: we only create these pointers from Rc::into_raw
@@ -776,6 +778,7 @@ impl Value {
                 HeapObject::Function(_) => "function",
                 HeapObject::NativeFunction(_) => "native-function",
                 HeapObject::CompiledFunction(_) => "function",
+                HeapObject::ThreadHandle(_) => "thread-handle",
             }
         } else {
             "unknown"
@@ -959,6 +962,11 @@ impl Value {
                 Some(HeapObject::CompiledFunction(c)) => {
                     Value::CompiledFunction(c.clone())
                 }
+                Some(HeapObject::ThreadHandle(h)) => {
+                    // ThreadHandles are already Arc-based, just clone the Value
+                    let heap = Rc::new(HeapObject::ThreadHandle(h.clone()));
+                    Value::from_heap(heap)
+                }
                 None => Value::nil(),
             }
         } else if self.is_ptr() {
@@ -1073,6 +1081,9 @@ impl Value {
                     inner: Arc::new(SharedHeapObject::CompiledFunction(arc_chunk)),
                 })
             }
+            Some(HeapObject::ThreadHandle(_)) => {
+                Err("Thread handles cannot be shared across threads".to_string())
+            }
             None => Err("Cannot convert unknown value to SharedValue".to_string()),
         }
     }
@@ -1122,7 +1133,6 @@ impl Value {
                 let cdr = Value::from_shared(&cons.cdr);
                 Value::cons_rc(car, cdr)
             }
-            SharedHeapObject::Function(f) => Value::function((**f).clone()),
             SharedHeapObject::NativeFunction(nf) => {
                 Value::native_function(&nf.name, nf.func)
             }
@@ -1212,6 +1222,7 @@ impl fmt::Display for Value {
                 HeapObject::Function(_) => write!(f, "<function>"),
                 HeapObject::NativeFunction(nf) => write!(f, "<native fn {}>", nf.name),
                 HeapObject::CompiledFunction(_) => write!(f, "<function>"),
+                HeapObject::ThreadHandle(_) => write!(f, "<thread-handle>"),
             }
         } else {
             write!(f, "<unknown>")
