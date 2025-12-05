@@ -117,7 +117,7 @@ fn eval_inner(expr: &Value, env: &Env, tail_pos: bool) -> Result<Trampoline, Str
                 "if" => return eval_if(&items[1..], env, tail_pos),
                 "def" => return eval_def(&items[1..], env),
                 "let" => return eval_let(&items[1..], env, tail_pos),
-                "fn" => return eval_fn(&items[1..], env),
+                "fn" | "lambda" => return eval_fn(&items[1..], env),
                 "do" => return eval_do(&items[1..], env, tail_pos),
                 _ => {}
             }

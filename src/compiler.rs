@@ -694,7 +694,7 @@ impl Compiler {
                     "or" => return self.compile_or(&items[1..], dest),
                     "def" => return self.compile_def(&items[1..], dest),
                     "let" => return self.compile_let(&items[1..], dest, tail_pos),
-                    "fn" => return self.compile_fn(&items[1..], dest),
+                    "fn" | "lambda" => return self.compile_fn(&items[1..], dest),
                     "do" => return self.compile_do(&items[1..], dest, tail_pos),
                     _ => {}
                 }
