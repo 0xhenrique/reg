@@ -101,6 +101,11 @@ impl VM {
         self.jit_enabled = true;
     }
 
+    /// Get a global variable by name (returns None if not found)
+    pub fn get_global(&self, name: &str) -> Option<Value> {
+        self.globals.borrow().get(name).cloned()
+    }
+
     pub fn define_global(&mut self, name: &str, value: Value) {
         // Avoid String allocation if key already exists
         {
