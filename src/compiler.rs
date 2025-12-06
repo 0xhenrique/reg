@@ -1448,15 +1448,30 @@ impl Compiler {
                     }
                 } else {
                     // For CallGlobal, args go in dest+1, dest+2, ...
+                    // BUG FIX: If dest+1 would overlap with locals, use a temp dest
+                    // to prevent arguments from overwriting let-bound variables.
                     let start_locals = self.locals.len();
+                    let actual_dest = if dest + 1 < start_locals as Reg {
+                        // Use a destination after all locals to avoid register clash
+                        start_locals as Reg
+                    } else {
+                        dest
+                    };
+
                     for (i, arg) in args.iter().enumerate() {
-                        let arg_reg = dest + 1 + i as Reg;
+                        let arg_reg = actual_dest + 1 + i as Reg;
                         while (self.locals.len() as Reg) <= arg_reg {
                             self.alloc_reg();
                         }
                         self.compile_expr(arg, arg_reg, false)?;
                     }
-                    self.emit(Op::call_global(dest, name_idx_u8, nargs));
+                    self.emit(Op::call_global(actual_dest, name_idx_u8, nargs));
+
+                    // If we used a temp dest, move result to original dest
+                    if actual_dest != dest {
+                        self.emit(Op::mov(dest, actual_dest));
+                    }
+
                     while self.locals.len() > start_locals {
                         self.free_reg();
                     }
