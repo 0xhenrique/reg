@@ -690,6 +690,7 @@ impl Compiler {
                 match sym {
                     "quote" => return self.compile_quote(&items[1..], dest),
                     "if" => return self.compile_if(&items[1..], dest, tail_pos),
+                    "cond" => return self.compile_cond(&items[1..], dest, tail_pos),
                     "and" => return self.compile_and(&items[1..], dest),
                     "or" => return self.compile_or(&items[1..], dest),
                     "def" => return self.compile_def(&items[1..], dest),
@@ -771,6 +772,117 @@ impl Compiler {
 
             let end = self.chunk.current_pos();
             self.chunk.patch_jump(jump_over_nil, end);
+        }
+
+        Ok(())
+    }
+
+    /// Compile cond expression: (cond (test1 result1) (test2 result2) ... (else default))
+    /// Each clause is a list where the first element is the condition and the rest is the body.
+    /// The special condition 'else' or 'true' matches unconditionally.
+    fn compile_cond(&mut self, clauses: &[Value], dest: Reg, tail_pos: bool) -> Result<(), String> {
+        if clauses.is_empty() {
+            // Empty cond returns nil
+            self.emit(Op::load_nil(dest));
+            return Ok(());
+        }
+
+        // Track jumps to end (from successful branches)
+        let mut jumps_to_end: Vec<usize> = Vec::new();
+
+        for (i, clause) in clauses.iter().enumerate() {
+            let is_last = i == clauses.len() - 1;
+
+            // Each clause should be a list: (condition body...)
+            let clause_items = clause.as_list()
+                .ok_or_else(|| "cond clause must be a list".to_string())?;
+
+            if clause_items.is_empty() {
+                return Err("cond clause cannot be empty".to_string());
+            }
+
+            let condition = &clause_items[0];
+            let body = &clause_items[1..];
+
+            // Check for else/true clause (unconditional)
+            let is_else = condition.as_symbol()
+                .map(|s| s == "else" || s == "true")
+                .unwrap_or(false);
+
+            if is_else {
+                // Else clause - just compile the body
+                if body.is_empty() {
+                    self.emit(Op::load_nil(dest));
+                } else if body.len() == 1 {
+                    self.compile_expr(&body[0], dest, tail_pos)?;
+                } else {
+                    // Multiple expressions: wrap in implicit do
+                    let mut do_list = vec![Value::symbol("do")];
+                    do_list.extend(body.iter().cloned());
+                    self.compile_expr(&Value::list(do_list), dest, tail_pos)?;
+                }
+                // No need to jump - this is the final case
+                break;
+            }
+
+            // Compile condition
+            self.compile_expr(condition, dest, false)?;
+
+            if is_last {
+                // Last clause without else: if false, result is nil
+                let jump_to_nil = self.emit(Op::jump_if_false(dest, 0));
+
+                // Compile body
+                if body.is_empty() {
+                    // If body is empty, the result is the condition value (already in dest)
+                    // But we need to handle the nil case
+                } else if body.len() == 1 {
+                    self.compile_expr(&body[0], dest, tail_pos)?;
+                } else {
+                    let mut do_list = vec![Value::symbol("do")];
+                    do_list.extend(body.iter().cloned());
+                    self.compile_expr(&Value::list(do_list), dest, tail_pos)?;
+                }
+
+                // Jump over nil
+                let jump_over_nil = self.emit(Op::jump(0));
+
+                // Nil case
+                let nil_pos = self.chunk.current_pos();
+                self.chunk.patch_jump(jump_to_nil, nil_pos);
+                self.emit(Op::load_nil(dest));
+
+                // Patch jump over nil
+                let end_pos = self.chunk.current_pos();
+                self.chunk.patch_jump(jump_over_nil, end_pos);
+            } else {
+                // Not the last clause: if false, jump to next clause
+                let jump_to_next = self.emit(Op::jump_if_false(dest, 0));
+
+                // Compile body
+                if body.is_empty() {
+                    // Empty body - condition value is the result (already in dest)
+                } else if body.len() == 1 {
+                    self.compile_expr(&body[0], dest, tail_pos)?;
+                } else {
+                    let mut do_list = vec![Value::symbol("do")];
+                    do_list.extend(body.iter().cloned());
+                    self.compile_expr(&Value::list(do_list), dest, tail_pos)?;
+                }
+
+                // Jump to end (skip remaining clauses)
+                jumps_to_end.push(self.emit(Op::jump(0)));
+
+                // Patch jump to next clause
+                let next_clause_pos = self.chunk.current_pos();
+                self.chunk.patch_jump(jump_to_next, next_clause_pos);
+            }
+        }
+
+        // Patch all jumps to end
+        let end_pos = self.chunk.current_pos();
+        for jump_pos in jumps_to_end {
+            self.chunk.patch_jump(jump_pos, end_pos);
         }
 
         Ok(())

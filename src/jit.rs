@@ -986,10 +986,9 @@ fn compile_bytecode(
             }
 
             // For opcodes we don't yet support, we need to bail out
-            // In a real JIT, this would trigger deoptimization
             _ => {
                 // For unsupported opcodes, return nil and let interpreter handle it
-                // This is a simple "give up" strategy for Phase 1
+                // This is a simple "give up" strategy for Phase 1 [wip]
                 return Err(format!("Unsupported opcode: {:?}", op));
             }
         }
