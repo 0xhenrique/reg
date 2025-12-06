@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
+use std::sync::Arc;
 
 // Register file size - each function call uses ~(locals + 16) registers
 // For 10000 deep recursion with ~20 registers per call = 200000 registers
@@ -414,6 +415,14 @@ impl VM {
                     let symbol_rc = unsafe { frame.chunk.constants.get_unchecked(name_idx as usize) }
                         .as_symbol_rc()
                         .ok_or("CallGlobal: expected symbol")?;
+
+                    // Special handling for spawn - needs access to globals
+                    if &*symbol_rc == "spawn" {
+                        let result = self.handle_spawn(base, dest, nargs)?;
+                        unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
+                        continue;
+                    }
+
                     let key = SymbolKey(symbol_rc);
 
                     // INLINE CACHE: Check typed caches first (no type check needed)
@@ -1374,6 +1383,96 @@ impl VM {
         }
     }
 
+    /// Handle spawn with access to globals - allows spawned threads to call parent-defined functions
+    fn handle_spawn(&self, base: usize, dest: u8, nargs: u8) -> Result<Value, String> {
+        use std::sync::Mutex;
+        use std::thread;
+        use crate::value::HeapObject;
+
+        if nargs != 1 {
+            return Err("spawn expects 1 argument (function)".to_string());
+        }
+
+        // Get the function argument
+        let arg_start = base + dest as usize + 1;
+        let func = &self.registers[arg_start];
+
+        // Only compiled functions can be spawned (not closures with captured environments)
+        let chunk = if let Some(chunk) = func.as_compiled_function() {
+            chunk.clone()
+        } else {
+            return Err("spawn expects a compiled function (not a closure)".to_string());
+        };
+
+        // Convert Rc<Chunk> to Arc<Chunk> for thread safety
+        let arc_chunk: Arc<Chunk> = Arc::new((*chunk).clone());
+
+        // Collect shareable globals (compiled functions and native functions)
+        // We need to convert them to thread-safe format
+        let mut shared_globals: Vec<(String, SharedGlobal)> = Vec::new();
+        {
+            let globals = self.globals.borrow();
+            for (name, value) in globals.iter() {
+                if let Some(cf) = value.as_compiled_function() {
+                    // Convert compiled function to Arc-based
+                    // cf is &Rc<Chunk>, so **cf gives us Chunk
+                    shared_globals.push((
+                        name.clone(),
+                        SharedGlobal::CompiledFunction(Arc::new((**cf).clone()))
+                    ));
+                } else if let Some(nf) = value.as_native_function() {
+                    // Native functions are just function pointers, safe to share
+                    shared_globals.push((
+                        name.clone(),
+                        SharedGlobal::NativeFunction(nf.name.clone(), nf.func)
+                    ));
+                }
+                // Skip other types (data values) - they can't be safely shared
+            }
+        }
+
+        // Spawn the thread with access to shared globals
+        let handle = thread::spawn(move || {
+            // Create a new VM for this thread
+            let mut thread_vm = standard_vm();
+
+            // Add the shared globals to the thread's VM
+            for (name, shared) in shared_globals {
+                match shared {
+                    SharedGlobal::CompiledFunction(arc_chunk) => {
+                        // Convert Arc<Chunk> back to Rc<Chunk>
+                        let rc_chunk = Rc::new((*arc_chunk).clone());
+                        thread_vm.define_global(&name, Value::CompiledFunction(rc_chunk));
+                    }
+                    SharedGlobal::NativeFunction(fn_name, func_ptr) => {
+                        thread_vm.define_global(&name, Value::native_function(&fn_name, func_ptr));
+                    }
+                }
+            }
+
+            // Execute the function (it should be zero-argument)
+            match thread_vm.run((*arc_chunk).clone()) {
+                Ok(result) => {
+                    // Convert result to SharedValue
+                    result.make_shared()
+                }
+                Err(e) => Err(format!("Thread execution error: {}", e)),
+            }
+        });
+
+        // Wrap the JoinHandle in Arc<Mutex<Option<>>> so it can be joined once
+        let thread_handle = Arc::new(Mutex::new(Some(handle)));
+
+        // Create a HeapObject::ThreadHandle and wrap it in a Value
+        let heap = Rc::new(HeapObject::ThreadHandle(thread_handle));
+        Ok(Value::from_heap(heap))
+    }
+}
+
+/// Helper enum for sharing globals between threads
+enum SharedGlobal {
+    CompiledFunction(Arc<Chunk>),
+    NativeFunction(String, fn(&[Value]) -> Result<Value, String>),
 }
 
 impl Default for VM {
