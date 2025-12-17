@@ -21,7 +21,7 @@ struct SymbolKey(Rc<str>);
 impl Hash for SymbolKey {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Hash by pointer address only - O(1)
+        // Hash by pointer address only
         // Cast fat pointer (*const str) to thin pointer (*const u8) first
         (Rc::as_ptr(&self.0) as *const u8 as usize).hash(state);
     }
@@ -214,8 +214,30 @@ impl VM {
                     let symbol_rc = unsafe { frame.chunk.constants.get_unchecked(name_idx as usize) }
                         .as_symbol_rc()
                         .ok_or("GetGlobal: expected symbol")?;
-                    let key = SymbolKey(symbol_rc);
+                    let name = &*symbol_rc;
 
+                    // Check for qualified name (module/symbol)
+                    if let Some(slash_pos) = name.find('/') {
+                        let module_name = &name[..slash_pos];
+                        let symbol_name = &name[slash_pos + 1..];
+
+                        // Get the module to check exports
+                        let module_val = self.globals.borrow().get(module_name).cloned()
+                            .ok_or_else(|| format!("Undefined module: {}", module_name))?;
+
+                        if let Some(module) = module_val.as_module() {
+                            // Check if the symbol is exported
+                            if !module.exports.contains_key(symbol_name) {
+                                return Err(format!(
+                                    "'{}' is not exported from module '{}'",
+                                    symbol_name, module_name
+                                ));
+                            }
+                        }
+                        // If not a module (maybe a namespace-style name), fall through
+                    }
+
+                    let key = SymbolKey(symbol_rc);
                     let value = if let Some(cached) = self.global_cache.get(&key) {
                         cached.clone()
                     } else {
@@ -423,6 +445,34 @@ impl VM {
                         continue;
                     }
 
+                    // Special handling for __make_module__ - needs access to globals
+                    if &*symbol_rc == "__make_module__" {
+                        let result = self.handle_make_module(base, dest, nargs)?;
+                        unsafe { *self.registers.get_unchecked_mut(base + dest as usize) = result };
+                        continue;
+                    }
+
+                    // Check for qualified name access (module/symbol) - verify export
+                    let name = &*symbol_rc;
+                    if let Some(slash_pos) = name.find('/') {
+                        let module_name = &name[..slash_pos];
+                        let symbol_name = &name[slash_pos + 1..];
+
+                        // Get the module to check exports
+                        let module_val = self.globals.borrow().get(module_name).cloned()
+                            .ok_or_else(|| format!("Undefined module: {}", module_name))?;
+
+                        if let Some(module) = module_val.as_module() {
+                            // Check if the symbol is exported
+                            if !module.exports.contains_key(symbol_name) {
+                                return Err(format!(
+                                    "'{}' is not exported from module '{}'",
+                                    symbol_name, module_name
+                                ));
+                            }
+                        }
+                    }
+
                     let key = SymbolKey(symbol_rc);
 
                     // INLINE CACHE: Check typed caches first (no type check needed)
@@ -589,6 +639,28 @@ impl VM {
                     let symbol_rc = unsafe { frame.chunk.constants.get_unchecked(name_idx as usize) }
                         .as_symbol_rc()
                         .ok_or("TailCallGlobal: expected symbol")?;
+
+                    // Check for qualified name access (module/symbol) - verify export
+                    let name = &*symbol_rc;
+                    if let Some(slash_pos) = name.find('/') {
+                        let module_name = &name[..slash_pos];
+                        let symbol_name = &name[slash_pos + 1..];
+
+                        // Get the module to check exports
+                        let module_val = self.globals.borrow().get(module_name).cloned()
+                            .ok_or_else(|| format!("Undefined module: {}", module_name))?;
+
+                        if let Some(module) = module_val.as_module() {
+                            // Check if the symbol is exported
+                            if !module.exports.contains_key(symbol_name) {
+                                return Err(format!(
+                                    "'{}' is not exported from module '{}'",
+                                    symbol_name, module_name
+                                ));
+                            }
+                        }
+                    }
+
                     let key = SymbolKey(symbol_rc);
 
                     // INLINE CACHE: Check typed caches first (no type check needed)
@@ -1466,6 +1538,43 @@ impl VM {
         // Create a HeapObject::ThreadHandle and wrap it in a Value
         let heap = Rc::new(HeapObject::ThreadHandle(thread_handle));
         Ok(Value::from_heap(heap))
+    }
+
+    /// Handle __make_module__ call - creates a module from qualified globals
+    /// Args: module_name, export1, export2, ...
+    fn handle_make_module(&self, base: usize, dest: u8, nargs: u8) -> Result<Value, String> {
+        use std::collections::HashMap;
+
+        if nargs < 1 {
+            return Err("__make_module__ expects at least 1 argument (module name)".to_string());
+        }
+
+        let arg_start = base + dest as usize + 1;
+
+        // First arg is module name (as string)
+        let module_name = self.registers[arg_start]
+            .as_string()
+            .ok_or("__make_module__: first argument must be module name string")?
+            .to_string();
+
+        // Remaining args are export names
+        let mut exports: HashMap<String, Value> = HashMap::new();
+
+        for i in 1..nargs as usize {
+            let export_name = self.registers[arg_start + i]
+                .as_string()
+                .ok_or("__make_module__: export name must be a string")?;
+
+            // Look up the qualified global
+            let qualified_name = format!("{}/{}", module_name, export_name);
+            let value = self.globals.borrow().get(&qualified_name).cloned()
+                .ok_or_else(|| format!("Module '{}': undefined export '{}'", module_name, export_name))?;
+
+            exports.insert(export_name.to_string(), value);
+        }
+
+        // Create the module
+        Ok(Value::module(&module_name, exports))
     }
 }
 

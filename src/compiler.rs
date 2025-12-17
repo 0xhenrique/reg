@@ -697,6 +697,8 @@ impl Compiler {
                     "let" => return self.compile_let(&items[1..], dest, tail_pos),
                     "fn" | "lambda" => return self.compile_fn(&items[1..], dest),
                     "do" => return self.compile_do(&items[1..], dest, tail_pos),
+                    "module" => return self.compile_module(&items[1..], dest),
+                    "import" => return self.compile_import(&items[1..], dest),
                     _ => {}
                 }
             }
@@ -1248,6 +1250,181 @@ impl Compiler {
         self.compile_expr(&args[args.len() - 1], dest, tail_pos)
     }
 
+    /// Compile a module declaration:
+    /// (module name (export sym1 sym2 ...) body...)
+    ///
+    /// This creates a module with the specified exports and stores it as a global.
+    /// Definitions inside the module body are stored as qualified globals (module/name).
+    fn compile_module(&mut self, args: &[Value], dest: Reg) -> Result<(), String> {
+        if args.len() < 2 {
+            return Err("module expects at least 2 arguments: name and (export ...)".to_string());
+        }
+
+        // Parse module name
+        let module_name = args[0]
+            .as_symbol()
+            .ok_or("module name must be a symbol")?;
+
+        // Parse export list: (export sym1 sym2 ...)
+        let export_list = args[1]
+            .as_list()
+            .ok_or("module expects (export ...) as second argument")?;
+
+        if export_list.is_empty() || export_list[0].as_symbol() != Some("export") {
+            return Err("module expects (export sym1 sym2 ...) as second argument".to_string());
+        }
+
+        let exports: Vec<String> = export_list[1..]
+            .iter()
+            .map(|v| {
+                v.as_symbol()
+                    .ok_or_else(|| "export list must contain symbols".to_string())
+                    .map(|s| s.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Body expressions (definitions)
+        let body = &args[2..];
+
+        // We'll build the module by:
+        // 1. Compiling each body expression
+        // 2. For each def, we store as qualified global (module/name)
+        // 3. At the end, we create a Module value and store it
+
+        // Compile body expressions - definitions will be stored as module/name globals
+        // We need to track definitions made in this module
+        let mut defined_names: Vec<String> = Vec::new();
+
+        for expr in body {
+            // Check if this is a def expression to track the name
+            if let Some(items) = expr.as_list() {
+                if !items.is_empty() {
+                    if let Some("def") = items[0].as_symbol() {
+                        if items.len() >= 2 {
+                            if let Some(name) = items[1].as_symbol() {
+                                defined_names.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Create a transformed expression with qualified name for def
+            let transformed = self.transform_module_def(expr, module_name)?;
+            let temp = self.alloc_reg();
+            self.compile_expr(&transformed, temp, false)?;
+            self.free_reg();
+        }
+
+        // Now create the Module object
+        // First, load all arguments
+
+        // Module name as string
+        let name_idx = self.add_constant(Value::string(module_name));
+        let name_reg = self.alloc_reg();
+        self.emit(Op::load_const(name_reg, name_idx));
+
+        // Export names as strings
+        for export_name in &exports {
+            let export_idx = self.add_constant(Value::string(export_name));
+            let export_reg = self.alloc_reg();
+            self.emit(Op::load_const(export_reg, export_idx));
+        }
+
+        // Call __make_module__
+        let fn_name_idx = self.add_constant(Value::symbol("__make_module__"));
+        if fn_name_idx <= 255 {
+            self.emit(Op::call_global(dest, fn_name_idx as u8, (1 + exports.len()) as u8));
+        } else {
+            return Err("Too many constants".to_string());
+        }
+
+        // Free temp registers
+        for _ in 0..=exports.len() {
+            self.free_reg();
+        }
+
+        // Store the module as a global
+        let module_global_idx = self.add_constant(Value::symbol(module_name));
+        self.emit(Op::set_global(module_global_idx, dest));
+
+        Ok(())
+    }
+
+    /// Transform a def expression inside a module to use qualified name
+    fn transform_module_def(&self, expr: &Value, module_name: &str) -> Result<Value, String> {
+        if let Some(items) = expr.as_list() {
+            if !items.is_empty() {
+                if let Some("def") = items[0].as_symbol() {
+                    if items.len() >= 2 {
+                        if let Some(name) = items[1].as_symbol() {
+                            // Transform (def name value) to (def module/name value)
+                            let qualified_name = format!("{}/{}", module_name, name);
+                            let mut new_items = vec![items[0].clone(), Value::symbol(&qualified_name)];
+                            new_items.extend(items[2..].iter().cloned());
+                            return Ok(Value::list(new_items));
+                        }
+                    }
+                }
+            }
+        }
+        // Not a def or malformed - return as-is
+        Ok(expr.clone())
+    }
+
+    /// Compile an import statement:
+    /// (import module)           - import all exports, access as module/name
+    /// (import module (sym1 sym2)) - import specific symbols into local scope
+    fn compile_import(&mut self, args: &[Value], dest: Reg) -> Result<(), String> {
+        if args.is_empty() {
+            return Err("import expects at least 1 argument".to_string());
+        }
+
+        let module_name = args[0]
+            .as_symbol()
+            .ok_or("import expects a module name symbol")?;
+
+        if args.len() == 1 {
+            // (import module) - just load the module to verify it exists
+            // The qualified names (module/name) are already available as globals
+            let module_idx = self.add_constant(Value::symbol(module_name));
+            self.emit(Op::get_global(dest, module_idx));
+            // Result is the module value (for chaining or inspection)
+        } else if args.len() == 2 {
+            // (import module (sym1 sym2 ...)) - import specific symbols
+            let symbols = args[1]
+                .as_list()
+                .ok_or("import expects a list of symbols as second argument")?;
+
+            for sym in symbols {
+                let sym_name = sym
+                    .as_symbol()
+                    .ok_or("import symbol list must contain symbols")?;
+
+                // Get the qualified name from the module
+                let qualified_name = format!("{}/{}", module_name, sym_name);
+                let qualified_idx = self.add_constant(Value::symbol(&qualified_name));
+
+                // Load the value
+                let temp = self.alloc_reg();
+                self.emit(Op::get_global(temp, qualified_idx));
+
+                // Store as unqualified global
+                let unqualified_idx = self.add_constant(Value::symbol(sym_name));
+                self.emit(Op::set_global(unqualified_idx, temp));
+
+                self.free_reg();
+            }
+
+            // Return nil
+            self.emit(Op::load_nil(dest));
+        } else {
+            return Err("import expects 1 or 2 arguments".to_string());
+        }
+
+        Ok(())
+    }
+
     /// Try to compile a binary operation using specialized opcodes
     /// Returns Some(true) if compiled, Some(false) if not applicable, Err on error
     fn try_compile_binary_op(&mut self, op: &str, args: &[Value], dest: Reg) -> Result<Option<bool>, String> {
@@ -1414,11 +1591,15 @@ impl Compiler {
 
     fn compile_call(&mut self, items: &[Value], dest: Reg, tail_pos: bool) -> Result<(), String> {
         // Try constant folding for the entire call expression (including pure user functions)
-        let call_expr = Value::list(items.to_vec());
-        if let Some(folded) = try_const_eval_with_fns(&call_expr, &self.pure_fns) {
-            let idx = self.add_constant(folded);
-            self.emit(Op::load_const(dest, idx));
-            return Ok(());
+        // NOTE: Don't constant-fold qualified names (module/function) to preserve module privacy
+        let is_module_call = items[0].as_symbol().map_or(false, |s| s.contains('/'));
+        if !is_module_call {
+            let call_expr = Value::list(items.to_vec());
+            if let Some(folded) = try_const_eval_with_fns(&call_expr, &self.pure_fns) {
+                let idx = self.add_constant(folded);
+                self.emit(Op::load_const(dest, idx));
+                return Ok(());
+            }
         }
 
         // Try to compile as specialized binary operation
@@ -1465,6 +1646,8 @@ impl Compiler {
             // Try inlining small non-recursive functions
             // This eliminates call overhead for thin wrappers like:
             //   (def reverse (fn (lst) (reverse-acc lst (list))))
+            // NOTE: Don't inline qualified names (module/function) to preserve module privacy
+            if !op.contains('/') {
             if let Some(fn_def) = self.inline_candidates.get(op).cloned() {
                 // Check: correct number of arguments
                 if args.len() == fn_def.params.len() {
@@ -1486,6 +1669,7 @@ impl Compiler {
                     }
                 }
             }
+            } // end !op.contains('/')
         }
 
         // Check if calling a global symbol (optimization: use CallGlobal/TailCallGlobal)

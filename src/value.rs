@@ -14,8 +14,8 @@ use crate::bytecode::Chunk;
 //
 // Arena allocation eliminates per-object reference counting overhead by:
 // 1. Allocating objects in a growable Vec using bump allocation
-// 2. Using indices instead of pointers for stable references
-// 3. Cloning is free (just copy the index)
+// 2. Using indices instead of pointers for references
+// 3. Cloning is free
 // 4. Dropping is a no-op (arena is cleared in bulk)
 // 5. Values that escape (returned from top-level) are promoted to Rc
 //
@@ -274,6 +274,16 @@ pub enum HeapObject {
     /// Atomic reference for shared mutable state
     /// Wrapped in Arc<Mutex<>> to allow thread-safe mutation
     Atom(Arc<Mutex<SharedValue>>),
+    /// Module - a namespace containing exported definitions
+    Module(Box<ModuleObject>),
+}
+
+#[derive(Debug, Clone)]
+pub struct ModuleObject {
+    /// Module name (e.g., "math")
+    pub name: String,
+    /// Exported symbols mapped to their values
+    pub exports: HashMap<String, Value>,
 }
 
 impl Clone for HeapObject {
@@ -290,6 +300,7 @@ impl Clone for HeapObject {
             HeapObject::ChannelSender(s) => HeapObject::ChannelSender(s.clone()),
             HeapObject::ChannelReceiver(r) => HeapObject::ChannelReceiver(r.clone()),
             HeapObject::Atom(a) => HeapObject::Atom(a.clone()),
+            HeapObject::Module(m) => HeapObject::Module(m.clone()),
         }
     }
 }
@@ -509,6 +520,14 @@ impl Value {
         Value::from_heap(heap)
     }
 
+    pub fn module(name: &str, exports: HashMap<String, Value>) -> Value {
+        let heap = Rc::new(HeapObject::Module(Box::new(ModuleObject {
+            name: name.to_string(),
+            exports,
+        })));
+        Value::from_heap(heap)
+    }
+
     /// Create a heap-allocated value from an Rc<HeapObject>
     /// Uses Rc::into_raw to store the pointer - refcount is NOT decremented
     pub fn from_heap(heap: Rc<HeapObject>) -> Value {
@@ -697,6 +716,14 @@ impl Value {
         }
     }
 
+    /// Get as a module reference
+    pub fn as_module(&self) -> Option<&ModuleObject> {
+        match self.as_heap() {
+            Some(HeapObject::Module(m)) => Some(m),
+            _ => None,
+        }
+    }
+
     // Lisp semantics
 
     /// Check if a value is truthy
@@ -795,6 +822,7 @@ impl Value {
                 HeapObject::ChannelSender(_) => "channel-sender",
                 HeapObject::ChannelReceiver(_) => "channel-receiver",
                 HeapObject::Atom(_) => "atom",
+                HeapObject::Module(_) => "module",
             }
         } else {
             "unknown"
@@ -998,6 +1026,14 @@ impl Value {
                     let heap = Rc::new(HeapObject::Atom(a.clone()));
                     Value::from_heap(heap)
                 }
+                Some(HeapObject::Module(m)) => {
+                    // Promote module exports recursively
+                    let promoted_exports: HashMap<String, Value> = m.exports
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.promote()))
+                        .collect();
+                    Value::module(&m.name, promoted_exports)
+                }
                 None => Value::nil(),
             }
         } else if self.is_ptr() {
@@ -1123,6 +1159,9 @@ impl Value {
             }
             Some(HeapObject::Atom(_)) => {
                 Err("Atoms cannot be converted to SharedValue (they are already thread-safe)".to_string())
+            }
+            Some(HeapObject::Module(_)) => {
+                Err("Modules cannot be shared across threads".to_string())
             }
             None => Err("Cannot convert unknown value to SharedValue".to_string()),
         }
@@ -1270,6 +1309,7 @@ impl fmt::Display for Value {
                     let value = a.lock().unwrap();
                     write!(f, "(atom {})", value)
                 }
+                HeapObject::Module(m) => write!(f, "<module {}>", m.name),
             }
         } else {
             write!(f, "<unknown>")
