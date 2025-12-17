@@ -1592,7 +1592,8 @@ impl Compiler {
     fn compile_call(&mut self, items: &[Value], dest: Reg, tail_pos: bool) -> Result<(), String> {
         // Try constant folding for the entire call expression (including pure user functions)
         // NOTE: Don't constant-fold qualified names (module/function) to preserve module privacy
-        let is_module_call = items[0].as_symbol().map_or(false, |s| s.contains('/'));
+        // A qualified name has format "module/name" (contains / but is not just "/")
+        let is_module_call = items[0].as_symbol().map_or(false, |s| s.len() > 1 && s.contains('/'));
         if !is_module_call {
             let call_expr = Value::list(items.to_vec());
             if let Some(folded) = try_const_eval_with_fns(&call_expr, &self.pure_fns) {
@@ -1647,7 +1648,8 @@ impl Compiler {
             // This eliminates call overhead for thin wrappers like:
             //   (def reverse (fn (lst) (reverse-acc lst (list))))
             // NOTE: Don't inline qualified names (module/function) to preserve module privacy
-            if !op.contains('/') {
+            // A qualified name has format "module/name" (contains / but is not just "/")
+            if !(op.len() > 1 && op.contains('/')) {
             if let Some(fn_def) = self.inline_candidates.get(op).cloned() {
                 // Check: correct number of arguments
                 if args.len() == fn_def.params.len() {
