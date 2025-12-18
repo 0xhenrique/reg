@@ -452,6 +452,38 @@ impl VM {
                         continue;
                     }
 
+                    // Special handling for load - push a new frame for the loaded code
+                    if &*symbol_rc == "load" {
+                        let loaded_chunk = self.compile_load(base, dest, nargs)?;
+
+                        let frame = unsafe { self.frames.last().unwrap_unchecked() };
+                        let num_registers = frame.chunk.num_registers;
+                        let new_base = base + num_registers as usize;
+
+                        if new_base + loaded_chunk.num_registers as usize > MAX_REGISTERS {
+                            return Err("Stack overflow in load".to_string());
+                        }
+
+                        // Save current IP
+                        unsafe { self.frames.last_mut().unwrap_unchecked() }.ip = ip;
+
+                        // Push frame for loaded code
+                        self.frames.push(CallFrame {
+                            chunk: loaded_chunk,
+                            ip: 0,
+                            base: new_base,
+                            return_reg: base + dest as usize,
+                        });
+
+                        // Update cached frame values
+                        let frame = unsafe { self.frames.last().unwrap_unchecked() };
+                        code_ptr = frame.chunk.code.as_ptr();
+                        constants_ptr = frame.chunk.constants.as_ptr();
+                        ip = 0;
+                        base = new_base;
+                        continue;
+                    }
+
                     // Check for qualified name access (module/symbol) - verify export
                     let name = &*symbol_rc;
                     if let Some(slash_pos) = name.find('/') {
@@ -1538,6 +1570,49 @@ impl VM {
         // Create a HeapObject::ThreadHandle and wrap it in a Value
         let heap = Rc::new(HeapObject::ThreadHandle(thread_handle));
         Ok(Value::from_heap(heap))
+    }
+
+    /// Compile a file for loading - returns the compiled chunk
+    /// Args: filename (string)
+    fn compile_load(&mut self, base: usize, dest: u8, nargs: u8) -> Result<Rc<Chunk>, String> {
+        use std::fs;
+        use crate::{parse_all, expand, Compiler, MacroRegistry, standard_env};
+
+        if nargs != 1 {
+            return Err("load expects 1 argument (filename)".to_string());
+        }
+
+        let arg_start = base + dest as usize + 1;
+        let filename = self.registers[arg_start]
+            .as_string()
+            .ok_or("load: argument must be a string filename")?
+            .to_string();
+
+        // Read the file
+        let contents = fs::read_to_string(&filename)
+            .map_err(|e| format!("load: could not read file '{}': {}", filename, e))?;
+
+        // Parse all expressions
+        let exprs = parse_all(&contents)
+            .map_err(|e| format!("load: parse error in '{}': {}", filename, e))?;
+
+        // For macro expansion
+        let env = standard_env();
+        let macros = MacroRegistry::new();
+
+        // Expand macros
+        let expanded: Result<Vec<Value>, String> = exprs
+            .iter()
+            .map(|expr| expand(expr, &macros, &env))
+            .collect();
+        let expanded = expanded
+            .map_err(|e| format!("load: macro error in '{}': {}", filename, e))?;
+
+        // Compile all expressions
+        let chunk = Compiler::compile_all(&expanded)
+            .map_err(|e| format!("load: compile error in '{}': {}", filename, e))?;
+
+        Ok(Rc::new(chunk))
     }
 
     /// Handle __make_module__ call - creates a module from qualified globals
