@@ -1,0 +1,285 @@
+* Register based VM
+
+A Lisp interpreter with a register-based bytecode virtual machine.
+
+** Features
+
+- *Register-based bytecode VM* - Inspired by Lua's design
+- *Compile-time optimizations* - Constant folding and pure function inlining
+- *Tail call optimization* - Write recursive functions without stack overflow (citation needed)
+- *Macro system* - Compile-time code generation with =defmacro=
+- *Reference counting* - Predictable memory management without garbage collection pauses*
+- *Immutable by default* - Values are immutable, inspired by FP
+- *Fast startup* - Minimal overhead, just feed the VM with code
+
+** Building
+
+*** NixOS
+
+#+begin_src bash
+nix-shell
+cargo build --release
+#+end_src
+
+*** GNU Guix
+
+#+begin_src bash
+guix shell -m manifest.scm
+cargo build --release
+#+end_src
+
+** How to use
+
+*** Running a Lisp File
+
+#+begin_src bash
+./target/release/lisp-vm your-program.lisp
+#+end_src
+
+*** REPL
+
+#+begin_src bash
+./target/release/lisp-vm
+#+end_src
+
+Try to experiment a bit with it. Type =:q= to exit.
+
+*** CLI Options
+
+#+begin_src bash
+lisp-vm [OPTIONS] [FILE]
+
+Options:
+  --arena    Enable arena allocation for cons cells (experimental feature)
+#+end_src
+
+** Examples
+
+*** Basic Arithmetic
+
+#+begin_src lisp
+; Addition, subtraction, multiplication, division
+(+ 1 2 3)        ; => 6
+(* 4 5)          ; => 20
+(- 10 3)         ; => 7
+(/ 20 4)         ; => 5
+
+; Comparisons
+(< 5 10)         ; => true
+(>= 5 5)         ; => true
+(= 2 2)          ; => true
+#+end_src
+
+*** Variables and Functions
+
+#+begin_src lisp
+; Define a variable
+(def x 42)
+
+; Define a function
+(def square (fn (n) (* n n)))
+(square 5)       ; => 25
+
+; Functions with multiple statements using 'do'
+(def greet (fn (name)
+  (do
+    (println "Hello")
+    name)))
+(greet "World")  ; prints "Hello", returns "World"
+#+end_src
+
+*** Let Bindings
+
+#+begin_src lisp
+; Create local bindings
+(let (x 10 y 20)
+  (+ x y))       ; => 30
+
+; Nested let bindings
+(let (x 5)
+  (let (y (* x 2))
+    (+ x y)))    ; => 15
+#+end_src
+
+*** Conditionals
+
+#+begin_src lisp
+; if expressions
+(if (< 5 10)
+    "yes"
+    "no")        ; => "yes"
+
+; if without else returns nil
+(if false "won't happen")  ; => nil
+#+end_src
+
+*** Recursion
+
+The VM kinda supports recursion with TCO. Not battle tested thougheverbeit:
+
+#+begin_src lisp
+; Regular recursion
+(def factorial (fn (n)
+  (if (<= n 1)
+      1
+      (* n (factorial (- n 1))))))
+(factorial 5)    ; => 120
+(factorial 10)   ; => 3628800
+
+; Tail-recursive function
+(def sum (fn (n acc)
+  (if (<= n 0)
+      acc
+      (sum (- n 1) (+ acc n)))))
+(sum 100 0)      ; => 5050
+(sum 10000 0)    ; => 50005000 (shouldn't stack overflow)
+#+end_src
+
+*** Lists
+
+#+begin_src lisp
+; Create a list
+(list 1 2 3 4 5)           ; => (1 2 3 4 5)
+
+; car and cdr (first and rest)
+(car (list 1 2 3))         ; => 1
+(cdr (list 1 2 3))         ; => (2 3)
+
+; cons (prepend element)
+(cons 0 (list 1 2 3))      ; => (0 1 2 3)
+
+; length
+(length (list 1 2 3 4 5))  ; => 5
+
+; Quoting
+'(1 2 3)                   ; => (1 2 3)
+#+end_src
+
+*** Higher-Order Functions
+
+#+begin_src lisp
+; Functions are first-class values
+(def apply-twice (fn (f x)
+  (f (f x))))
+
+(def add-one (fn (x) (+ x 1)))
+(apply-twice add-one 5)    ; => 7
+
+; Functions can be returned
+(def make-adder (fn (n)
+  (fn (x) (+ x n))))
+(def add-ten (make-adder 10))
+(add-ten 5)                ; => 15
+#+end_src
+
+*** Macros
+
+Macros enable compile-time code generation:
+
+#+begin_src lisp
+; Define a macro
+(defmacro unless (cond body)
+  (list 'if cond nil body))
+
+; Use the macro
+(unless false (println "This prints!"))
+(unless true (println "This does not print"))
+
+; Macros expand at compile time
+(defmacro when (cond body)
+  (list 'if cond body nil))
+
+(when (> 5 3) (println "5 is greater than 3"))
+#+end_src
+
+*** Built-in Functions
+
+**** Arithmetic
+- =+=, =-=, =*=, =/=, =mod= - Arithmetic operations (support multiple arguments)
+
+**** Comparison
+- =<=, =<==, =>=, =>==, ===, =!== - Comparison operations
+
+**** Logic
+- =not= - Logical negation
+
+**** List Operations
+- =list= - Create a list
+- =cons= - Prepend element to list
+- =car= - Get first element (=first= or =head=)
+- =cdr= - Get rest of list (=rest= or =tail=)
+- =length= - Get list length
+
+**** Type Predicates
+- =nil?=, =int?=, =float?=, =string?=, =list?=, =fn?=, =symbol?= - Type checking
+
+**** I/O
+- =print= - Print value without newline
+- =println= - Print value with newline
+
+**** Special Forms
+- =def= - Define global variable
+- =fn= - Create anonymous function
+- =if= - Conditional expression
+- =let= - Create local bindings
+- =do= - Execute multiple expressions, return last one
+- =quote= (or ='=) - Quote expression without evaluation
+- =defmacro= - Define compile-time macro
+- =gensym= - Generate unique symbol (for hygienic macros)
+
+** Example Programs
+
+*** Fibonacci (Tree Recursion)
+
+#+begin_src lisp
+(def fib (fn (n)
+  (if (<= n 1)
+      n
+      (+ (fib (- n 1)) (fib (- n 2))))))
+
+(println (fib 10))  ; => 55
+#+end_src
+
+*** Sum of List
+
+#+begin_src lisp
+(def sum-list (fn (lst)
+  (if (nil? lst)
+      0
+      (+ (car lst) (sum-list (cdr lst))))))
+
+(sum-list (list 1 2 3 4 5))  ; => 15
+#+end_src
+
+*** Map Function
+
+#+begin_src lisp
+(def map (fn (f lst)
+  (if (nil? lst)
+      nil
+      (cons (f (car lst)) (map f (cdr lst))))))
+
+(def double (fn (x) (* x 2)))
+(map double (list 1 2 3 4))  ; => (2 4 6 8)
+#+end_src
+
+** Performance
+
+The VM uses some common optimization techniques:
+
+- *Constant folding*: Expressions like =(+ 1 2 3)= compile directly to =6=
+- *Function inlining*: Pure functions with constant arguments are evaluated at compile time
+- *Register-based bytecode*: Reduced memory traffic
+- *Specialized opcodes*: Direct arithmetic operations bypass function call overhead
+- *Tail call optimization*: Recursive tail calls reuse stack frames
+
+Optimization is a rabbit hole by itself. I'm not expecting to beat something like Lua.
+For now, I will keep as is. Just don't try any memory intensive tests and it should work fine.
+
+** Acknowledgments
+
+Inspired by:
+- *Lua* - For the register-based VM design
+- *Crafting Interpreters* - For VM implementation techniques
+- [[https://www.youtube.com/playlist?list=PLpM-Dvs8t0VYbTFO5tBwxG4Q20BJuqXD_][Tsoding - Lisp in C]] - The series of videos that inspired me into learning more about VM
+- *A ton of blogs posts, articles, videos and Github issues* - Thank you a lot!
